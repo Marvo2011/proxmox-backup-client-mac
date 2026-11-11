@@ -1,0 +1,31 @@
+[package]
+name = "proxmox-compression"
+version = "0.2.1"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "contains compression utilitites (such as an Zip Encoder for async rust)"
+
+exclude.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+crc32fast.workspace = true
+endian_trait.workspace = true
+flate2.workspace = true
+futures.workspace = true
+libc.workspace = true
+tar.workspace = true
+tokio = { workspace = true, features = [ "fs", "io-util"] }
+walkdir.workspace = true
+zstd.workspace = true
+
+proxmox-time.workspace = true
+proxmox-io = { workspace = true, features = [ "tokio" ] }
+proxmox-lang.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = [ "macros" ] }
+

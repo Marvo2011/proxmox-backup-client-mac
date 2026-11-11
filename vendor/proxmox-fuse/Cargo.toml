@@ -1,0 +1,23 @@
+[package]
+name = "proxmox-fuse"
+version = "0.1.7"
+authors = ["Wolfgang Bumiller <w.bumiller@proxmox.com>"]
+edition = "2021"
+license = "AGPL-3"
+description = "Expose fuse requests as async streams."
+
+exclude = [ "build", "debian" ]
+
+[dependencies]
+anyhow = "1.0"
+futures = "0.3"
+libc = "0.2"
+tokio = { version = "1.0", features = ["rt-multi-thread", "macros", "net", "signal"] }
+tokio-stream = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1.0", features = ["rt-multi-thread"] }
+
+# For bitfield access...
+[build-dependencies]
+cc = "1.0.46"

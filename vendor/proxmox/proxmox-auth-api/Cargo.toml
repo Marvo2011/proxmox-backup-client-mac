@@ -1,0 +1,52 @@
+[package]
+name = "proxmox-auth-api"
+version = "0.4.0"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+exclude.workspace = true
+description = "Tickets, API and Realm handling"
+
+[[example]]
+name = "passwd"
+required-features = [ "pam-authenticator" ]
+
+[dependencies]
+anyhow.workspace = true
+const_format = { workspace = true, optional = true }
+base64 = { workspace = true, optional = true }
+lazy_static = { workspace = true, optional = true }
+libc = { workspace = true, optional = true }
+log = { workspace = true, optional = true }
+http = { workspace = true, optional = true }
+openssl = { workspace = true, optional = true }
+pam-sys = { workspace = true, optional = true }
+percent-encoding = { workspace = true, optional = true }
+regex = { workspace = true, optional = true }
+serde = { workspace = true, optional = true, features = [ "derive" ] }
+serde_json = { workspace = true, optional = true }
+serde_plain = { workspace = true, optional = true }
+
+proxmox-rest-server = { workspace = true, optional = true }
+proxmox-router = { workspace = true, optional = true }
+proxmox-schema = { workspace = true, optional = true, features = [ "api-macro", "api-types" ] }
+proxmox-tfa = { workspace = true, optional = true, features = [ "api" ] }
+
+[features]
+default = []
+
+ticket = [ "dep:base64", "dep:percent-encoding", "dep:openssl" ]
+api-types = [ "dep:const_format", "dep:lazy_static", "dep:regex", "dep:serde", "dep:serde_plain", "dep:proxmox-schema" ]
+api = [
+    "api-types",
+    "ticket",
+
+    "dep:http",
+    "dep:serde_json",
+
+    "dep:proxmox-rest-server",
+    "dep:proxmox-router",
+    "dep:proxmox-tfa",
+]
+pam-authenticator = [ "api", "dep:libc", "dep:log", "dep:pam-sys" ]

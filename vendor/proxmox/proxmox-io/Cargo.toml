@@ -1,0 +1,15 @@
+[package]
+name = "proxmox-io"
+version = "1.0.1"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "extension traits for Read and Write"
+
+exclude.workspace = true
+
+[dependencies]
+endian_trait = { workspace = true, features = ["arrays"] }
+# this is also the feature name:
+tokio = { workspace = true, features = [ "io-util" ], optional = true }

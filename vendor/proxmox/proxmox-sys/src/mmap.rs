@@ -1,0 +1,132 @@
+//! Memory mapping helpers.
+
+use std::convert::TryFrom;
+use std::mem::MaybeUninit;
+use std::num::NonZeroUsize;
+use std::os::unix::io::RawFd;
+use std::{io, mem};
+
+use anyhow::format_err;
+use nix::sys::mman;
+
+use proxmox_lang::error::io_err_other;
+
+use crate::error::SysError;
+
+pub struct Mmap<T> {
+    data: *mut T,
+    len: usize,
+    /// Bytes mapped in front of `data` to page align the offset passed to mmap(2).
+    align_offset: usize,
+}
+
+unsafe impl<T> Send for Mmap<T> where T: Send {}
+unsafe impl<T> Sync for Mmap<T> where T: Sync {}
+
+impl<T> Mmap<T> {
+    /// Map a file into memory.
+    ///
+    /// # Safety
+    ///
+    /// `fd` must refer to a valid file descriptor.
+    pub unsafe fn map_fd(
+        fd: RawFd,
+        ofs: u64,
+        count: usize,
+        prot: mman::ProtFlags,
+        flags: mman::MapFlags,
+    ) -> io::Result<Self> {
+        let byte_len = count * mem::size_of::<T>();
+        if byte_len == 0 {
+            return Err(io_err_other(format_err!("mapped length must not be zero")));
+        }
+
+        // mmap(2) requires the offset to be a multiple of the page size, which is not the case
+        // for e.g. the 4 KiB index file headers on systems with 16 KiB pages (Apple Silicon)
+        let page_size = page_size()?;
+        let align_offset = (ofs % page_size) as usize;
+        let map_len = NonZeroUsize::new(byte_len + align_offset).unwrap();
+
+        // libc::size_t vs usize
+        #[allow(clippy::useless_conversion)]
+        let data = mman::mmap(
+            None,
+            map_len,
+            prot,
+            flags,
+            fd,
+            libc::off_t::try_from(ofs - align_offset as u64).map_err(io_err_other)?,
+        )
+        .map_err(SysError::into_io_error)?;
+
+        Ok(Self {
+            data: (data as *mut u8).add(align_offset) as *mut T,
+            len: count,
+            align_offset,
+        })
+    }
+}
+
+fn page_size() -> io::Result<u64> {
+    match unsafe { libc::sysconf(libc::_SC_PAGESIZE) } {
+        size if size > 0 => Ok(size as u64),
+        _ => Err(io::Error::last_os_error()),
+    }
+}
+
+impl<T> std::ops::Deref for Mmap<T> {
+    type Target = [T];
+
+    #[inline]
+    fn deref(&self) -> &[T] {
+        unsafe { std::slice::from_raw_parts(self.data, self.len) }
+    }
+}
+
+impl<T> std::ops::DerefMut for Mmap<T> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut [T] {
+        unsafe { std::slice::from_raw_parts_mut(self.data, self.len) }
+    }
+}
+
+impl<T> Drop for Mmap<T> {
+    fn drop(&mut self) {
+        unsafe {
+            // In theory this can fail if too many memory mappings are already present and
+            // unmapping a smaller region inside a bigger one, causing it to become split into 2
+            // regions. But then we have bigger problems already anyway, so we'll just ignore this.
+            let _ = mman::munmap(
+                (self.data as *mut u8).sub(self.align_offset) as *mut libc::c_void,
+                self.len * mem::size_of::<T>() + self.align_offset,
+            );
+        }
+    }
+}
+
+impl<'a, T> IntoIterator for &'a Mmap<T> {
+    type Item = &'a T;
+    type IntoIter = <&'a [T] as IntoIterator>::IntoIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        <&'a [T] as IntoIterator>::into_iter(self)
+    }
+}
+
+impl<T> Mmap<MaybeUninit<T>> {
+    /// Converts to `Mmap<T>`.
+    ///
+    /// # Safety
+    ///
+    /// It is up to the caller to ensure this is safe, see
+    /// [`MaybeUninit::assume_init`](std::mem::MaybeUninit::assume_init).
+    pub unsafe fn assume_init(self) -> Mmap<T> {
+        let out = Mmap {
+            data: self.data as *mut T,
+            len: self.len,
+            align_offset: self.align_offset,
+        };
+        std::mem::forget(self);
+        out
+    }
+}

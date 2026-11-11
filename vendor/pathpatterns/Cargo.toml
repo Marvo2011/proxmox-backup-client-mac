@@ -1,0 +1,13 @@
+[package]
+name = "pathpatterns"
+version = "0.3.0"
+authors = ["Wolfgang Bumiller <w.bumiller@errno.eu>"]
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "Include/exclude path list implementation with git-like globbing support."
+
+exclude = [ ".cargo", "build", "debian" ]
+
+[dependencies]
+bitflags = "1.2"
+libc = "0.2"

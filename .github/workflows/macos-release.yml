@@ -1,0 +1,131 @@
+name: macOS release
+
+# Builds the client and the pxar tool for macOS on Apple Silicon and publishes
+# them as a GitHub release tagged with the client version (e.g. v3.2.4).
+#
+# The version only changes with upstream version bumps, so pushes without a
+# bump update the existing release: its binaries are replaced and the tag is
+# moved to the new commit.
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: macos-release
+  cancel-in-progress: false
+
+env:
+  FUSE_T_VERSION: "1.2.9"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Build and release (macOS arm64)
+    runs-on: macos-15
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      # FUSE-T provides libfuse3 for `mount` and `map`. Building needs its headers and
+      # library, the binaries only link it weakly and run without it.
+      - name: Install FUSE-T
+        run: |
+          curl -fsSL -o fuse-t.pkg \
+            "https://github.com/macos-fuse-t/fuse-t/releases/download/${FUSE_T_VERSION}/fuse-t-macos-installer-${FUSE_T_VERSION}.pkg"
+          pkgutil --check-signature fuse-t.pkg | grep -q "Developer ID Installer"
+          sudo installer -pkg fuse-t.pkg -target /
+          pkgconf --modversion fuse3
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # Link OpenSSL statically, so the binaries do not depend on Homebrew.
+      - name: Configure OpenSSL
+        run: |
+          echo "OPENSSL_DIR=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
+          echo "OPENSSL_STATIC=1" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: >
+          cargo build --release --locked
+          -p proxmox-backup-client -p pxar-bin
+
+      - name: Test
+        run: >
+          cargo test --locked
+          -p pbs-client -p pbs-datastore -p pbs-key-config -p pbs-config
+          -p pbs-pxar-fuse -p pxar-bin
+
+      - name: Check linked libraries
+        run: |
+          for bin in proxmox-backup-client pxar; do
+            otool -L "target/release/$bin"
+            # only system libraries and the weakly linked FUSE-T library are allowed
+            if otool -L "target/release/$bin" | tail -n +2 \
+                | grep -vE '^\s+(/usr/lib/|/System/Library/|@rpath/libfuse3)'; then
+              echo "::error::$bin links non-system libraries"
+              exit 1
+            fi
+          done
+
+      - name: Determine version
+        id: version
+        run: |
+          version=$(target/release/proxmox-backup-client version --output-format json \
+            | jq -r '.client.version + "." + .client.release')
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::unexpected client version '$version'"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+
+      - name: Package
+        id: package
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          name="proxmox-backup-client-${VERSION}-macos-arm64"
+          mkdir -p "dist/$name"
+          cp target/release/proxmox-backup-client target/release/pxar "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          (cd dist && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256")
+          echo "archive=dist/$name.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ steps.version.outputs.tag }}
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+        run: |
+          cat > notes.md <<EOF
+          proxmox-backup-client ${VERSION} and pxar for macOS on Apple Silicon (arm64).
+
+          Built from ${GITHUB_SHA}.
+
+          - \`mount\` and \`map\` require [FUSE-T](https://www.fuse-t.org), everything else runs without it.
+          - The binaries are not notarized. After downloading with a browser, remove the quarantine
+            attribute: \`xattr -d com.apple.quarantine proxmox-backup-client pxar\`
+          EOF
+
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            # same version as before: move the tag and replace the binaries
+            git tag -f "$TAG" "$GITHUB_SHA"
+            git push -f origin "refs/tags/$TAG"
+            gh release upload "$TAG" "$ARCHIVE" "$ARCHIVE.sha256" --clobber
+            gh release edit "$TAG" --notes-file notes.md
+          else
+            gh release create "$TAG" "$ARCHIVE" "$ARCHIVE.sha256" \
+              --target "$GITHUB_SHA" \
+              --title "proxmox-backup-client ${VERSION} for macOS (Apple Silicon)" \
+              --notes-file notes.md
+          fi

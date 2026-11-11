@@ -1,0 +1,5 @@
+/target
+/testdir
+**/*.rs.bk
+Cargo.lock
+test.pxar

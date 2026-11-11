@@ -1,0 +1,23 @@
+[package]
+name = "proxmox-async"
+version = "0.4.1"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Proxmox async/tokio helpers"
+
+exclude.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+futures.workspace = true
+lazy_static.workspace = true
+pin-utils.workspace = true
+tokio = { workspace = true, features = [ "net", "rt", "rt-multi-thread", "sync"] }
+
+proxmox-io = { workspace = true, features = [ "tokio" ] }
+proxmox-lang.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = [ "macros" ] }

@@ -1,0 +1,17 @@
+# build output
+/target/
+/dist/
+**/target/
+
+# test artifacts
+/pxar-bin/tests/archive.pxar
+/tests/catar_data/test_xattrs_dest/
+/vendor/**/testdir/
+/vendor/**/Cargo.lock
+
+# editors and macOS
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/

@@ -1,0 +1,142 @@
+# macOS build of the Proxmox Backup client and the pxar tool, see README.md.
+#
+# Trimmed from the upstream proxmox-backup workspace: only the crates needed for
+# the client are part of it, the server package and its crates are left out.
+# [workspace.dependencies] is kept as in upstream.
+
+[workspace.package]
+version = "3.2.4"
+authors = [
+    "Dietmar Maurer <dietmar@proxmox.com>",
+    "Dominik Csapak <d.csapak@proxmox.com>",
+    "Christian Ebner <c.ebner@proxmox.com>",
+    "Fabian Grünbichler <f.gruenbichler@proxmox.com>",
+    "Stefan Reiter <s.reiter@proxmox.com>",
+    "Thomas Lamprecht <t.lamprecht@proxmox.com>",
+    "Wolfgang Bumiller <w.bumiller@proxmox.com>",
+    "Proxmox Support Team <support@proxmox.com>",
+]
+edition = "2021"
+license = "AGPL-3"
+repository = "https://git.proxmox.com/?p=proxmox-backup.git"
+
+[workspace]
+resolver = "2"
+members = [
+    "pbs-api-types",
+    "pbs-buildcfg",
+    "pbs-client",
+    "pbs-config",
+    "pbs-datastore",
+    "pbs-fuse-loop",
+    "pbs-key-config",
+    "pbs-pxar-fuse",
+    "pbs-tools",
+
+    "proxmox-backup-client",
+
+    "pxar-bin",
+]
+# Proxmox crates with macOS changes, patched in via .cargo/config.toml
+exclude = [ "vendor" ]
+
+[workspace.dependencies]
+# proxmox workspace
+proxmox-apt = "0.10.5"
+proxmox-async = "0.4"
+proxmox-auth-api = "0.4"
+proxmox-borrow = "1"
+proxmox-compression = "0.2"
+proxmox-fuse = "0.1.3"
+proxmox-http = { version = "0.9.0", features = [ "client", "http-helpers", "websocket" ] } # see below
+proxmox-human-byte = "0.1"
+proxmox-io = "1.0.1" # tools and client use "tokio" feature
+proxmox-lang = "1.1"
+proxmox-ldap = "0.2.1"
+proxmox-metrics = "0.3.1"
+proxmox-notify = "0.4"
+proxmox-openid = "0.10.0"
+proxmox-rest-server = { version = "0.5.1", features = [ "templates" ] }
+# some use "cli", some use "cli" and "server", pbs-config uses nothing
+proxmox-router = { version = "2.0.0", default_features = false }
+proxmox-rrd = { version = "0.1" }
+# everything but pbs-config and pbs-client use "api-macro"
+proxmox-schema = "3"
+proxmox-section-config = "2"
+proxmox-serde = "0.1.1"
+proxmox-shared-memory = "0.3.0"
+proxmox-sortable-macro = "0.1.2"
+proxmox-subscription = { version = "0.4.2", features = [ "api-types" ] }
+proxmox-sys = "0.5.4"
+proxmox-tfa = { version = "4.0.4", features = [ "api", "api-types" ] }
+proxmox-time = "1.1.6"
+proxmox-uuid = "1"
+
+# other proxmox crates
+pathpatterns = "0.3"
+proxmox-acme = "0.5"
+pxar = "0.10.2"
+
+# PBS workspace
+pbs-api-types = { path = "pbs-api-types" }
+pbs-buildcfg = { path = "pbs-buildcfg" }
+pbs-client = { path = "pbs-client" }
+pbs-config = { path = "pbs-config" }
+pbs-datastore = { path = "pbs-datastore" }
+pbs-fuse-loop = { path = "pbs-fuse-loop" }
+pbs-key-config = { path = "pbs-key-config" }
+pbs-pxar-fuse = { path = "pbs-pxar-fuse" }
+pbs-tape = { path = "pbs-tape" }
+pbs-tools = { path = "pbs-tools" }
+
+# regular crates
+anyhow = "1.0"
+async-trait = "0.1.56"
+apt-pkg-native = "0.3.2"
+base64 = "0.13"
+bitflags = "1.2.1"
+bytes = "1.0"
+cidr = "0.2.1"
+crc32fast = "1"
+const_format = "0.2"
+crossbeam-channel = "0.5"
+endian_trait = { version = "0.6", features = ["arrays"] }
+env_logger = "0.10"
+flate2 = "1.0"
+foreign-types = "0.3"
+futures = "0.3"
+h2 = { version = "0.3", features = [ "stream" ] }
+handlebars = "3.0"
+hex = "0.4.3"
+http = "0.2"
+hyper = { version = "0.14", features = [ "full" ] }
+lazy_static = "1.4"
+libc = "0.2"
+log = "0.4.17"
+nix = "0.26.1"
+nom = "7"
+num-traits = "0.2"
+once_cell = "1.3.1"
+openssl = "0.10.40"
+percent-encoding = "2.1"
+pin-project-lite = "0.2"
+regex = "1.5.5"
+rustyline = "9"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_plain = "1"
+siphasher = "0.3"
+syslog = "6"
+tar = "0.4"
+termcolor = "1.1.2"
+thiserror = "1.0"
+tokio = "1.6"
+tokio-openssl = "0.6.1"
+tokio-stream = "0.1.0"
+tokio-util = { version = "0.7", features = [ "io" ] }
+tower-service = "0.3.0"
+udev = "0.4"
+url = "2.1"
+walkdir = "2"
+xdg = "2.2"
+zstd = { version = "0.12", features = [ "bindgen" ] }

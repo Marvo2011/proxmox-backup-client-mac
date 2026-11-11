@@ -1,0 +1,40 @@
+[package]
+name = "proxmox-schema"
+version = "3.1.1"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "proxmox api schema and validation"
+
+exclude.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+const_format = { workspace = true, optional = true }
+lazy_static.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+textwrap = "0.16"
+
+# the upid type needs this for 'getpid'
+libc = { workspace = true, optional = true }
+nix = { workspace = true, optional = true }
+
+proxmox-api-macro = { workspace = true, optional = true }
+
+[dev-dependencies]
+url.workspace = true
+serde = { workspace = true, features = [ "derive" ] }
+proxmox-api-macro.workspace = true
+
+[features]
+default = []
+
+api-macro = ["dep:proxmox-api-macro"]
+upid-api-impl = [ "dep:libc", "dep:nix" ]
+api-types = [ "dep:const_format" ]
+
+# Testing only
+test-harness = []

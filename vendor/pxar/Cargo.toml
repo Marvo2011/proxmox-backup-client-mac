@@ -1,0 +1,67 @@
+[package]
+name = "pxar"
+# API broken, next is 0.11.0 (due to `ReadAtImpl` enum variants being made private)
+version = "0.10.2"
+authors = ["Wolfgang Bumiller <w.bumiller@proxmox.com>"]
+edition = "2021"
+license = "AGPL-3"
+description = "Proxmox Archive format support library"
+exclude = [
+    "build",
+    "debian",
+    "testdir",
+]
+
+[[example]]
+name = "apxar"
+path = "examples/apxar.rs"
+required-features = [ "async-example" ]
+
+[[example]]
+name = "pxarcmd"
+path = "examples/pxarcmd.rs"
+
+[[example]]
+name = "mk-format-hashes"
+path = "examples/mk-format-hashes.rs"
+test = false
+bench = false
+doc = false
+
+[[test]]
+name = "simple"
+path = "tests/simple/main.rs"
+test = true
+required-features = [ "test-harness" ]
+
+[[test]]
+name = "compat"
+path = "tests/compat.rs"
+test = true
+required-features = [ "test-harness" ]
+
+[dependencies]
+bitflags = "1.2.1"
+endian_trait = { version = "0.6", features = ["arrays"] }
+siphasher = "0.3"
+
+tokio = { version = "1.0", optional = true, default-features = false }
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+libc = "0.2"
+
+[features]
+default = [ "tokio-io" ]
+tokio-io = [ "tokio" ]
+tokio-fs = [ "tokio-io", "tokio/fs" ]
+
+full = [ "tokio-fs"]
+
+async-example = [
+    "tokio-io",
+    "tokio-fs",
+    "tokio/rt-multi-thread",
+    "tokio/macros",
+]
+
+test-harness = []

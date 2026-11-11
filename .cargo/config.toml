@@ -1,0 +1,36 @@
+# FUSE (`mount`/`map`) uses FUSE-T, which has to be installed for building
+# (https://www.fuse-t.org). libfuse3 is linked weakly, so the binaries also run
+# without it, see proxmox-fuse's `available()`.
+[target.'cfg(target_os = "macos")']
+rustflags = [
+    "-L", "native=/usr/local/lib",
+    "-C", "link-arg=-Wl,-weak-lfuse3",
+    "-C", "link-arg=-Wl,-rpath,/usr/local/lib",
+]
+
+# Proxmox crates are taken from vendor/, which carries the macOS changes, see
+# vendor/README.md. Paths are relative to the repository root.
+[patch.crates-io]
+proxmox-api-macro = { path = "vendor/proxmox/proxmox-api-macro" }
+proxmox-async = { path = "vendor/proxmox/proxmox-async" }
+proxmox-auth-api = { path = "vendor/proxmox/proxmox-auth-api" }
+proxmox-borrow = { path = "vendor/proxmox/proxmox-borrow" }
+proxmox-compression = { path = "vendor/proxmox/proxmox-compression" }
+proxmox-http-error = { path = "vendor/proxmox/proxmox-http-error" }
+proxmox-http = { path = "vendor/proxmox/proxmox-http" }
+proxmox-human-byte = { path = "vendor/proxmox/proxmox-human-byte" }
+proxmox-io = { path = "vendor/proxmox/proxmox-io" }
+proxmox-lang = { path = "vendor/proxmox/proxmox-lang" }
+proxmox-notify = { path = "vendor/proxmox/proxmox-notify" }
+proxmox-router = { path = "vendor/proxmox/proxmox-router" }
+proxmox-schema = { path = "vendor/proxmox/proxmox-schema" }
+proxmox-section-config = { path = "vendor/proxmox/proxmox-section-config" }
+proxmox-serde = { path = "vendor/proxmox/proxmox-serde" }
+proxmox-shared-memory = { path = "vendor/proxmox/proxmox-shared-memory" }
+proxmox-sortable-macro = { path = "vendor/proxmox/proxmox-sortable-macro" }
+proxmox-sys = { path = "vendor/proxmox/proxmox-sys" }
+proxmox-time = { path = "vendor/proxmox/proxmox-time" }
+proxmox-uuid = { path = "vendor/proxmox/proxmox-uuid" }
+pathpatterns = { path = "vendor/pathpatterns" }
+proxmox-fuse = { path = "vendor/proxmox-fuse" }
+pxar = { path = "vendor/pxar" }
