@@ -95,6 +95,16 @@ jobs:
             echo "::error::binary does not report version '$version'"
             exit 1
           fi
+          # release notes: the section of this version in CHANGELOG.md
+          awk -v heading="## $version" '
+            $0 == heading { found = 1; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md | sed -e '/./,$!d' > changes.md
+          if [[ ! -s changes.md ]]; then
+            echo "::error::CHANGELOG.md has no section '## $version'"
+            exit 1
+          fi
           version=${version/+/-}
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "tag=v$version" >> "$GITHUB_OUTPUT"
@@ -126,7 +136,11 @@ jobs:
           - \`mount\` and \`map\` require [FUSE-T](https://www.fuse-t.org), everything else runs without it.
           - The binaries are not notarized. After downloading with a browser, remove the quarantine
             attribute: \`xattr -d com.apple.quarantine proxmox-backup-client pxar\`
+
+          ## Changes
+
           EOF
+          cat changes.md >> notes.md
 
           if gh release view "$TAG" > /dev/null 2>&1; then
             # same version as before: move the tag and replace the binaries

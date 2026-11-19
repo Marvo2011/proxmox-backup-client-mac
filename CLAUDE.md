@@ -22,7 +22,7 @@ The build needs FUSE-T installed (https://www.fuse-t.org), because `proxmox-fuse
 
 ## Versioning
 
-The workspace version in `Cargo.toml` is the upstream version plus the release date of the port as build metadata, e.g. `3.2.4+20261119`. Bump the date for a new release. The release workflow tags it as `v3.2.4-20261119`; pushes without a bump replace the binaries of the existing release. The workflow then writes the Homebrew formula (prebuilt binaries) to `<owner>/homebrew-tap`, if the `HOMEBREW_TAP_TOKEN` secret is set.
+The workspace version in `Cargo.toml` is the upstream version plus the release date of the port as build metadata, e.g. `3.2.4+20261119`. Bump the date for a new release and add a `## <version>` section to `CHANGELOG.md`: the workflow uses it as release notes and fails without it. Note user-visible changes there as they are made. The release workflow tags it as `v3.2.4-20261119`; pushes without a bump replace the binaries of the existing release. The workflow then writes the Homebrew formula (prebuilt binaries) to `<owner>/homebrew-tap`, if the `HOMEBREW_TAP_TOKEN` secret is set.
 
 ## Layout
 
