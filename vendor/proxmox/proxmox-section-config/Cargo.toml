@@ -1,13 +1,14 @@
 [package]
 name = "proxmox-section-config"
-version = "2.0.2"
+description = "proxmox schema based section config format parsing"
+version = "3.3.0"
+
 authors.workspace = true
 edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "proxmox schema based section config format parsing"
-
-exclude.workspace = true
 
 [dependencies]
 anyhow.workspace = true
@@ -18,3 +19,6 @@ serde_json.workspace = true
 proxmox-schema.workspace = true
 # FIXME: remove!
 proxmox-lang.workspace = true
+
+[dev-dependencies]
+serde = { workspace = true, features = ["derive"] }

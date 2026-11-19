@@ -5,12 +5,10 @@ use std::mem;
 
 use endian_trait::Endian;
 
-use crate::vec::{self, ByteVecExt};
-
 /// Adds some additional related functionality for types implementing [`Read`](std::io::Read).
 ///
 /// Particularly for reading into a newly allocated buffer, appending to a `Vec<u8>` or reading
-/// values of a specific endianess (types implementing [`Endian`]).
+/// values of a specific endianness (types implementing [`Endian`]).
 ///
 /// Examples:
 /// ```no_run
@@ -22,14 +20,11 @@ use crate::vec::{self, ByteVecExt};
 /// // read some bytes into a newly allocated Vec<u8>:
 /// let mut data = file.read_exact_allocated(64)?;
 ///
-/// // appending data to a vector:
-/// let actually_appended = file.append_to_vec(&mut data, 64)?; // .read() version
-/// file.append_exact_to_vec(&mut data, 64)?; // .read_exact() version
 /// # Ok(())
 /// # }
 /// ```
 ///
-/// Or for reading values of a defined representation and endianess:
+/// Or for reading values of a defined representation and endianness:
 ///
 /// ```no_run
 /// # use endian_trait::Endian;
@@ -52,16 +47,14 @@ use crate::vec::{self, ByteVecExt};
 ///
 /// [`Endian`]: https://docs.rs/endian_trait/0.6/endian_trait/trait.Endian.html
 pub trait ReadExt {
-    /// Read data into a newly allocated vector. This is a shortcut for:
-    /// ```ignore
-    /// let mut data = Vec::with_capacity(len);
-    /// unsafe {
-    ///     data.set_len(len);
-    /// }
-    /// reader.read_exact(&mut data)?;
-    /// ```
+    /// Read an exact amount of data into a newly allocated vector.
     ///
-    /// With this trait, we just use:
+    /// Returns [`io::ErrorKind::UnexpectedEof`] if not enough data could be read.
+    ///
+    /// Allocation failures may result in [`io::ErrorKind::OutOfMemory`], but
+    /// callers should not rely on this because many systems overcommit memory.
+    ///
+    /// Example:
     /// ```no_run
     /// use proxmox_io::ReadExt;
     /// # fn code(mut reader: std::fs::File, len: usize) -> std::io::Result<()> {
@@ -71,13 +64,7 @@ pub trait ReadExt {
     /// ```
     fn read_exact_allocated(&mut self, size: usize) -> io::Result<Vec<u8>>;
 
-    /// Append data to a vector, growing it as necessary. Returns the amount of data appended.
-    fn append_to_vec(&mut self, out: &mut Vec<u8>, size: usize) -> io::Result<usize>;
-
-    /// Append an exact amount of data to a vector, growing it as necessary.
-    fn append_exact_to_vec(&mut self, out: &mut Vec<u8>, size: usize) -> io::Result<()>;
-
-    /// Read a value with host endianess.
+    /// Read a value with host endianness.
     ///
     /// This is limited to types implementing the [`Endian`] trait under the assumption that
     /// this is only done for types which are supposed to be read/writable directly.
@@ -187,7 +174,7 @@ pub trait ReadExt {
     /// [`Endian`]: https://docs.rs/endian_trait/0.6/endian_trait/trait.Endian.html
     unsafe fn read_be_value<T: Endian>(&mut self) -> io::Result<T>;
 
-    /// Read a boxed value with host endianess.
+    /// Read a boxed value with host endianness.
     ///
     /// This is currently not limited to types implementing the [`Endian`] trait as in our use
     /// cases we use this for types which are too big to want to always perform endian swaps
@@ -239,30 +226,22 @@ pub trait ReadExt {
 
 impl<R: io::Read> ReadExt for R {
     fn read_exact_allocated(&mut self, size: usize) -> io::Result<Vec<u8>> {
-        let mut out = unsafe { vec::uninitialized(size) };
-        self.read_exact(&mut out)?;
-        Ok(out)
-    }
+        let mut out = vec![];
+        out.try_reserve_exact(size)?;
 
-    fn append_to_vec(&mut self, out: &mut Vec<u8>, size: usize) -> io::Result<usize> {
-        let pos = out.len();
-        unsafe {
-            out.grow_uninitialized(size);
-        }
-        let got = self.read(&mut out[pos..])?;
-        unsafe {
-            out.set_len(pos + got);
-        }
-        Ok(got)
-    }
+        let limit = size.try_into().map_err(|_| io::ErrorKind::InvalidInput)?;
 
-    fn append_exact_to_vec(&mut self, out: &mut Vec<u8>, size: usize) -> io::Result<()> {
-        let pos = out.len();
-        unsafe {
-            out.grow_uninitialized(size);
+        use io::Read;
+        self.take(limit).read_to_end(&mut out)?;
+
+        if out.len() != size {
+            Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "failed to fill whole buffer",
+            ))
+        } else {
+            Ok(out)
         }
-        self.read_exact(&mut out[pos..])?;
-        Ok(())
     }
 
     unsafe fn read_host_value<T: Endian>(&mut self) -> io::Result<T> {
@@ -285,15 +264,15 @@ impl<R: io::Read> ReadExt for R {
     }
 
     unsafe fn read_host_value_boxed<T>(&mut self) -> io::Result<Box<T>> {
-        // FIXME: Change this once #![feature(new_uninit)] lands for Box<T>!
-
         unsafe {
-            let ptr = std::alloc::alloc(std::alloc::Layout::new::<T>()) as *mut T;
+            let mut result = Box::<T>::new_uninit();
+            // If this reads uninitialized memory from result or lies about
+            // having written to it that would be undefined behavior.
             self.read_exact(std::slice::from_raw_parts_mut(
-                ptr as *mut u8,
-                mem::size_of::<T>(),
+                result.as_mut_ptr().cast::<u8>(),
+                size_of::<T>(),
             ))?;
-            Ok(Box::from_raw(ptr))
+            Ok(result.assume_init())
         }
     }
 
@@ -326,7 +305,7 @@ impl<R: io::Read> ReadExt for R {
 
     fn skip_to_end(&mut self) -> io::Result<usize> {
         let mut skipped_bytes = 0;
-        let mut buf = unsafe { vec::uninitialized(32 * 1024) };
+        let mut buf = vec![0; 32 * 1024];
         loop {
             match self.read(&mut buf) {
                 Ok(0) => return Ok(skipped_bytes),
@@ -336,4 +315,24 @@ impl<R: io::Read> ReadExt for R {
             }
         }
     }
+}
+
+#[test]
+fn test_read_exact_allocated() {
+    let input = [1, 2, 3];
+
+    let mut r = input.as_slice();
+    assert_eq!(r.read_exact_allocated(3).unwrap(), &input);
+
+    let mut r = input.as_slice();
+    assert_eq!(
+        r.read_exact_allocated(4).unwrap_err().kind(),
+        io::ErrorKind::UnexpectedEof
+    );
+
+    let mut r = input.as_slice();
+    assert_eq!(
+        r.read_exact_allocated(usize::MAX).unwrap_err().kind(),
+        io::ErrorKind::OutOfMemory
+    );
 }

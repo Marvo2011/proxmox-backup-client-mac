@@ -4,28 +4,36 @@ version = "0.1.0"
 authors.workspace = true
 edition.workspace = true
 description = "Configuration file management for PBS"
+rust-version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
 const_format.workspace = true
-lazy_static.workspace = true
+hex.workspace = true
 libc.workspace = true
 nix.workspace = true
 once_cell.workspace = true
 openssl.workspace = true
+parking_lot.workspace = true
 regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
+proxmox-http.workspace = true
+proxmox-lang.workspace = true
 proxmox-notify.workspace = true
 proxmox-router = { workspace = true, default-features = false }
+proxmox-product-config.workspace = true
+proxmox-s3-client.workspace = true
 proxmox-schema.workspace = true
 proxmox-section-config.workspace = true
 proxmox-sys = { workspace = true, features = [ "acl", "crypt", "timer" ] }
 proxmox-time.workspace = true
+proxmox-uuid.workspace = true
 
 pbs-api-types.workspace = true
 pbs-buildcfg.workspace = true
+pbs-key-config.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 proxmox-shared-memory.workspace = true

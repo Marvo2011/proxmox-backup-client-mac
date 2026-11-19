@@ -2,7 +2,7 @@
 
 use anyhow::Error;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use proxmox_api_macro::api;
 use proxmox_schema as schema;
@@ -39,10 +39,25 @@ pub struct IndexText {
     text: String,
 }
 
+#[cfg(false)]
+#[api(
+    properties: {
+        unused0: { schema: INDEX_SCHEMA },
+        unused1: { schema: TEXT_SCHEMA },
+    }
+)]
+/// Index and text.
+#[derive(Deserialize, Serialize)]
+pub struct UnusedStruct {
+    unused0: u64,
+    unused1: String,
+}
+
 #[api(
     properties: {
         nv: { type: NameValue },
         it: { type: IndexText },
+        un: { type: UnusedStruct },
     },
 )]
 /// Name, value, index and text.
@@ -53,6 +68,10 @@ pub struct Nvit {
 
     #[serde(flatten)]
     it: IndexText,
+
+    #[cfg(false)]
+    #[serde(flatten)]
+    un: UnusedStruct,
 }
 
 #[test]
@@ -75,6 +94,24 @@ fn test_nvit() {
     assert_eq!(TEST_SCHEMA, Nvit::API_SCHEMA);
 }
 
+#[test]
+fn test_nvit_json_schema_macro() {
+    const TEST_SCHEMA: ::proxmox_schema::Schema = proxmox_api_macro::json_schema! {
+        description: "Name, value, index and text.",
+        allOf: [
+            {
+                description: "Name and value.",
+                properties: {
+                    name: { schema: NAME_SCHEMA },
+                    value: { schema: VALUE_SCHEMA },
+                },
+            },
+            { type: IndexText },
+        ],
+    };
+    assert_eq!(TEST_SCHEMA, Nvit::API_SCHEMA);
+}
+
 #[api(
     properties: {
         nv: { type: NameValue },
@@ -92,6 +129,10 @@ struct WithExtra {
 
     /// Extra field.
     extra: String,
+
+    /// Unused field.
+    #[cfg(false)]
+    unused_field: String,
 }
 
 #[test]

@@ -4,6 +4,23 @@ The version is the upstream proxmox-backup version plus the release date of the
 port. The release workflow takes the release notes from the section of the
 released version, so every version needs one.
 
+## 4.2.10+20261119
+
+- Based on upstream proxmox-backup 4.2.10 (before 3.2.4). New in the client
+  since then, among others:
+  - `--change-detection-mode metadata`: split archives (`.mpxar`/`.ppxar`),
+    unchanged files are reused from the previous snapshot instead of being
+    read again
+  - the repository can be given as separate options (`--server`, `--port`,
+    `--datastore`, `--auth-id`) instead of `--repository`
+  - the limit for open files is raised for the metadata change detection
+    (on macOS up to the kernel limit `kern.maxfilesperproc`)
+- The fixes of 3.2.4+20261119 (online-only cloud files, `EINTR`, upload
+  errors) are carried over.
+- Restoring hardlinks refuses `..` and symlinks in the target path, as
+  `openat2(RESOLVE_BENEATH)` does on Linux.
+- Building needs Rust 1.91 or newer.
+
 ## 3.2.4+20261119
 
 - Online-only files of cloud storage folders (iCloud Drive, Nextcloud, OneDrive

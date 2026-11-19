@@ -6,7 +6,7 @@ use std::path::Path;
 
 #[cfg(target_os = "linux")]
 use anyhow::bail;
-use anyhow::{anyhow, Context, Error};
+use anyhow::{Context, Error, anyhow};
 use nix::errno::Errno;
 #[cfg(target_os = "linux")]
 use nix::fcntl::OFlag;
@@ -15,14 +15,17 @@ use nix::sys::stat::Mode;
 
 use pxar::Metadata;
 
+use proxmox_log::info;
+#[cfg(target_os = "linux")]
+use proxmox_log::warn;
 use proxmox_sys::c_result;
 use proxmox_sys::error::SysError;
 use proxmox_sys::fs::xattr;
 #[cfg(target_os = "linux")]
 use proxmox_sys::fs::{self, acl};
 
-use crate::pxar::tools::perms_from_metadata;
 use crate::pxar::Flags;
+use crate::pxar::tools::perms_from_metadata;
 
 //
 // utility functions
@@ -80,7 +83,13 @@ pub fn apply_at(
             Mode::empty(),
         )?;
 
-        apply(flags, metadata, fd.as_raw_fd(), path_info, on_error)
+        apply(
+            flags,
+            metadata,
+            fd.as_raw_fd(),
+            &path_info.join(file_name.to_string_lossy().to_string()),
+            on_error,
+        )
     }
 
     // no O_PATH, so address the entry by path to also cover symlinks, FIFOs and devices
@@ -91,7 +100,14 @@ pub fn apply_at(
         path.extend_from_slice(file_name.to_bytes());
         let c_path = CString::new(path)?;
 
-        apply_to_path(flags, metadata, &c_path, None, path_info, on_error)
+        apply_to_path(
+            flags,
+            metadata,
+            &c_path,
+            None,
+            &path_info.join(file_name.to_string_lossy().to_string()),
+            on_error,
+        )
     }
 }
 
@@ -102,7 +118,7 @@ fn fd_path(fd: RawFd) -> Result<CString, Error> {
 }
 
 #[cfg(target_os = "macos")]
-fn fd_path(fd: RawFd) -> Result<CString, Error> {
+pub(crate) fn fd_path(fd: RawFd) -> Result<CString, Error> {
     let mut buf = vec![0u8; libc::PATH_MAX as usize];
     c_result!(unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr()) })
         .context("failed to get path of file descriptor")?;
@@ -294,7 +310,7 @@ fn add_fcaps(
     c_result!(unsafe {
         sys_setxattr(
             c_proc_path,
-            xattr::xattr_name_fcaps().as_ptr(),
+            xattr::XATTR_NAME_FCAPS.as_ptr(),
             fcaps.data.as_ptr() as *const libc::c_void,
             fcaps.data.len(),
         )
@@ -320,7 +336,7 @@ fn apply_xattrs(
         }
 
         if !xattr::is_valid_xattr_name(xattr.name()) {
-            log::info!("skipping invalid xattr named {:?}", xattr.name());
+            info!("skipping invalid xattr named {:?}", xattr.name());
             continue;
         }
 
@@ -392,7 +408,7 @@ fn apply_acls(
             acl.add_entry_full(acl::ACL_GROUP_OBJ, None, mode)?;
 
             if !metadata.acl.users.is_empty() || !metadata.acl.groups.is_empty() {
-                log::warn!(
+                warn!(
                     "Warning: {:?}: Missing GROUP_OBJ entry in ACL, resetting to value of MASK",
                     path_info,
                 );
@@ -410,7 +426,7 @@ fn apply_acls(
     }
 
     if !acl.is_valid() {
-        bail!("Error while restoring ACL - ACL invalid");
+        warn!("Warning: {path_info:?} - ACL invalid, attempting restore anyway..");
     }
 
     acl.set_file(c_proc_path, acl::ACL_TYPE_ACCESS)?;
@@ -439,7 +455,7 @@ fn apply_acls(
         }
 
         if !acl.is_valid() {
-            bail!("Error while restoring ACL - ACL invalid");
+            warn!("Warning: {path_info:?} - ACL invalid, attempting restore anyway..");
         }
 
         acl.set_file(c_proc_path, acl::ACL_TYPE_DEFAULT)?;
@@ -539,7 +555,7 @@ fn apply_flags(flags: Flags, c_path: &CStr, entry_flags: u64) -> Result<(), Erro
 
     match c_result!(unsafe { libc::lchflags(c_path.as_ptr(), st_flags) }) {
         Ok(_) => Ok(()),
-        Err(err) if errno_is_unsupported(Errno::from_i32(err.raw_os_error().unwrap_or(0))) => {
+        Err(err) if errno_is_unsupported(Errno::from_raw(err.raw_os_error().unwrap_or(0))) => {
             Ok(())
         }
         Err(err) => Err(err).context("failed to set file flags"),

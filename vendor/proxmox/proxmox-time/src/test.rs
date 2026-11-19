@@ -1,10 +1,10 @@
-use anyhow::{bail, Error};
+use anyhow::{Error, bail};
 
 use super::*;
 
 fn test_event(v: &'static str) -> Result<(), Error> {
     match v.parse::<CalendarEvent>() {
-        Ok(event) => println!("CalendarEvent '{}' => {:?}", v, event),
+        Ok(event) => println!("CalendarEvent '{v}' => {event:?}"),
         Err(err) => bail!("parsing '{}' failed - {}", v, err),
     }
 
@@ -19,7 +19,7 @@ const fn make_test_time(mday: i32, hour: i32, min: i32) -> i64 {
 #[allow(clippy::identity_op)]
 fn test_compute_next_event() -> Result<(), Error> {
     let test_value = |v: &'static str, last: i64, expect: i64| -> Result<i64, Error> {
-        let event: CalendarEvent = match format!("{} UTC", v).parse() {
+        let event: CalendarEvent = match format!("{v} UTC").parse() {
             Ok(event) => event,
             Err(err) => bail!("parsing '{}' failed - {}", v, err),
         };
@@ -27,7 +27,7 @@ fn test_compute_next_event() -> Result<(), Error> {
         match event.compute_next_event(last) {
             Ok(Some(next)) => {
                 if next == expect {
-                    println!("next {:?} => {}", event, next);
+                    println!("next {event:?} => {next}");
                 } else {
                     bail!(
                         "next {:?} failed\nnext:  {:?}\nexpect: {:?}",
@@ -45,7 +45,7 @@ fn test_compute_next_event() -> Result<(), Error> {
     };
 
     let test_never = |v: &'static str, last: i64| -> Result<(), Error> {
-        let event: CalendarEvent = match format!("{} UTC", v).parse() {
+        let event: CalendarEvent = match format!("{v} UTC").parse() {
             Ok(event) => event,
             Err(err) => bail!("parsing '{}' failed - {}", v, err),
         };
@@ -184,10 +184,16 @@ fn test_compute_next_event() -> Result<(), Error> {
     test_value("2020-7..9-2/2", JUL_31_2020, JUL_31_2020 + 2 * DAY)?;
     test_value("2020,2021-12-31", JUL_31_2020, DEC_31_2020)?;
 
+    // keyword shortcuts
+    test_value("minutely", THURSDAY_00_00, THURSDAY_00_00 + MIN)?;
+    test_value("hourly", THURSDAY_00_00, THURSDAY_00_00 + HOUR)?;
+    test_value("weekly", THURSDAY_00_00, THURSDAY_00_00 + 4 * DAY)?; // next Monday
     test_value("monthly", 0, 31 * DAY)?;
     test_value("quarterly", 0, (31 + 28 + 31) * DAY)?;
     test_value("semiannually", 0, (31 + 28 + 31 + 30 + 31 + 30) * DAY)?;
-    test_value("yearly", 0, (365) * DAY)?;
+    test_value("semi-annually", 0, (31 + 28 + 31 + 30 + 31 + 30) * DAY)?;
+    test_value("yearly", 0, 365 * DAY)?;
+    test_value("annually", 0, 365 * DAY)?;
 
     test_never("2021-02-29", 0)?;
     test_never("02-30", 0)?;
@@ -227,7 +233,7 @@ fn test_calendar_event_weekday() -> Result<(), Error> {
 fn test_time_span_parser() -> Result<(), Error> {
     let test_value = |ts_str: &str, expect: f64| -> Result<(), Error> {
         let ts: TimeSpan = ts_str.parse()?;
-        assert_eq!(f64::from(ts), expect, "{}", ts_str);
+        assert_eq!(f64::from(ts), expect, "{ts_str}");
         Ok(())
     };
 

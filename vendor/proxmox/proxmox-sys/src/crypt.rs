@@ -5,7 +5,7 @@
 
 use std::ffi::{CStr, CString};
 
-use anyhow::{bail, Error};
+use anyhow::{Error, bail};
 
 // from libcrypt1, 'lib/crypt.h.in'
 const CRYPT_OUTPUT_SIZE: usize = 384;
@@ -26,7 +26,7 @@ pub const HASH_PREFIX: &str = "$y$";
 const HASH_COST: u64 = 5;
 
 #[repr(C)]
-struct crypt_data {
+struct CryptData {
     output: [libc::c_char; CRYPT_OUTPUT_SIZE],
     setting: [libc::c_char; CRYPT_OUTPUT_SIZE],
     input: [libc::c_char; CRYPT_MAX_PASSPHRASE_SIZE],
@@ -35,19 +35,19 @@ struct crypt_data {
     internal: [libc::c_char; CRYPT_DATA_INTERNAL_SIZE],
 }
 
-/// Encrypt a pasword - see man crypt(3)
+/// Encrypt a password - see man crypt(3)
 pub fn crypt(password: &[u8], salt: &[u8]) -> Result<String, Error> {
     #[link(name = "crypt")]
-    extern "C" {
+    unsafe extern "C" {
         #[link_name = "crypt_r"]
         fn __crypt_r(
             key: *const libc::c_char,
             salt: *const libc::c_char,
-            data: *mut crypt_data,
+            data: *mut CryptData,
         ) -> *mut libc::c_char;
     }
 
-    let mut data: crypt_data = unsafe { std::mem::zeroed() };
+    let mut data: CryptData = unsafe { std::mem::zeroed() };
     for (i, c) in salt.iter().take(data.setting.len() - 1).enumerate() {
         data.setting[i] = *c as libc::c_char;
     }
@@ -71,7 +71,7 @@ pub fn crypt(password: &[u8], salt: &[u8]) -> Result<String, Error> {
         // > output field of their data argument, and crypt writes an invalid hash to its static
         // > storage area.  This string will be shorter than 13 characters, will begin with a ‘*’,
         // > and will not compare equal to setting.
-        if data.output.first().is_none() || Some(&('*' as i8)) == data.output.first() {
+        if data.output[0] == '*' as libc::c_char {
             bail!("internal error: crypt_r returned invalid hash");
         }
         CStr::from_ptr(&data.output as *const _)
@@ -87,7 +87,7 @@ pub fn crypt(password: &[u8], salt: &[u8]) -> Result<String, Error> {
 /// - `rbytes`: The byte slice that contains cryptographically random bytes for generating the salt
 pub fn crypt_gensalt(prefix: &str, count: u64, rbytes: &[u8]) -> Result<String, Error> {
     #[link(name = "crypt")]
-    extern "C" {
+    unsafe extern "C" {
         #[link_name = "crypt_gensalt_rn"]
         fn __crypt_gensalt_rn(
             prefix: *const libc::c_char,
@@ -133,7 +133,7 @@ pub fn crypt_gensalt(prefix: &str, count: u64, rbytes: &[u8]) -> Result<String, 
     // while it states that this is "in addition" to returning a null pointer, this isn't how
     // `crypt_r` seems to behave (sometimes only setting an invalid hash) so add this here too just
     // in case.
-    if output.first().is_none() || Some(&('*' as i8)) == output.first() {
+    if output[0] == '*' as libc::c_char {
         bail!("internal error: crypt_gensalt_rn could not create a valid salt");
     }
 
@@ -142,7 +142,7 @@ pub fn crypt_gensalt(prefix: &str, count: u64, rbytes: &[u8]) -> Result<String, 
     Ok(res.to_str()?.to_string())
 }
 
-/// Encrypt a pasword using sha256 hashing method
+/// Encrypt a password using sha256 hashing method
 pub fn encrypt_pw(password: &str) -> Result<String, Error> {
     // 8*32 = 256 bits security (128+ recommended, see `man crypt(5)`)
     let salt = crate::linux::random_data(32)?;

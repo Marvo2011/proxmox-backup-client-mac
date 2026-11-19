@@ -7,6 +7,7 @@
 //! parsers.
 
 #![deny(unsafe_op_in_unsafe_fn)]
+#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
 #[cfg(feature = "api-macro")]
 pub use proxmox_api_macro::api;
@@ -21,20 +22,17 @@ pub mod de;
 pub mod format;
 pub mod ser;
 
+mod comma_separated_list;
+pub use comma_separated_list::*;
+
+// TODO: only a pub mod for backward compat, drop if all call sites are fixed.
 pub mod property_string;
+pub use property_string::PropertyString;
 
 mod schema;
 pub use schema::*;
 
 pub mod upid;
-
-// const_regex uses lazy_static, but we otherwise don't need it, and don't want to force users to
-// have to write it out in their Cargo.toml as dependency, so we add a hidden re-export here which
-// is semver-exempt!
-#[doc(hidden)]
-pub mod semver_exempt {
-    pub use lazy_static::lazy_static;
-}
 
 #[cfg(feature = "api-types")]
 pub mod api_types;

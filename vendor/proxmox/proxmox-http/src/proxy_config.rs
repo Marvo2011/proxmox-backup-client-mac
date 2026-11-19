@@ -2,9 +2,12 @@
 //!
 //! This can be used with the async [`Client`](crate::client::Client) or sync [`Client`](crate::client::sync::Client).
 
-use anyhow::{bail, format_err, Error};
+use anyhow::{Error, bail, format_err};
 
 use http::Uri;
+
+#[cfg(feature = "api-types")]
+use proxmox_schema::{ApiStringFormat, Schema, StringSchema};
 
 use crate::uri::build_authority;
 
@@ -83,8 +86,21 @@ impl ProxyConfig {
     pub fn to_proxy_string(&self) -> Result<String, Error> {
         let authority = build_authority(&self.host, self.port)?;
         Ok(match self.authorization {
-            None => format!("http://{}", authority),
-            Some(ref authorization) => format!("http://{}@{}", authorization, authority),
+            None => format!("http://{authority}"),
+            Some(ref authorization) => format!("http://{authorization}@{authority}"),
         })
     }
 }
+
+#[cfg(feature = "api-types")]
+/// Schema for the http proxy configuration
+pub const HTTP_PROXY_SCHEMA: Schema =
+    StringSchema::new("HTTP proxy configuration [http://]<host>[:port]")
+        .format(&ApiStringFormat::VerifyFn(|s| {
+            ProxyConfig::parse_proxy_url(s)?;
+            Ok(())
+        }))
+        .min_length(1)
+        .max_length(128)
+        .type_text("[http://]<host>[:port]")
+        .schema();

@@ -1,18 +1,19 @@
-use anyhow::{format_err, Error};
+use anyhow::{Error, format_err};
 use std::fs::File;
 use std::io::{Seek, SeekFrom, Write};
 use std::sync::Arc;
 
 use futures::future::AbortHandle;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use pbs_api_types::{BackupDir, BackupNamespace};
+use proxmox_log::warn;
+
+use pbs_api_types::{BackupArchiveName, BackupDir, BackupNamespace, MANIFEST_BLOB_NAME};
 use pbs_datastore::data_blob::DataBlob;
 use pbs_datastore::data_blob_reader::DataBlobReader;
 use pbs_datastore::dynamic_index::DynamicIndexReader;
 use pbs_datastore::fixed_index::FixedIndexReader;
 use pbs_datastore::index::IndexFile;
-use pbs_datastore::manifest::MANIFEST_BLOB_NAME;
 use pbs_datastore::{BackupManifest, PROXMOX_BACKUP_READER_PROTOCOL_ID_V1};
 use pbs_tools::crypt_config::CryptConfig;
 use pbs_tools::sha::sha256;
@@ -124,32 +125,47 @@ impl BackupReader {
 
     /// Download backup manifest (index.json)
     ///
-    /// The manifest signature is verified if we have a crypt_config.
-    pub async fn download_manifest(&self) -> Result<(BackupManifest, Vec<u8>), Error> {
+    /// The manifest signature is verified if we have a crypt_config. With a crypt_config set an
+    /// unsigned manifest is rejected unless `ignore_missing_signature` is set.
+    pub async fn download_manifest(
+        &self,
+        ignore_missing_signature: bool,
+    ) -> Result<(BackupManifest, Vec<u8>), Error> {
         let mut raw_data = Vec::with_capacity(64 * 1024);
-        self.download(MANIFEST_BLOB_NAME, &mut raw_data).await?;
+        self.download(MANIFEST_BLOB_NAME.as_ref(), &mut raw_data)
+            .await?;
         let blob = DataBlob::load_from_reader(&mut &raw_data[..])?;
         // no expected digest available
         let data = blob.decode(None, None)?;
 
-        let manifest =
-            BackupManifest::from_data(&data[..], self.crypt_config.as_ref().map(Arc::as_ref))?;
+        let manifest = BackupManifest::from_data(
+            &data[..],
+            self.crypt_config.as_ref().map(Arc::as_ref),
+            ignore_missing_signature,
+        )?;
+
+        if ignore_missing_signature && self.crypt_config.is_some() && manifest.signature.is_none() {
+            warn!(
+                "backup manifest has no signature, but an encryption key is set - cannot verify \
+                 the backup's integrity"
+            );
+        }
 
         Ok((manifest, data))
     }
 
     /// Download a .blob file
     ///
-    /// This creates a temporary file in /tmp (using O_TMPFILE). The data is verified using
-    /// the provided manifest.
+    /// This creates a temporary file (See [`crate::tools::create_tmp_file`] for
+    /// details). The data is verified using the provided manifest.
     pub async fn download_blob(
         &self,
         manifest: &BackupManifest,
-        name: &str,
+        name: &BackupArchiveName,
     ) -> Result<DataBlobReader<'_, File>, Error> {
         let mut tmpfile = crate::tools::create_tmp_file()?;
 
-        self.download(name, &mut tmpfile).await?;
+        self.download(name.as_ref(), &mut tmpfile).await?;
 
         tmpfile.seek(SeekFrom::Start(0))?;
         let (csum, size) = sha256(&mut tmpfile)?;
@@ -162,16 +178,16 @@ impl BackupReader {
 
     /// Download dynamic index file
     ///
-    /// This creates a temporary file in /tmp (using O_TMPFILE). The index is verified using
-    /// the provided manifest.
+    /// This creates a temporary file (See [`crate::tools::create_tmp_file`] for
+    /// details). The index is verified using the provided manifest.
     pub async fn download_dynamic_index(
         &self,
         manifest: &BackupManifest,
-        name: &str,
+        name: &BackupArchiveName,
     ) -> Result<DynamicIndexReader, Error> {
         let mut tmpfile = crate::tools::create_tmp_file()?;
 
-        self.download(name, &mut tmpfile).await?;
+        self.download(name.as_ref(), &mut tmpfile).await?;
 
         let index = DynamicIndexReader::new(tmpfile)
             .map_err(|err| format_err!("unable to read dynamic index '{}' - {}", name, err))?;
@@ -185,16 +201,16 @@ impl BackupReader {
 
     /// Download fixed index file
     ///
-    /// This creates a temporary file in /tmp (using O_TMPFILE). The index is verified using
-    /// the provided manifest.
+    /// This creates a temporary file (See [`crate::tools::create_tmp_file`] for
+    /// details). The index is verified using the provided manifest.
     pub async fn download_fixed_index(
         &self,
         manifest: &BackupManifest,
-        name: &str,
+        name: &BackupArchiveName,
     ) -> Result<FixedIndexReader, Error> {
         let mut tmpfile = crate::tools::create_tmp_file()?;
 
-        self.download(name, &mut tmpfile).await?;
+        self.download(name.as_ref(), &mut tmpfile).await?;
 
         let index = FixedIndexReader::new(tmpfile)
             .map_err(|err| format_err!("unable to read fixed index '{}' - {}", name, err))?;

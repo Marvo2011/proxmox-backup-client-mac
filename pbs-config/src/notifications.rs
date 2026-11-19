@@ -1,10 +1,11 @@
 use anyhow::Error;
 
 use proxmox_notify::Config;
+use proxmox_product_config::replace_privileged_config;
 
 use pbs_buildcfg::configdir;
 
-use crate::{open_backup_lockfile, BackupLockGuard};
+use crate::{BackupLockGuard, open_backup_lockfile};
 
 /// Configuration file location for notification targets/matchers.
 pub const NOTIFICATION_CONFIG_PATH: &str = configdir!("/notifications.cfg");
@@ -34,8 +35,11 @@ pub fn config() -> Result<Config, Error> {
 /// Save notification config.
 pub fn save_config(config: Config) -> Result<(), Error> {
     let (cfg, priv_cfg) = config.write()?;
-    crate::replace_backup_config(NOTIFICATION_CONFIG_PATH, cfg.as_bytes())?;
-    crate::replace_secret_config(NOTIFICATION_PRIV_CONFIG_PATH, priv_cfg.as_bytes())?;
+    replace_privileged_config(NOTIFICATION_CONFIG_PATH, cfg.as_bytes())?;
+    proxmox_product_config::replace_secret_config(
+        NOTIFICATION_PRIV_CONFIG_PATH,
+        priv_cfg.as_bytes(),
+    )?;
 
     Ok(())
 }

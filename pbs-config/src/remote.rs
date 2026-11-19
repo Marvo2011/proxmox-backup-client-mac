@@ -1,18 +1,17 @@
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
 use anyhow::Error;
-use lazy_static::lazy_static;
 
+use proxmox_product_config::replace_privileged_config;
 use proxmox_schema::*;
 use proxmox_section_config::{SectionConfig, SectionConfigData, SectionConfigPlugin};
 
-use pbs_api_types::{Remote, REMOTE_ID_SCHEMA};
+use pbs_api_types::{REMOTE_ID_SCHEMA, Remote};
 
-use crate::{open_backup_lockfile, BackupLockGuard};
+use crate::{BackupLockGuard, open_backup_lockfile};
 
-lazy_static! {
-    pub static ref CONFIG: SectionConfig = init();
-}
+pub static CONFIG: LazyLock<SectionConfig> = LazyLock::new(init);
 
 fn init() -> SectionConfig {
     let obj_schema = match Remote::API_SCHEMA {
@@ -47,7 +46,7 @@ pub fn config() -> Result<(SectionConfigData, [u8; 32]), Error> {
 
 pub fn save_config(config: &SectionConfigData) -> Result<(), Error> {
     let raw = CONFIG.write(REMOTE_CFG_FILENAME, config)?;
-    crate::replace_backup_config(REMOTE_CFG_FILENAME, raw.as_bytes())
+    replace_privileged_config(REMOTE_CFG_FILENAME, raw.as_bytes())
 }
 
 // shell completion helper

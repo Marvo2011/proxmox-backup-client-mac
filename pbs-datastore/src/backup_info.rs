@@ -1,51 +1,48 @@
 use std::fmt;
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::prelude::OsStrExt;
+use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
+use std::time::Duration;
 
-use anyhow::{bail, format_err, Error};
+use anyhow::{Context, Error, bail, format_err};
+use const_format::concatcp;
+use tracing::info;
 
-use proxmox_sys::fs::{lock_dir_noblock, replace_file, CreateOptions};
+use proxmox_s3_client::{S3ObjectKey, S3PathPrefix};
+use proxmox_sys::fs::{CreateOptions, lock_dir_noblock, lock_dir_noblock_shared, replace_file};
+use proxmox_systemd::escape_unit;
 
 use pbs_api_types::{
-    Authid, BackupNamespace, BackupType, GroupFilter, BACKUP_DATE_REGEX, BACKUP_FILE_REGEX,
+    ArchiveType, Authid, BACKUP_DATE_REGEX, BackupArchiveName, BackupGroupDeleteStats,
+    BackupNamespace, BackupType, CLIENT_LOG_BLOB_NAME, GroupFilter, MANIFEST_BLOB_NAME,
+    VerifyState,
 };
-use pbs_config::{open_backup_lockfile, BackupLockGuard};
+use pbs_config::{BackupLockGuard, open_backup_lockfile};
 
-use crate::manifest::{
-    BackupManifest, CLIENT_LOG_BLOB_NAME, MANIFEST_BLOB_NAME, MANIFEST_LOCK_NAME,
-};
-use crate::{DataBlob, DataStore};
+use crate::datastore::{GROUP_NOTES_FILE_NAME, GROUP_OWNER_FILE_NAME};
+use crate::manifest::{BackupManifest, MANIFEST_LOCK_NAME};
+use crate::move_journal;
+use crate::s3::S3_CONTENT_PREFIX;
+use crate::{DataBlob, DataStore, DatastoreBackend};
 
-#[derive(Default)]
-pub struct BackupGroupDeleteStats {
-    // Count of protected snapshots, therefore not removed
-    unremoved_protected: usize,
-    // Count of deleted snapshots
-    removed_snapshots: usize,
+pub const DATASTORE_LOCKS_DIR: &str = "/run/proxmox-backup/locks";
+pub const PROTECTED_MARKER_FILENAME: &str = ".protected";
+
+proxmox_schema::const_regex! {
+    pub BACKUP_FILES_AND_PROTECTED_REGEX = concatcp!(r"^(.*\.([fd]idx|blob)|\", PROTECTED_MARKER_FILENAME, ")$");
 }
 
-impl BackupGroupDeleteStats {
-    pub fn all_removed(&self) -> bool {
-        self.unremoved_protected == 0
-    }
-
-    pub fn removed_snapshots(&self) -> usize {
-        self.removed_snapshots
-    }
-
-    pub fn protected_snapshots(&self) -> usize {
-        self.unremoved_protected
-    }
-
-    fn increment_removed_snapshots(&mut self) {
-        self.removed_snapshots += 1;
-    }
-
-    fn increment_protected_snapshots(&mut self) {
-        self.unremoved_protected += 1;
-    }
-}
+// TODO: Remove with PBS 5
+// Note: The `expect()` call here will only happen if we can neither confirm nor deny the existence
+// of the file. this should only happen if a user messes with the `/run/proxmox-backup` directory.
+// if that happens, a lot more should fail as we rely on the existence of the directory throughout
+// the code. so just panic with a reasonable message.
+pub(crate) static OLD_LOCKING: LazyLock<bool> = LazyLock::new(|| {
+    std::fs::exists("/run/proxmox-backup/old-locking")
+        .expect("cannot read `/run/proxmox-backup`, please check permissions")
+});
 
 /// BackupGroup is a directory containing a list of BackupDir
 #[derive(Clone)]
@@ -128,9 +125,7 @@ impl BackupGroup {
                 }
 
                 let backup_dir = self.backup_dir_with_rfc3339(backup_time)?;
-                let files = list_backup_files(l2_fd, backup_time)?;
-
-                let protected = backup_dir.is_protected();
+                let (files, protected) = list_backup_files(l2_fd, backup_time)?;
 
                 list.push(BackupInfo {
                     backup_dir,
@@ -168,13 +163,13 @@ impl BackupGroup {
                 }
 
                 let mut manifest_path = PathBuf::from(backup_time);
-                manifest_path.push(MANIFEST_BLOB_NAME);
+                manifest_path.push(MANIFEST_BLOB_NAME.as_ref());
 
-                use nix::fcntl::{openat, OFlag};
+                use nix::fcntl::{OFlag, openat};
                 match openat(
-                    l2_fd,
+                    Some(l2_fd),
                     &manifest_path,
-                    OFlag::O_RDONLY,
+                    OFlag::O_RDONLY | OFlag::O_CLOEXEC,
                     nix::sys::stat::Mode::empty(),
                 ) {
                     Ok(rawfd) => {
@@ -225,14 +220,19 @@ impl BackupGroup {
         crate::ListSnapshots::new(self.clone())
     }
 
-    /// Destroy the group inclusive all its backup snapshots (BackupDir's)
+    /// Destroy the group inclusive all its backup snapshots (BackupDir's).
+    ///
+    /// Consumes the group lock. The caller is responsible for acquiring it via
+    /// [`Self::lock`] beforehand.
     ///
     /// Returns `BackupGroupDeleteStats`, containing the number of deleted snapshots
     /// and number of protected snaphsots, which therefore were not removed.
-    pub fn destroy(&self) -> Result<BackupGroupDeleteStats, Error> {
+    pub(crate) fn destroy(
+        &self,
+        _lock_guard: BackupLockGuard,
+        backend: &DatastoreBackend,
+    ) -> Result<BackupGroupDeleteStats, Error> {
         let path = self.full_group_path();
-        let _guard =
-            proxmox_sys::fs::lock_dir_noblock(&path, "backup group", "possible running backup")?;
 
         log::info!("removing backup group {:?}", path);
         let mut delete_stats = BackupGroupDeleteStats::default();
@@ -242,17 +242,194 @@ impl BackupGroup {
                 delete_stats.increment_protected_snapshots();
                 continue;
             }
-            snap.destroy(false)?;
+            // also for S3 cleanup local only, the actual S3 objects will be removed below,
+            // reducing the number of required API calls.
+            snap.destroy(false, &DatastoreBackend::Filesystem)?;
             delete_stats.increment_removed_snapshots();
         }
 
-        if delete_stats.all_removed() {
-            std::fs::remove_dir_all(&path).map_err(|err| {
-                format_err!("removing group directory {:?} failed - {}", path, err)
-            })?;
+        if let DatastoreBackend::S3(s3_client) = backend {
+            let path = self.relative_group_path();
+            let group_prefix = path
+                .to_str()
+                .ok_or_else(|| format_err!("invalid group path prefix"))?;
+            let prefix = format!("{S3_CONTENT_PREFIX}/{group_prefix}");
+            let delete_objects_errors = proxmox_async::runtime::block_on(
+                s3_client.delete_objects_by_prefix_with_suffix_filter(
+                    &S3PathPrefix::Some(prefix),
+                    PROTECTED_MARKER_FILENAME,
+                    &[GROUP_OWNER_FILE_NAME, GROUP_NOTES_FILE_NAME],
+                ),
+            )?;
+            if !delete_objects_errors.is_empty() {
+                crate::s3::log_s3_delete_objects_errors(&delete_objects_errors);
+                bail!("deleting objects failed");
+            }
+        }
+
+        // Note: make sure the old locking mechanism isn't used as `remove_dir_all` is not safe in
+        // that case
+        if delete_stats.all_removed() && !*OLD_LOCKING {
+            self.remove_group_dir()?;
+            delete_stats.increment_removed_groups();
         }
 
         Ok(delete_stats)
+    }
+
+    /// Check merge invariants for moving this group's snapshots into `target`.
+    /// Returns an error if ownership differs or snapshot times mismatch.
+    pub(crate) fn check_merge_invariants(&self, target: &BackupGroup) -> Result<(), Error> {
+        let src_owner = self.get_owner()?;
+        let tgt_owner = target.get_owner()?;
+        if src_owner != tgt_owner {
+            bail!(
+                "cannot merge group '{}/{}' from '{}' into '{}': owner mismatch \
+                (source: {src_owner}, target: {tgt_owner})",
+                self.group.ty,
+                self.group.id,
+                self.ns,
+                target.ns,
+            );
+        }
+
+        let (src_oldest, src_oldest_str) = self.iter_snapshots()?.filter_map(Result::ok).fold(
+            (i64::MAX, String::new()),
+            |(min, min_str), s| {
+                let curr = s.backup_time();
+                if curr < min {
+                    (curr, s.backup_time_string.clone())
+                } else {
+                    (min, min_str)
+                }
+            },
+        );
+
+        if src_oldest != i64::MAX {
+            // Any target snapshot with time >= src_oldest violates the
+            // "source strictly newer than target" merge invariant. Short-circuit on the first hit.
+            if let Some(overlap) = target
+                .iter_snapshots()?
+                .filter_map(Result::ok)
+                .find_map(|s| {
+                    if s.backup_time() >= src_oldest {
+                        Some(s.backup_time_string().to_owned())
+                    } else {
+                        None
+                    }
+                })
+            {
+                info!("oldest source snapshot: {src_oldest_str}");
+                info!("conflicting target snapshot: {overlap}");
+                bail!(
+                    "cannot merge group '{}/{}' from '{}' into '{}': snapshot time mismatch",
+                    self.group.ty,
+                    self.group.id,
+                    self.ns,
+                    target.ns,
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Move the group notes file (if any) from this group to `target`. Caller must hold
+    /// exclusive group locks on both.
+    ///
+    /// Behavior:
+    /// - If the source has no notes, do nothing.
+    /// - If only the source has notes, upload them to the target's S3 notes object first
+    ///   (when the backend is S3), then rename the local file. A failure in either step
+    ///   aborts the move so the source is left intact for the caller to retry; the S3
+    ///   upload uses replace semantics so re-running is idempotent.
+    /// - If both source and target have notes (merge case):
+    ///   - identical contents: leave the target unchanged. The source copy will be
+    ///     removed by `destroy()`.
+    ///   - diverging contents: log a warning and keep the target's notes.
+    pub(crate) fn move_notes_to(
+        &self,
+        target: &BackupGroup,
+        backend: &DatastoreBackend,
+    ) -> Result<(), Error> {
+        let src_notes_path = self.store.group_notes_path(&self.ns, &self.group);
+        let dst_notes_path = target.store.group_notes_path(&target.ns, &target.group);
+
+        let src_notes = match std::fs::read(&src_notes_path) {
+            Ok(v) => v,
+            Err(ref err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => {
+                bail!("reading source group notes {src_notes_path:?} failed: {err}")
+            }
+        };
+
+        match std::fs::read(&dst_notes_path) {
+            Ok(dst_notes) => {
+                if dst_notes != src_notes {
+                    log::warn!(
+                        "group notes differ during merge of '{}' from '{}' into '{}' - keeping target's notes",
+                        self.group,
+                        self.ns,
+                        target.ns,
+                    );
+                }
+                // Identical or intentionally kept: source copy will be removed by destroy().
+                return Ok(());
+            }
+            Err(ref err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                bail!("reading target group notes {dst_notes_path:?} failed: {err}")
+            }
+        }
+
+        if let DatastoreBackend::S3(s3_client) = backend {
+            let dst_key = crate::s3::object_key_from_path(
+                &target.relative_group_path(),
+                GROUP_NOTES_FILE_NAME,
+            )
+            .context("invalid target notes object key")?;
+            let data = hyper::body::Bytes::copy_from_slice(&src_notes);
+            proxmox_async::runtime::block_on(s3_client.upload_replace_with_retry(dst_key, data))
+                .with_context(|| {
+                    format!(
+                        "failed to upload group notes on S3 backend for '{}' in '{}'",
+                        target.group, target.ns,
+                    )
+                })?;
+        }
+
+        std::fs::rename(&src_notes_path, &dst_notes_path).with_context(|| {
+            format!("failed to move group notes {src_notes_path:?} -> {dst_notes_path:?}")
+        })?;
+
+        Ok(())
+    }
+
+    /// Helper function, assumes that no more snapshots are present in the group.
+    fn remove_group_dir(&self) -> Result<(), Error> {
+        let note_path = self.store.group_notes_path(&self.ns, &self.group);
+        if let Err(err) = std::fs::remove_file(&note_path) {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                bail!("removing the note file '{note_path:?}' failed - {err}")
+            }
+        }
+
+        let owner_path = self.store.owner_path(&self.ns, &self.group);
+
+        if let Err(err) = std::fs::remove_file(&owner_path) {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                bail!("removing the owner file '{owner_path:?}' failed - {err}");
+            }
+        }
+
+        let path = self.full_group_path();
+
+        std::fs::remove_dir(&path)
+            .map_err(|err| format_err!("removing group directory {path:?} failed - {err}"))?;
+
+        let _ = std::fs::remove_file(self.lock_path());
+
+        Ok(())
     }
 
     /// Returns the backup owner.
@@ -266,6 +443,36 @@ impl BackupGroup {
     pub fn set_owner(&self, auth_id: &Authid, force: bool) -> Result<(), Error> {
         self.store
             .set_owner(&self.ns, self.as_ref(), auth_id, force)
+    }
+
+    /// Returns a file name for locking a group.
+    ///
+    /// The lock file will be located in:
+    /// `${DATASTORE_LOCKS_DIR}/${datastore name}/${lock_file_path_helper(rpath)}`
+    /// where `rpath` is the relative path of the group.
+    fn lock_path(&self) -> PathBuf {
+        let path = Path::new(DATASTORE_LOCKS_DIR).join(self.store.name());
+
+        let rpath = Path::new(self.group.ty.as_str()).join(&self.group.id);
+
+        path.join(lock_file_path_helper(&self.ns, rpath))
+    }
+
+    /// Locks a group exclusively.
+    pub fn lock(&self) -> Result<BackupLockGuard, Error> {
+        if *OLD_LOCKING {
+            lock_dir_noblock(
+                &self.full_group_path(),
+                "backup group",
+                "possible runing backup, group is in use",
+            )
+            .map(BackupLockGuard::from)
+        } else {
+            lock_helper(self.store.name(), &self.lock_path(), |p| {
+                open_backup_lockfile(p, Some(Duration::from_secs(0)), true)
+                    .with_context(|| format!("unable to acquire backup group lock {p:?}"))
+            })
+        }
     }
 }
 
@@ -415,12 +622,14 @@ impl BackupDir {
 
     /// Returns the absolute path for backup_dir, using the cached formatted time string.
     pub fn full_path(&self) -> PathBuf {
-        self.store.snapshot_path(&self.ns, &self.dir)
+        let mut path = self.store.base_path();
+        path.push(self.relative_path());
+        path
     }
 
     pub fn protected_file(&self) -> PathBuf {
         let mut path = self.full_path();
-        path.push(".protected");
+        path.push(PROTECTED_MARKER_FILENAME);
         path
     }
 
@@ -446,39 +655,253 @@ impl BackupDir {
         .map_err(|err| format_err!("unable to load blob '{:?}' - {}", path, err))
     }
 
+    /// Generate the full archive file path with given archive name including server side type
+    /// extension for this snapshot's backup dir.
+    pub fn full_archive_path(&self, archive_name: &BackupArchiveName) -> PathBuf {
+        let mut path = self.full_path();
+        path.push(archive_name.as_ref());
+        path
+    }
+
     /// Returns the filename to lock a manifest
     ///
     /// Also creates the basedir. The lockfile is located in
-    /// '/run/proxmox-backup/locks/{datastore}/[ns/{ns}/]+{type}/{id}/{timestamp}.index.json.lck'
-    fn manifest_lock_path(&self) -> Result<PathBuf, Error> {
-        let mut path = PathBuf::from(&format!("/run/proxmox-backup/locks/{}", self.store.name()));
-        path.push(self.relative_path());
+    /// `${DATASTORE_LOCKS_DIR}/${datastore name}/${lock_file_path_helper(rpath)}.index.json.lck`
+    /// where rpath is the relative path of the snapshot.
+    fn manifest_lock_path(&self) -> PathBuf {
+        let path = Path::new(DATASTORE_LOCKS_DIR).join(self.store.name());
 
-        std::fs::create_dir_all(&path)?;
-        let ts = self.backup_time_string();
-        path.push(&format!("{ts}{MANIFEST_LOCK_NAME}"));
+        let rpath = Path::new(self.dir.group.ty.as_str())
+            .join(&self.dir.group.id)
+            .join(&self.backup_time_string)
+            .join(MANIFEST_LOCK_NAME);
 
-        Ok(path)
+        path.join(lock_file_path_helper(&self.ns, rpath))
     }
 
     /// Locks the manifest of a snapshot, for example, to update or delete it.
     pub(crate) fn lock_manifest(&self) -> Result<BackupLockGuard, Error> {
-        let path = self.manifest_lock_path()?;
+        let path = if *OLD_LOCKING {
+            // old manifest lock path
+            let path = Path::new(DATASTORE_LOCKS_DIR)
+                .join(self.store.name())
+                .join(self.relative_path());
 
-        // actions locking the manifest should be relatively short, only wait a few seconds
-        open_backup_lockfile(&path, Some(std::time::Duration::from_secs(5)), true)
-            .map_err(|err| format_err!("unable to acquire manifest lock {:?} - {}", &path, err))
+            std::fs::create_dir_all(&path)?;
+
+            path.join(format!("{}{MANIFEST_LOCK_NAME}", self.backup_time_string()))
+        } else {
+            self.manifest_lock_path()
+        };
+
+        lock_helper(self.store.name(), &path, |p| {
+            // update_manifest should never take a long time, so if
+            // someone else has the lock we can simply block a bit
+            // and should get it soon
+            open_backup_lockfile(p, Some(Duration::from_secs(5)), true)
+                .with_context(|| format_err!("unable to acquire manifest lock {p:?}"))
+        })
+    }
+
+    /// Returns a file name for locking a snapshot.
+    ///
+    /// The lock file will be located in:
+    /// `${DATASTORE_LOCKS_DIR}/${datastore name}/${lock_file_path_helper(rpath)}`
+    /// where `rpath` is the relative path of the snapshot.
+    fn lock_path(&self) -> PathBuf {
+        let path = Path::new(DATASTORE_LOCKS_DIR).join(self.store.name());
+
+        let rpath = Path::new(self.dir.group.ty.as_str())
+            .join(&self.dir.group.id)
+            .join(&self.backup_time_string);
+
+        path.join(lock_file_path_helper(&self.ns, rpath))
+    }
+
+    /// Locks a snapshot exclusively.
+    pub fn lock(&self) -> Result<BackupLockGuard, Error> {
+        if *OLD_LOCKING {
+            lock_dir_noblock(
+                &self.full_path(),
+                "snapshot",
+                "backup is running or snapshot is in use",
+            )
+            .map(BackupLockGuard::from)
+        } else {
+            lock_helper(self.store.name(), &self.lock_path(), |p| {
+                open_backup_lockfile(p, Some(Duration::from_secs(0)), true)
+                    .with_context(|| format!("unable to acquire snapshot lock {p:?}"))
+            })
+        }
+    }
+
+    /// Acquires a shared lock on a snapshot.
+    pub fn lock_shared(&self) -> Result<BackupLockGuard, Error> {
+        if *OLD_LOCKING {
+            lock_dir_noblock_shared(
+                &self.full_path(),
+                "snapshot",
+                "backup is running or snapshot is in use, could not acquire shared lock",
+            )
+            .map(BackupLockGuard::from)
+        } else {
+            lock_helper(self.store.name(), &self.lock_path(), |p| {
+                open_backup_lockfile(p, Some(Duration::from_secs(0)), false)
+                    .with_context(|| format!("unable to acquire shared snapshot lock {p:?}"))
+            })
+        }
+    }
+
+    /// Move this snapshot into `target`.
+    ///
+    /// For the filesystem backend, renames the snapshot directory. For S3, copies all
+    /// objects under the snapshot prefix to the target, renames the local cache directory,
+    /// then deletes the source objects. A copy failure returns an error with the snapshot
+    /// intact at source. A delete failure is logged as a warning.
+    ///
+    /// Before the rename, each index file's post-rename path is recorded in the per-datastore
+    /// move journal so a concurrent GC phase-1 drain can still mark their chunks - see
+    /// `move_journal` for the race this closes. If the rename then fails the journal entry
+    /// becomes a ghost that the drain skips on `open_index_reader` returning `None`.
+    ///
+    /// The caller must hold an exclusive lock on this snapshot, hold exclusive locks on
+    /// both source and target groups, and ensure the target group directory exists.
+    pub(crate) fn move_to(
+        &self,
+        target: &BackupGroup,
+        backend: &DatastoreBackend,
+    ) -> Result<(), Error> {
+        if !Arc::ptr_eq(&self.store, &target.store) {
+            bail!("cannot move snapshot across different datastores");
+        }
+
+        let target_snap = target.backup_dir_with_rfc3339(self.backup_time_string.clone())?;
+        let src_snap_path = self.full_path();
+        let dst_snap_path = target_snap.full_path();
+
+        // Enumerate the index files at source (they are still there until the
+        // rename below) and record their future paths in the move journal so a
+        // concurrent GC phase-1 drain can mark their chunks even if the
+        // hierarchy iteration missed both the source and target.
+        let mut journal_entries: Vec<PathBuf> = Vec::new();
+        for entry in std::fs::read_dir(&src_snap_path)
+            .with_context(|| format!("failed to list source snapshot dir {src_snap_path:?}"))?
+        {
+            let entry =
+                entry.with_context(|| format!("failed to read entry in {src_snap_path:?}"))?;
+            let name = entry.file_name();
+            let Some(name_str) = name.to_str() else {
+                continue;
+            };
+            if matches!(
+                ArchiveType::from_path(name_str),
+                Ok(ArchiveType::FixedIndex) | Ok(ArchiveType::DynamicIndex)
+            ) {
+                journal_entries.push(dst_snap_path.join(&name));
+            }
+        }
+        move_journal::append_moved_indices(self.store.name(), &journal_entries)?;
+
+        match backend {
+            DatastoreBackend::Filesystem => {
+                std::fs::rename(&src_snap_path, &dst_snap_path).with_context(|| {
+                    format!("failed to move snapshot {src_snap_path:?} to {dst_snap_path:?}")
+                })?;
+            }
+            DatastoreBackend::S3(s3_client) => {
+                let src_rel = self.relative_path();
+                let src_rel_str = src_rel
+                    .to_str()
+                    .ok_or_else(|| format_err!("invalid source snapshot path"))?;
+                let src_prefix_str = format!("{S3_CONTENT_PREFIX}/{src_rel_str}/");
+
+                let dst_rel = target_snap.relative_path();
+                let dst_rel_str = dst_rel
+                    .to_str()
+                    .ok_or_else(|| format_err!("invalid target snapshot path"))?;
+                let dst_prefix_str = format!("{S3_CONTENT_PREFIX}/{dst_rel_str}/");
+
+                let store_prefix = format!("{}/", self.store.name());
+
+                // Copy all objects for this snapshot to the target prefix. On failure the
+                // source snapshot remains intact and any partial target copies stay as
+                // leftovers (visible via the API for cleanup).
+                let prefix = S3PathPrefix::Some(src_prefix_str.clone());
+                let mut token: Option<String> = None;
+                let mut src_keys = Vec::new();
+
+                loop {
+                    let result = proxmox_async::runtime::block_on(
+                        s3_client.list_objects_v2(&prefix, token.as_deref()),
+                    )
+                    .context("failed to list snapshot objects on S3 backend")?;
+
+                    for item in result.contents {
+                        let full_key_str: &str = &item.key;
+                        let rel_key =
+                            full_key_str.strip_prefix(&store_prefix).ok_or_else(|| {
+                                format_err!("unexpected key prefix in '{full_key_str}'")
+                            })?;
+                        let src_key = S3ObjectKey::try_from(rel_key)?;
+
+                        let suffix = rel_key
+                            .strip_prefix(&src_prefix_str)
+                            .ok_or_else(|| format_err!("unexpected key format '{rel_key}'"))?;
+                        let dst_key_str = format!("{dst_prefix_str}{suffix}");
+                        let dst_key = S3ObjectKey::try_from(dst_key_str.as_str())?;
+
+                        proxmox_async::runtime::block_on(
+                            s3_client.copy_object(src_key.clone(), dst_key),
+                        )
+                        .with_context(|| format!("failed to copy S3 object '{rel_key}'"))?;
+                        src_keys.push(src_key);
+                    }
+
+                    if result.is_truncated {
+                        token = result.next_continuation_token;
+                    } else {
+                        break;
+                    }
+                }
+
+                std::fs::rename(&src_snap_path, &dst_snap_path).with_context(|| {
+                    format!("failed to move snapshot cache {src_snap_path:?} to {dst_snap_path:?}")
+                })?;
+
+                // Delete source S3 objects. Treat failures as warnings since the snapshot
+                // is already at the target.
+                for src_key in src_keys {
+                    if let Err(err) =
+                        proxmox_async::runtime::block_on(s3_client.delete_object(src_key.clone()))
+                    {
+                        log::warn!(
+                            "S3 move: failed to delete source object '{src_key:?}' \
+                            (snapshot already at target, orphaned object requires manual removal): \
+                            {err:#}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Clean up stale source lock files under /run for this snapshot.
+        let _ = std::fs::remove_file(self.manifest_lock_path());
+        let _ = std::fs::remove_file(self.lock_path());
+
+        Ok(())
     }
 
     /// Destroy the whole snapshot, bails if it's protected
     ///
-    /// Setting `force` to true skips locking and thus ignores if the backup is currently in use.
-    pub fn destroy(&self, force: bool) -> Result<(), Error> {
-        let full_path = self.full_path();
-
+    /// Setting `force` to true requires the caller to already hold both the snapshot and the
+    /// group lock so that destruction is race-free and the empty-group cleanup further below
+    /// can run safely.
+    pub(crate) fn destroy(&self, force: bool, backend: &DatastoreBackend) -> Result<(), Error> {
         let (_guard, _manifest_guard);
         if !force {
-            _guard = lock_dir_noblock(&full_path, "snapshot", "possibly running or in use")?;
+            _guard = self.lock().map_err(|err| {
+                format_err!("while destroying snapshot {:?}: {err}", self.full_path())
+            })?;
             _manifest_guard = self.lock_manifest()?;
         }
 
@@ -486,14 +909,63 @@ impl BackupDir {
             bail!("cannot remove protected snapshot"); // use special error type?
         }
 
+        if let DatastoreBackend::S3(s3_client) = backend {
+            let path = self.relative_path();
+            let snapshot_prefix = path
+                .to_str()
+                .ok_or_else(|| format_err!("invalid snapshot path"))?;
+            let prefix = format!("{S3_CONTENT_PREFIX}/{snapshot_prefix}");
+            let delete_objects_error = proxmox_async::runtime::block_on(
+                s3_client.delete_objects_by_prefix(&S3PathPrefix::Some(prefix)),
+            )?;
+            if !delete_objects_error.is_empty() {
+                crate::s3::log_s3_delete_objects_errors(&delete_objects_error);
+                bail!("deleting objects failed");
+            }
+        }
+
+        let full_path = self.full_path();
         log::info!("removing backup snapshot {:?}", full_path);
         std::fs::remove_dir_all(&full_path).map_err(|err| {
             format_err!("removing backup snapshot {:?} failed - {}", full_path, err,)
         })?;
 
-        // the manifest doesn't exist anymore, no need to keep the lock (already done by guard?)
-        if let Ok(path) = self.manifest_lock_path() {
-            let _ = std::fs::remove_file(path); // ignore errors
+        // remove no longer needed lock files
+        let _ = std::fs::remove_file(self.manifest_lock_path()); // ignore errors
+        let _ = std::fs::remove_file(self.lock_path()); // ignore errors
+
+        let group = BackupGroup::from(self);
+        // With force the caller asserts to already hold the group lock, otherwise acquire it now
+        // for the empty-group cleanup further below.
+        let _guard = if !force {
+            match group.lock() {
+                Ok(guard) => Some(guard),
+                Err(err) => {
+                    // If we can't lock the group, it is still in use (either by another backup
+                    // process or by a parent caller, which needs to take care of removing empty
+                    // groups itself). Do not error out, the snapshot was already removed and
+                    // there is nothing a user could do to rectify the situation.
+                    log::debug!(
+                        "could not lock group '{group:?}' for empty cleanup check: {err:#}"
+                    );
+                    return Ok(());
+                }
+            }
+        } else {
+            None
+        };
+
+        // Only remove the group if it is empty (otherwise removing would fail anyway, to avoid
+        // removing backups that might still be used) and the new locking mechanism is used (the
+        // old one would race here).
+        if group.list_backups()?.is_empty() && !*OLD_LOCKING {
+            group.remove_group_dir()?;
+            if let DatastoreBackend::S3(s3_client) = backend {
+                let object_key =
+                    super::s3::object_key_from_path(&group.relative_group_path(), "owner")
+                        .context("invalid owner file object key")?;
+                proxmox_async::runtime::block_on(s3_client.delete_object(object_key))?;
+            }
         }
 
         Ok(())
@@ -518,7 +990,7 @@ impl BackupDir {
 
     /// Load the manifest without a lock. Must not be written back.
     pub fn load_manifest(&self) -> Result<(BackupManifest, u64), Error> {
-        let blob = self.load_blob(MANIFEST_BLOB_NAME)?;
+        let blob = self.load_blob(MANIFEST_BLOB_NAME.as_ref())?;
         let raw_size = blob.raw_size();
         let manifest = BackupManifest::try_from(blob)?;
         Ok((manifest, raw_size))
@@ -528,6 +1000,7 @@ impl BackupDir {
     /// only use this method - anything else may break locking guarantees.
     pub fn update_manifest(
         &self,
+        backend: &DatastoreBackend,
         update_fn: impl FnOnce(&mut BackupManifest),
     ) -> Result<(), Error> {
         let _guard = self.lock_manifest()?;
@@ -535,13 +1008,21 @@ impl BackupDir {
 
         update_fn(&mut manifest);
 
-        let manifest = serde_json::to_value(manifest)?;
-        let manifest = serde_json::to_string_pretty(&manifest)?;
-        let blob = DataBlob::encode(manifest.as_bytes(), None, true)?;
+        // keep existing signature
+        let blob = manifest.to_data_blob(None)?;
         let raw_data = blob.raw_data();
 
+        if let DatastoreBackend::S3(s3_client) = backend {
+            let object_key =
+                super::s3::object_key_from_path(&self.relative_path(), MANIFEST_BLOB_NAME.as_ref())
+                    .context("invalid manifest object key")?;
+            let data = hyper::body::Bytes::copy_from_slice(raw_data);
+            proxmox_async::runtime::block_on(s3_client.upload_replace_with_retry(object_key, data))
+                .context("failed to update manifest on s3 backend")?;
+        }
+
         let mut path = self.full_path();
-        path.push(MANIFEST_BLOB_NAME);
+        path.push(MANIFEST_BLOB_NAME.as_ref());
 
         // atomic replace invalidates flock - no other writes past this point!
         replace_file(&path, raw_data, CreateOptions::new(), false)?;
@@ -556,7 +1037,7 @@ impl BackupDir {
         wanted_files.insert(MANIFEST_BLOB_NAME.to_string());
         wanted_files.insert(CLIENT_LOG_BLOB_NAME.to_string());
         manifest.files().iter().for_each(|item| {
-            wanted_files.insert(item.filename.clone());
+            wanted_files.insert(item.filename.to_string());
         });
 
         for item in proxmox_sys::fs::read_subdir(libc::AT_FDCWD, &full_path)?.flatten() {
@@ -580,6 +1061,11 @@ impl BackupDir {
         }
 
         Ok(())
+    }
+
+    /// Load the verify state from the manifest.
+    pub fn verify_state(&self) -> Result<Option<VerifyState>, anyhow::Error> {
+        Ok(self.load_manifest()?.0.verify_state()?.map(|svs| svs.state))
     }
 }
 
@@ -640,8 +1126,7 @@ impl BackupInfo {
     pub fn new(backup_dir: BackupDir) -> Result<BackupInfo, Error> {
         let path = backup_dir.full_path();
 
-        let files = list_backup_files(libc::AT_FDCWD, &path)?;
-        let protected = backup_dir.is_protected();
+        let (files, protected) = list_backup_files(libc::AT_FDCWD, &path)?;
 
         Ok(BackupInfo {
             backup_dir,
@@ -650,35 +1135,120 @@ impl BackupInfo {
         })
     }
 
-    pub fn sort_list(list: &mut [BackupInfo], ascendending: bool) {
-        if ascendending {
+    pub fn sort_list(list: &mut [BackupInfo], ascending: bool) {
+        if ascending {
             // oldest first
-            list.sort_unstable_by(|a, b| a.backup_dir.dir.time.cmp(&b.backup_dir.dir.time));
+            list.sort_unstable_by_key(|a| a.backup_dir.dir.time);
         } else {
             // newest first
-            list.sort_unstable_by(|a, b| b.backup_dir.dir.time.cmp(&a.backup_dir.dir.time));
+            list.sort_unstable_by_key(|b| std::cmp::Reverse(b.backup_dir.dir.time));
         }
     }
 
     pub fn is_finished(&self) -> bool {
         // backup is considered unfinished if there is no manifest
-        self.files.iter().any(|name| name == MANIFEST_BLOB_NAME)
+        self.files
+            .iter()
+            .any(|name| name == MANIFEST_BLOB_NAME.as_ref())
     }
 }
 
 fn list_backup_files<P: ?Sized + nix::NixPath>(
     dirfd: RawFd,
     path: &P,
-) -> Result<Vec<String>, Error> {
+) -> Result<(Vec<String>, bool), Error> {
     let mut files = vec![];
+    let mut protected = false;
 
-    proxmox_sys::fs::scandir(dirfd, path, &BACKUP_FILE_REGEX, |_, filename, file_type| {
-        if file_type != nix::dir::Type::File {
-            return Ok(());
-        }
-        files.push(filename.to_owned());
-        Ok(())
-    })?;
+    proxmox_sys::fs::scandir(
+        dirfd,
+        path,
+        &BACKUP_FILES_AND_PROTECTED_REGEX,
+        |_, filename, file_type| {
+            if file_type != nix::dir::Type::File {
+                return Ok(());
+            }
+            // avoids more expensive check via `BackupDir::is_protected`
+            if filename == ".protected" {
+                protected = true;
+            } else {
+                files.push(filename.to_owned());
+            }
+            Ok(())
+        },
+    )?;
 
-    Ok(files)
+    Ok((files, protected))
+}
+
+/// Creates a path to a lock file depending on the relative path of an object (snapshot, group,
+/// manifest) in a datastore. First all namespaces will be concatenated with a colon (ns-folder).
+/// Then the actual file name will depend on the length of the relative path without namespaces. If
+/// it is shorter than 255 characters in its unit encoded form, than the unit encoded form will be
+/// used directly. If not, the file name will consist of the first 80 character, the last 80
+/// characters and the hash of the unit encoded relative path without namespaces. It will also be
+/// placed into a "hashed" subfolder in the namespace folder.
+///
+/// Examples:
+///
+/// - vm-100
+/// - vm-100-2022\x2d05\x2d02T08\x3a11\x3a33Z
+/// - ns1:ns2:ns3:ns4:ns5:ns6:ns7/vm-100-2022\x2d05\x2d02T08\x3a11\x3a33Z
+///
+/// A "hashed" lock file would look like this:
+/// - ns1:ns2:ns3/hashed/$first_eighty...$last_eighty-$hash
+fn lock_file_path_helper(ns: &BackupNamespace, path: PathBuf) -> PathBuf {
+    let to_return = PathBuf::from(
+        ns.components()
+            .map(String::from)
+            .reduce(|acc, n| format!("{acc}:{n}"))
+            .unwrap_or_default(),
+    );
+
+    let path_bytes = path.as_os_str().as_bytes();
+
+    let enc = escape_unit(path_bytes, true);
+
+    if enc.len() < 255 {
+        return to_return.join(enc);
+    }
+
+    let to_return = to_return.join("hashed");
+
+    let first_eigthy = &enc[..80];
+    let last_eighty = &enc[enc.len() - 80..];
+    let hash = hex::encode(openssl::sha::sha256(path_bytes));
+
+    to_return.join(format!("{first_eigthy}...{last_eighty}-{hash}"))
+}
+
+/// Helps implement the double stat'ing procedure. It avoids certain race conditions upon lock
+/// deletion.
+///
+/// It also creates the base directory for lock files.
+pub(crate) fn lock_helper<F>(
+    store_name: &str,
+    path: &std::path::Path,
+    lock_fn: F,
+) -> Result<BackupLockGuard, Error>
+where
+    F: Fn(&std::path::Path) -> Result<BackupLockGuard, Error>,
+{
+    let mut lock_dir = Path::new(DATASTORE_LOCKS_DIR).join(store_name);
+
+    if let Some(parent) = path.parent() {
+        lock_dir = lock_dir.join(parent);
+    };
+
+    std::fs::create_dir_all(&lock_dir)?;
+
+    let lock = lock_fn(path)?;
+
+    let inode = nix::sys::stat::fstat(lock.as_raw_fd())?.st_ino;
+
+    if nix::sys::stat::stat(path).map_or(true, |st| inode != st.st_ino) {
+        bail!("could not acquire lock, another thread modified the lock file");
+    }
+
+    Ok(lock)
 }

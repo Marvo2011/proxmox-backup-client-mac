@@ -4,11 +4,11 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
-use anyhow::{format_err, Error};
+use anyhow::{Error, format_err};
 use futures::future::{FutureExt, TryFutureExt};
 use tokio::sync::oneshot;
 
-/// Broadcast results to registered listeners using asnyc oneshot channels
+/// Broadcast results to registered listeners using async oneshot channels
 #[derive(Default)]
 pub struct BroadcastData<T> {
     result: Option<Result<T, String>>,
@@ -43,8 +43,8 @@ impl<T: Clone> BroadcastData<T> {
         }
     }
 
-    pub fn listen(&mut self) -> impl Future<Output = Result<T, Error>> {
-        use futures::future::{ok, Either};
+    pub fn listen(&mut self) -> impl Future<Output = Result<T, Error>> + use<T> {
+        use futures::future::{Either, ok};
 
         match &self.result {
             None => {}
@@ -105,7 +105,7 @@ impl<T: Clone + Send + 'static> BroadcastFuture<T> {
 
     fn spawn(
         inner: Arc<Mutex<BroadCastFutureBinding<T>>>,
-    ) -> impl Future<Output = Result<T, Error>> {
+    ) -> impl Future<Output = Result<T, Error>> + use<T> {
         let mut data = inner.lock().unwrap();
 
         if let Some(source) = data.future.take() {
@@ -122,7 +122,7 @@ impl<T: Clone + Send + 'static> BroadcastFuture<T> {
     }
 
     /// Register a listener
-    pub fn listen(&self) -> impl Future<Output = Result<T, Error>> {
+    pub fn listen(&self) -> impl Future<Output = Result<T, Error>> + use<T> {
         let inner2 = self.inner.clone();
         async move { Self::spawn(inner2).await }
     }
@@ -142,7 +142,7 @@ fn test_broadcast_future() {
             CHECKSUM.fetch_add(res, Ordering::SeqCst);
         })
         .map_err(|err| {
-            panic!("got error {}", err);
+            panic!("got error {err}");
         })
         .map(|_| ());
 
@@ -152,7 +152,7 @@ fn test_broadcast_future() {
             CHECKSUM.fetch_add(res * 2, Ordering::SeqCst);
         })
         .map_err(|err| {
-            panic!("got error {}", err);
+            panic!("got error {err}");
         })
         .map(|_| ());
 
@@ -178,7 +178,7 @@ fn test_broadcast_future() {
                 CHECKSUM.fetch_add(res * 4, Ordering::SeqCst);
             })
             .map_err(|err| {
-                panic!("got error {}", err);
+                panic!("got error {err}");
             })
             .map(|_| ()),
     );

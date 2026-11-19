@@ -62,7 +62,7 @@ impl<'a> From<&'a [*const c_char]> for FuseArgs<'a> {
 // FUSE-T installed, see `available()`.
 #[rustfmt::skip]
 #[cfg_attr(not(target_os = "macos"), link(name = "fuse3"))]
-extern "C" {
+unsafe extern "C" {
     pub fn fuse_session_new(args: Option<&FuseArgs>, oprs: Option<&Operations>, size: size_t, op: ConstPtr) -> MutPtr;
     pub fn fuse_session_fd(session: ConstPtr) -> c_int;
     pub fn fuse_session_mount(session: ConstPtr, mountpoint: StrPtr) -> c_int;
@@ -79,6 +79,7 @@ extern "C" {
     pub fn fuse_reply_readlink(req: Request, link: StrPtr) -> c_int;
     pub fn fuse_reply_none(req: Request);
     pub fn fuse_reply_write(req: Request, count: libc::size_t) -> c_int;
+    pub fn fuse_reply_statfs(req: Request, stbuf: *const libc::statvfs) -> c_int;
     pub fn fuse_req_userdata(req: Request) -> MutPtr;
     pub fn fuse_add_direntry_plus(req: Request, buf: MutStrPtr, bufsize: size_t, name: StrPtr, stbuf: Option<&EntryParam>, off: c_int) -> size_t;
     pub fn fuse_add_direntry(req: Request, buf: MutStrPtr, bufsize: size_t, name: StrPtr, stbuf: Option<&libc::stat>, off: c_int) -> size_t;
@@ -115,49 +116,49 @@ default_to_none! {
         // The order in which the functions are listed matters, as the offset in the
         // struct defines what function the fuse driver uses.
         // It should therefore not be altered!
-        pub init:            Option<extern fn(userdata: MutPtr)>,
-        pub destroy:         Option<extern fn(userdata: MutPtr)>,
-        pub lookup:          Option<extern fn(req: Request, parent: u64, name: StrPtr)>,
-        pub forget:          Option<extern fn(req: Request, inode: u64, nlookup: u64)>,
-        pub getattr:         Option<extern fn(req: Request, inode: u64, file_info: *const FuseFileInfo)>,
-        pub setattr:         Option<extern fn(req: Request, inode: u64, attr: *const libc::stat, to_set: c_int, file_info: *const FuseFileInfo)>,
-        pub readlink:        Option<extern fn(req: Request, inode: u64)>,
-        pub mknod:           Option<extern fn(req: Request, parent: u64, name: StrPtr, mode: libc::mode_t, rdev: libc::dev_t)>,
-        pub mkdir:           Option<extern fn(req: Request, parent: u64, name: StrPtr, mode: libc::mode_t)>,
-        pub unlink:          Option<extern fn(req: Request, parent: u64, name: StrPtr)>,
-        pub rmdir:           Option<extern fn(req: Request, parent: u64, name: StrPtr)>,
-        pub symlink:         Option<extern fn(req: Request, link: StrPtr, parent: u64, name: StrPtr)>,
-        pub rename:          Option<extern fn(req: Request, parent: u64, name: StrPtr, newparent: u64, newname: StrPtr, flags: c_int)>,
-        pub link:            Option<extern fn(req: Request, inode: u64, newparent: u64, newname: StrPtr)>,
-        pub open:            Option<extern fn(req: Request, inode: u64, file_info: *const FuseFileInfo)>,
-        pub read:            Option<extern fn(req: Request, inode: u64, size: size_t, offset: libc::off_t, file_info: *const FuseFileInfo)>,
-        pub write:           Option<extern fn(req: Request, inode: u64, buffer: *const u8, size: size_t, offset: libc::off_t, file_info: *const FuseFileInfo)>,
-        pub flush:           Option<extern fn(req: Request, inode: u64, file_info: *const FuseFileInfo)>,
-        pub release:         Option<extern fn(req: Request, inode: u64, file_info: *const FuseFileInfo)>,
-        pub fsync:           Option<extern fn(req: Request, inode: u64, datasync: c_int, file_info: *const FuseFileInfo)>,
-        pub opendir:         Option<extern fn(req: Request, inode: u64, file_info: *const FuseFileInfo)>,
-        pub readdir:         Option<extern fn(req: Request, inode: u64, size: size_t, offset: off_t, file_info: *const FuseFileInfo)>,
-        pub releasedir:      Option<extern fn(req: Request, inode: u64, file_info: *const FuseFileInfo)>,
-        pub fsyncdir:        Option<extern fn(req: Request, inode: u64, datasync: c_int, file_info: *const FuseFileInfo)>,
-        pub statfs:          Option<extern fn(req: Request, inode: u64)>,
-        pub setxattr:        Option<extern fn(req: Request, inode: u64, name: StrPtr, value: StrPtr, size: size_t, flags: c_int)>,
-        pub getxattr:        Option<extern fn(req: Request, inode: u64, name: StrPtr, size: size_t)>,
-        pub listxattr:       Option<extern fn(req: Request, inode: u64, size: size_t)>,
-        pub removexattr:     Option<extern fn(req: Request, inode: u64, name: StrPtr)>,
-        pub access:          Option<extern fn(req: Request, inode: u64, mask: i32)>,
-        pub create:          Option<extern fn(req: Request, parent: u64, name: StrPtr, mode: libc::mode_t, file_info: *const FuseFileInfo)>,
-        pub getlk:           Option<extern fn(req: Request, inode: u64, file_info: *const FuseFileInfo, lock: MutPtr)>,
-        pub setlk:           Option<extern fn(req: Request, inode: u64, file_info: *const FuseFileInfo, lock: MutPtr, sleep: c_int)>,
-        pub bmap:            Option<extern fn(req: Request, inode: u64, blocksize: size_t, idx: u64)>,
-        pub ioctl:           Option<extern fn(req: Request, inode: u64, cmd: c_int, arg: MutPtr, file_info: *const FuseFileInfo, flags: c_int, in_buf: ConstPtr, in_bufsz: size_t, out_bufsz: size_t)>,
-        pub poll:            Option<extern fn(req: Request, inode: u64, file_info: *const FuseFileInfo, pollhandle: MutPtr)>,
-        pub write_buf:       Option<extern fn(req: Request, inode: u64, bufv: MutPtr, offset: libc::off_t, file_info: *const FuseFileInfo)>,
-        pub retrieve_reply:  Option<extern fn(req: Request, cookie: ConstPtr, inode: u64, offset: libc::off_t, bufv: MutPtr)>,
-        pub forget_multi:    Option<extern fn(req: Request, count: size_t, forgets: MutPtr)>,
-        pub flock:           Option<extern fn(req: Request, inode: u64, file_info: *const FuseFileInfo, op: c_int)>,
-        pub fallocate:       Option<extern fn(req: Request, inode: u64, mode: c_int, offset: libc::off_t, length: libc::off_t, file_info: *const FuseFileInfo)>,
-        pub readdirplus:     Option<extern fn(req: Request, inode: u64, size: size_t, offset: off_t, file_info: *const FuseFileInfo)>,
-        pub copy_file_range: Option<extern fn(req: Request, ino_in: u64, off_in: libc::off_t, fi_in: *const FuseFileInfo, ino_out: u64, off_out: libc::off_t, fi_out: *const FuseFileInfo, len: size_t, flags: c_int)>,
+        pub init:            Option<extern "C" fn(userdata: MutPtr)>,
+        pub destroy:         Option<extern "C" fn(userdata: MutPtr)>,
+        pub lookup:          Option<extern "C" fn(req: Request, parent: u64, name: StrPtr)>,
+        pub forget:          Option<extern "C" fn(req: Request, inode: u64, nlookup: u64)>,
+        pub getattr:         Option<extern "C" fn(req: Request, inode: u64, file_info: *const FuseFileInfo)>,
+        pub setattr:         Option<extern "C" fn(req: Request, inode: u64, attr: *const libc::stat, to_set: c_int, file_info: *const FuseFileInfo)>,
+        pub readlink:        Option<extern "C" fn(req: Request, inode: u64)>,
+        pub mknod:           Option<extern "C" fn(req: Request, parent: u64, name: StrPtr, mode: libc::mode_t, rdev: libc::dev_t)>,
+        pub mkdir:           Option<extern "C" fn(req: Request, parent: u64, name: StrPtr, mode: libc::mode_t)>,
+        pub unlink:          Option<extern "C" fn(req: Request, parent: u64, name: StrPtr)>,
+        pub rmdir:           Option<extern "C" fn(req: Request, parent: u64, name: StrPtr)>,
+        pub symlink:         Option<extern "C" fn(req: Request, link: StrPtr, parent: u64, name: StrPtr)>,
+        pub rename:          Option<extern "C" fn(req: Request, parent: u64, name: StrPtr, newparent: u64, newname: StrPtr, flags: c_int)>,
+        pub link:            Option<extern "C" fn(req: Request, inode: u64, newparent: u64, newname: StrPtr)>,
+        pub open:            Option<extern "C" fn(req: Request, inode: u64, file_info: *const FuseFileInfo)>,
+        pub read:            Option<extern "C" fn(req: Request, inode: u64, size: size_t, offset: libc::off_t, file_info: *const FuseFileInfo)>,
+        pub write:           Option<extern "C" fn(req: Request, inode: u64, buffer: *const u8, size: size_t, offset: libc::off_t, file_info: *const FuseFileInfo)>,
+        pub flush:           Option<extern "C" fn(req: Request, inode: u64, file_info: *const FuseFileInfo)>,
+        pub release:         Option<extern "C" fn(req: Request, inode: u64, file_info: *const FuseFileInfo)>,
+        pub fsync:           Option<extern "C" fn(req: Request, inode: u64, datasync: c_int, file_info: *const FuseFileInfo)>,
+        pub opendir:         Option<extern "C" fn(req: Request, inode: u64, file_info: *const FuseFileInfo)>,
+        pub readdir:         Option<extern "C" fn(req: Request, inode: u64, size: size_t, offset: off_t, file_info: *const FuseFileInfo)>,
+        pub releasedir:      Option<extern "C" fn(req: Request, inode: u64, file_info: *const FuseFileInfo)>,
+        pub fsyncdir:        Option<extern "C" fn(req: Request, inode: u64, datasync: c_int, file_info: *const FuseFileInfo)>,
+        pub statfs:          Option<extern "C" fn(req: Request, inode: u64)>,
+        pub setxattr:        Option<extern "C" fn(req: Request, inode: u64, name: StrPtr, value: StrPtr, size: size_t, flags: c_int)>,
+        pub getxattr:        Option<extern "C" fn(req: Request, inode: u64, name: StrPtr, size: size_t)>,
+        pub listxattr:       Option<extern "C" fn(req: Request, inode: u64, size: size_t)>,
+        pub removexattr:     Option<extern "C" fn(req: Request, inode: u64, name: StrPtr)>,
+        pub access:          Option<extern "C" fn(req: Request, inode: u64, mask: i32)>,
+        pub create:          Option<extern "C" fn(req: Request, parent: u64, name: StrPtr, mode: libc::mode_t, file_info: *const FuseFileInfo)>,
+        pub getlk:           Option<extern "C" fn(req: Request, inode: u64, file_info: *const FuseFileInfo, lock: MutPtr)>,
+        pub setlk:           Option<extern "C" fn(req: Request, inode: u64, file_info: *const FuseFileInfo, lock: MutPtr, sleep: c_int)>,
+        pub bmap:            Option<extern "C" fn(req: Request, inode: u64, blocksize: size_t, idx: u64)>,
+        pub ioctl:           Option<extern "C" fn(req: Request, inode: u64, cmd: c_int, arg: MutPtr, file_info: *const FuseFileInfo, flags: c_int, in_buf: ConstPtr, in_bufsz: size_t, out_bufsz: size_t)>,
+        pub poll:            Option<extern "C" fn(req: Request, inode: u64, file_info: *const FuseFileInfo, pollhandle: MutPtr)>,
+        pub write_buf:       Option<extern "C" fn(req: Request, inode: u64, bufv: MutPtr, offset: libc::off_t, file_info: *const FuseFileInfo)>,
+        pub retrieve_reply:  Option<extern "C" fn(req: Request, cookie: ConstPtr, inode: u64, offset: libc::off_t, bufv: MutPtr)>,
+        pub forget_multi:    Option<extern "C" fn(req: Request, count: size_t, forgets: MutPtr)>,
+        pub flock:           Option<extern "C" fn(req: Request, inode: u64, file_info: *const FuseFileInfo, op: c_int)>,
+        pub fallocate:       Option<extern "C" fn(req: Request, inode: u64, mode: c_int, offset: libc::off_t, length: libc::off_t, file_info: *const FuseFileInfo)>,
+        pub readdirplus:     Option<extern "C" fn(req: Request, inode: u64, size: size_t, offset: off_t, file_info: *const FuseFileInfo)>,
+        pub copy_file_range: Option<extern "C" fn(req: Request, ino_in: u64, off_in: libc::off_t, fi_in: *const FuseFileInfo, ino_out: u64, off_out: libc::off_t, fi_out: *const FuseFileInfo, len: size_t, flags: c_int)>,
     }
 }
 
@@ -270,7 +271,7 @@ pub struct FuseFileInfo {
 macro_rules! fuse_file_info_accessors {
     ($(($flag:ident, $glue_set:ident, $glue_get:ident, $rust_set:ident, $rust_get:ident))+) => {
         #[link(name = "glue", kind = "static")]
-        extern "C" {
+        unsafe extern "C" {
             $(
             fn $glue_set(ffi: *mut FuseFileInfo, value: libc::c_uint);
             fn $glue_get(ffi: *mut FuseFileInfo) -> libc::c_uint;

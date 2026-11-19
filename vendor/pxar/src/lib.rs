@@ -15,15 +15,13 @@ pub mod format;
 
 pub(crate) mod util;
 
-mod poll_fn;
-
 pub mod accessor;
 pub mod binary_tree_array;
 pub mod decoder;
 pub mod encoder;
 
 #[doc(inline)]
-pub use format::{mode, Stat};
+pub use format::{Stat, mode};
 
 /// File metadata found in pxar archives.
 ///
@@ -344,6 +342,12 @@ impl Acl {
 /// Identifies whether the entry is a file, symlink, directory, etc.
 #[derive(Clone, Debug)]
 pub enum EntryKind {
+    /// Pxar file format version
+    Version(format::FormatVersion),
+
+    /// Pxar prelude blob
+    Prelude(format::Prelude),
+
     /// Symbolic links.
     Symlink(format::Symlink),
 
@@ -366,6 +370,9 @@ pub enum EntryKind {
 
         /// The file's byte offset inside the archive, if available.
         offset: Option<u64>,
+
+        /// The file's byte offset inside the payload stream, if available.
+        payload_offset: Option<u64>,
     },
 
     /// Directory entry. When iterating through an archive, the contents follow next.
@@ -493,6 +500,68 @@ impl Entry {
         match self.kind {
             EntryKind::File { size, .. } => Some(size),
             _ => None,
+        }
+    }
+}
+
+#[derive(Clone)]
+/// Possible variants of the encoder output and decoder as well as accessor inputs
+///
+/// Allow to have a unified or split input/output, depending on whether this is a split
+/// archive or not.
+pub enum PxarVariant<A, P> {
+    /// All of the pxar archive is contained within the given input/output
+    Unified(A),
+    /// Metadata and payload are split into separate inputs/outputs
+    Split(A, P),
+}
+
+impl<A, P> PxarVariant<A, P> {
+    pub fn archive(&self) -> &A {
+        match self {
+            PxarVariant::Unified(a) => a,
+            PxarVariant::Split(a, _) => a,
+        }
+    }
+
+    pub fn archive_mut(&mut self) -> &mut A {
+        match self {
+            PxarVariant::Unified(a) => a,
+            PxarVariant::Split(a, _) => a,
+        }
+    }
+
+    pub fn payload(&self) -> Option<&P> {
+        match self {
+            PxarVariant::Unified(_) => None,
+            PxarVariant::Split(_, p) => Some(p),
+        }
+    }
+
+    pub fn payload_mut(&mut self) -> Option<&mut P> {
+        match self {
+            PxarVariant::Unified(_) => None,
+            PxarVariant::Split(_, p) => Some(p),
+        }
+    }
+
+    pub fn wrap_multi<OUT1, OUT2, F1: Fn(A) -> OUT1, F2: Fn(P) -> OUT2>(
+        self,
+        f1: F1,
+        f2: F2,
+    ) -> PxarVariant<OUT1, OUT2> {
+        match self {
+            PxarVariant::Unified(a) => PxarVariant::Unified(f1(a)),
+            PxarVariant::Split(a, p) => PxarVariant::Split(f1(a), f2(p)),
+        }
+    }
+}
+
+impl<IN> PxarVariant<IN, IN> {
+    pub fn wrap<OUT, F: Fn(IN) -> OUT>(self, f: F) -> PxarVariant<OUT, OUT> {
+        match self {
+            PxarVariant::Unified(a) => PxarVariant::Unified(f(a)),
+            PxarVariant::Split(a, p) => PxarVariant::Split(f(a), f(p)),
         }
     }
 }

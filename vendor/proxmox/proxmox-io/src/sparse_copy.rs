@@ -14,8 +14,7 @@ const BUF_SIZE: usize = 8192;
 /// This is implemented in a way which allows the compiler to utilize SIMD instructions.
 pub fn buffer_is_zero(buf: &[u8]) -> bool {
     !buf.chunks(128)
-        .map(|aa| aa.iter().fold(0, |a, b| a | b) != 0)
-        .any(|a| a)
+        .any(|aa| aa.iter().fold(0, |a, b| a | b) != 0)
 }
 
 /// Result of a sparse copy call.
@@ -27,8 +26,8 @@ pub struct SparseCopyResult {
     pub seeked_last: bool,
 }
 
-/// Copy similar to [`io::copy`](std::io::copy), but seeks the target when encountering zero bytes
-/// instead of writing them.
+/// Copy similar to [`io::copy`], but seeks the target when encountering zero bytes instead of
+/// writing them.
 ///
 /// Example use:
 /// ```

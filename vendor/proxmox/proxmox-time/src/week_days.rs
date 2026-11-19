@@ -1,11 +1,11 @@
 use bitflags::bitflags;
 use nom::{bytes::complete::tag, character::complete::alpha1, combinator::opt, sequence::pair};
 
-use crate::parse_helpers::{parse_error, IResult};
+use crate::parse_helpers::{IResult, parse_error};
 
 bitflags! {
     /// Defines one or more days of a week.
-    #[derive(Default)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
     pub struct WeekDays: u8 {
         const MONDAY = 1;
         const TUESDAY = 2;
@@ -28,7 +28,7 @@ fn parse_weekday(i: &str) -> IResult<&str, WeekDays> {
         "friday" | "fri" => Ok((i, WeekDays::FRIDAY)),
         "saturday" | "sat" => Ok((i, WeekDays::SATURDAY)),
         "sunday" | "sun" => Ok((i, WeekDays::SUNDAY)),
-        _ => return Err(parse_error(text, "weekday")),
+        _ => Err(parse_error(text, "weekday")),
     }
 }
 

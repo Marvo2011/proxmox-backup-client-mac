@@ -1,40 +1,52 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString, OsStr};
-use std::fmt;
+use std::fmt::Display;
 use std::io::{self, Read};
+use std::mem::size_of;
+use std::ops::Range;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 
-use anyhow::{bail, Context, Error};
-use futures::future::BoxFuture;
+use anyhow::{Context, Error, bail};
 use futures::FutureExt;
+use futures::future::BoxFuture;
 use nix::dir::Dir;
 use nix::errno::Errno;
 use nix::fcntl::OFlag;
 use nix::sys::stat::{FileStat, Mode};
+use serde::{Deserialize, Serialize};
 
 use pathpatterns::{MatchEntry, MatchFlag, MatchList, MatchType, PatternFlag};
 use proxmox_sys::error::SysError;
-use pxar::encoder::{LinkOffset, SeqWrite};
-use pxar::Metadata;
+use pxar::accessor::ReadAt;
+use pxar::accessor::aio::{Accessor, Directory};
+use pxar::encoder::{LinkOffset, PayloadOffset, SeqWrite};
+use pxar::{EntryKind, Metadata, PxarVariant};
 
+use proxmox_human_byte::HumanByte;
 use proxmox_io::vec;
-use proxmox_lang::c_str;
+use proxmox_log::{debug, error, info, warn};
 use proxmox_sys::fs::xattr;
 #[cfg(target_os = "linux")]
 use proxmox_sys::fs::{self, acl};
 
 use pbs_datastore::catalog::BackupCatalogWriter;
+use pbs_datastore::dynamic_index::DynamicIndexReader;
+use pbs_datastore::index::IndexFile;
 
+use crate::inject_reused_chunks::InjectChunks;
+use crate::pxar::Flags;
+use crate::pxar::look_ahead_cache::{CacheEntry, CacheEntryData, PxarLookaheadCache};
 #[cfg(target_os = "linux")]
 use crate::pxar::metadata::errno_is_unsupported;
 use crate::pxar::tools::assert_single_path_component;
-use crate::pxar::Flags;
+
+const CHUNK_PADDING_THRESHOLD: f64 = 0.1;
 
 /// Pxar options for creating a pxar archive/stream
-#[derive(Default, Clone)]
+#[derive(Default)]
 pub struct PxarCreateOptions {
     /// Device/mountpoint st_dev numbers that should be included. None for no limitation.
     pub device_set: Option<HashSet<libc::dev_t>>,
@@ -46,10 +58,26 @@ pub struct PxarCreateOptions {
     pub skip_lost_and_found: bool,
     /// Skip xattrs of files that return E2BIG error
     pub skip_e2big_xattr: bool,
+    /// Reference state for partial backups
+    pub previous_ref: Option<PxarPrevRef>,
+    /// Maximum number of lookahead cache entries
+    pub max_cache_size: Option<usize>,
+}
+
+pub type MetadataArchiveReader = Arc<dyn ReadAt + Send + Sync + 'static>;
+
+/// Stateful information of previous backups snapshots for partial backups
+pub struct PxarPrevRef {
+    /// Reference accessor for metadata comparison
+    pub accessor: Accessor<MetadataArchiveReader>,
+    /// Reference index for reusing payload chunks
+    pub payload_index: DynamicIndexReader,
+    /// Reference archive name for partial backups
+    pub archive_name: String,
 }
 
 #[cfg(target_os = "linux")]
-fn detect_fs_type(fd: RawFd) -> Result<i64, Error> {
+fn detect_fs_type(fd: RawFd) -> Result<i64, Errno> {
     let mut fs_stat = std::mem::MaybeUninit::uninit();
     let res = unsafe { libc::fstatfs(fd, fs_stat.as_mut_ptr()) };
     Errno::result(res)?;
@@ -65,14 +93,14 @@ const SF_DATALESS: u32 = 0x40000000;
 /// macOS has no file system magic numbers, so map the file system type name to the Linux magic
 /// number with the same semantics for archiving.
 #[cfg(target_os = "macos")]
-fn detect_fs_type(fd: RawFd) -> Result<i64, Error> {
+fn detect_fs_type(fd: RawFd) -> Result<i64, Errno> {
     use proxmox_sys::linux::magic::*;
 
     let mut fs_stat = std::mem::MaybeUninit::uninit();
     // macOS occasionally interrupts this without a signal
     while let Err(err) = Errno::result(unsafe { libc::fstatfs(fd, fs_stat.as_mut_ptr()) }) {
         if err != Errno::EINTR {
-            return Err(err.into());
+            return Err(err);
         }
     }
     let fs_stat = unsafe { fs_stat.assume_init() };
@@ -122,30 +150,55 @@ pub fn is_virtual_file_system(magic: i64) -> bool {
         SYSFS_MAGIC)
 }
 
-#[derive(Debug)]
-struct ArchiveError {
-    path: PathBuf,
-    error: Error,
+trait UniqueContext<T> {
+    fn unique_context<S>(self, context: S) -> Result<T, anyhow::Error>
+    where
+        S: Display + Send + Sync + 'static;
 }
 
-impl ArchiveError {
-    fn new(path: PathBuf, error: Error) -> Self {
-        Self { path, error }
-    }
-}
-
-impl std::error::Error for ArchiveError {}
-
-impl fmt::Display for ArchiveError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "error at {:?}: {}", self.path, self.error)
+impl<T> UniqueContext<T> for Result<T, anyhow::Error> {
+    fn unique_context<S>(self, context: S) -> Result<T, anyhow::Error>
+    where
+        S: Display + Send + Sync + 'static,
+    {
+        match self {
+            Ok(ok) => Ok(ok),
+            Err(err) => {
+                let last_error = err.chain().next();
+                if let Some(e) = last_error {
+                    if e.to_string() == context.to_string() {
+                        return Err(err);
+                    }
+                }
+                Err(err.context(context))
+            }
+        }
     }
 }
 
 #[derive(Eq, PartialEq, Hash)]
-struct HardLinkInfo {
+pub(crate) struct HardLinkInfo {
     st_dev: libc::dev_t,
     st_ino: u64,
+}
+
+#[derive(Default)]
+struct ReuseStats {
+    files_reused_count: u64,
+    files_hardlink_count: u64,
+    files_reencoded_count: u64,
+    total_injected_count: u64,
+    partial_chunks_count: u64,
+    total_injected_size: u64,
+    total_reused_payload_size: u64,
+    total_reencoded_size: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) struct PbsClientPrelude {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exclude_patterns: Option<String>,
 }
 
 struct Archiver {
@@ -164,17 +217,43 @@ struct Archiver {
     hardlinks: HashMap<HardLinkInfo, (PathBuf, LinkOffset)>,
     file_copy_buffer: Vec<u8>,
     skip_e2big_xattr: bool,
+    forced_boundaries: Option<mpsc::Sender<InjectChunks>>,
+    suggested_boundaries: Option<mpsc::Sender<u64>>,
+    previous_payload_index: Option<DynamicIndexReader>,
+    cache: PxarLookaheadCache,
+    // Highest payload offset accepted as reusable so far. Mirrors the encoder's accumulated
+    // strict-monotonic-offset invariant on the read side, so that a previous archive written by
+    // an older client without the encode-time check is detected here and the affected file is
+    // re-encoded instead of reused.
+    last_reusable_offset: Option<u64>,
+    reuse_stats: ReuseStats,
+    split_archive: bool,
 }
 
 type Encoder<'a, T> = pxar::encoder::aio::Encoder<'a, T>;
 
+pub struct PxarWriters<T> {
+    archive: PxarVariant<T, T>,
+    catalog: Option<Arc<Mutex<dyn BackupCatalogWriter + Send>>>,
+}
+
+impl<T> PxarWriters<T> {
+    pub fn new(
+        archive: PxarVariant<T, T>,
+        catalog: Option<Arc<Mutex<dyn BackupCatalogWriter + Send>>>,
+    ) -> Self {
+        Self { archive, catalog }
+    }
+}
+
 pub async fn create_archive<T, F>(
     source_dir: Dir,
-    mut writer: T,
+    writers: PxarWriters<T>,
     feature_flags: Flags,
     callback: F,
-    catalog: Option<Arc<Mutex<dyn BackupCatalogWriter + Send>>>,
     options: PxarCreateOptions,
+    forced_boundaries: Option<mpsc::Sender<InjectChunks>>,
+    suggested_boundaries: Option<mpsc::Sender<u64>>,
 ) -> Result<(), Error>
 where
     T: SeqWrite + Send,
@@ -203,8 +282,6 @@ where
         set.insert(stat.st_dev);
     }
 
-    let mut encoder = Encoder::new(&mut writer, &metadata).await?;
-
     let mut patterns = options.patterns;
 
     if options.skip_lost_and_found {
@@ -215,13 +292,38 @@ where
         )?);
     }
 
+    let split_archive = writers.archive.payload().is_some();
+    let prelude = if split_archive && !patterns.is_empty() {
+        let prelude = PbsClientPrelude {
+            exclude_patterns: Some(String::from_utf8(generate_pxar_excludes_cli(
+                &patterns[..],
+            ))?),
+        };
+        Some(serde_json::to_vec(&prelude)?)
+    } else {
+        None
+    };
+
+    let metadata_mode = options.previous_ref.is_some() && split_archive;
+    let (previous_payload_index, previous_metadata_accessor) =
+        if let Some(refs) = options.previous_ref {
+            (
+                Some(refs.payload_index),
+                refs.accessor.open_root().await.ok(),
+            )
+        } else {
+            (None, None)
+        };
+
+    let mut encoder = Encoder::new(writers.archive, &metadata, prelude.as_deref()).await?;
+
     let mut archiver = Archiver {
         feature_flags,
         fs_feature_flags,
         fs_magic,
         callback: Box::new(callback),
         patterns,
-        catalog,
+        catalog: writers.catalog,
         path: PathBuf::new(),
         entry_counter: 0,
         entry_limit: options.entries_max,
@@ -230,12 +332,56 @@ where
         hardlinks: HashMap::new(),
         file_copy_buffer: vec::undefined(4 * 1024 * 1024),
         skip_e2big_xattr: options.skip_e2big_xattr,
+        forced_boundaries,
+        suggested_boundaries,
+        previous_payload_index,
+        cache: PxarLookaheadCache::new(options.max_cache_size),
+        last_reusable_offset: None,
+        reuse_stats: ReuseStats::default(),
+        split_archive,
     };
 
     archiver
-        .archive_dir_contents(&mut encoder, source_dir, true)
+        .archive_dir_contents(&mut encoder, previous_metadata_accessor, source_dir, true)
         .await?;
+
+    if metadata_mode {
+        archiver
+            .flush_cached_reusing_if_below_threshold(&mut encoder, false)
+            .await?;
+    }
+
     encoder.finish().await?;
+    encoder.close().await?;
+
+    if metadata_mode {
+        info!("Change detection summary:");
+        info!(
+            " - {} total files ({} hardlinks)",
+            archiver.reuse_stats.files_reused_count
+                + archiver.reuse_stats.files_reencoded_count
+                + archiver.reuse_stats.files_hardlink_count,
+            archiver.reuse_stats.files_hardlink_count,
+        );
+        info!(
+            " - {} unchanged, reusable files with {} data",
+            archiver.reuse_stats.files_reused_count,
+            HumanByte::from(archiver.reuse_stats.total_reused_payload_size),
+        );
+        info!(
+            " - {} changed or non-reusable files with {} data",
+            archiver.reuse_stats.files_reencoded_count,
+            HumanByte::from(archiver.reuse_stats.total_reencoded_size),
+        );
+        info!(
+            " - {} padding in {} partially reused chunks",
+            HumanByte::from(
+                archiver.reuse_stats.total_injected_size
+                    - archiver.reuse_stats.total_reused_payload_size
+            ),
+            archiver.reuse_stats.partial_chunks_count,
+        );
+    }
     Ok(())
 }
 
@@ -252,17 +398,10 @@ impl Archiver {
         self.feature_flags & self.fs_feature_flags
     }
 
-    fn wrap_err(&self, err: Error) -> Error {
-        if err.downcast_ref::<ArchiveError>().is_some() {
-            err
-        } else {
-            ArchiveError::new(self.path.clone(), err).into()
-        }
-    }
-
     fn archive_dir_contents<'a, T: SeqWrite + Send>(
         &'a mut self,
         encoder: &'a mut Encoder<'_, T>,
+        mut previous_metadata_accessor: Option<Directory<MetadataArchiveReader>>,
         mut dir: Dir,
         is_root: bool,
     ) -> BoxFuture<'a, Result<(), Error>> {
@@ -274,7 +413,7 @@ impl Archiver {
 
             let mut file_list = self.generate_directory_file_list(&mut dir, is_root)?;
 
-            if is_root && old_patterns_count > 0 {
+            if is_root && old_patterns_count > 0 && previous_metadata_accessor.is_none() {
                 file_list.push(FileListEntry {
                     name: CString::new(".pxarexclude-cli").unwrap(),
                     path: PathBuf::new(),
@@ -290,16 +429,24 @@ impl Archiver {
                 let file_name = file_entry.name.to_bytes();
 
                 if is_root && file_name == b".pxarexclude-cli" {
-                    self.encode_pxarexclude_cli(encoder, &file_entry.name, old_patterns_count)
-                        .await?;
+                    if !self.split_archive {
+                        self.encode_pxarexclude_cli(encoder, &file_entry.name, old_patterns_count)
+                            .await?;
+                    }
                     continue;
                 }
 
                 (self.callback)(&file_entry.path)?;
                 self.path = file_entry.path;
-                self.add_entry(encoder, dir_fd, &file_entry.name, &file_entry.stat)
-                    .await
-                    .map_err(|err| self.wrap_err(err))?;
+                self.add_entry(
+                    encoder,
+                    &mut previous_metadata_accessor,
+                    dir_fd,
+                    &file_entry.name,
+                    &file_entry.stat,
+                )
+                .await
+                .unique_context(format!("error at {:?}", self.path))?;
             }
             self.path = old_path;
             self.entry_counter = entry_counter;
@@ -308,6 +455,67 @@ impl Archiver {
             Ok(())
         }
         .boxed()
+    }
+
+    /// Record an accepted reusable payload offset from the previous metadata archive.
+    ///
+    /// Returns `false` if `offset` is not strictly greater than the last accepted offset, which
+    /// signals a duplicate or non-monotonic previous archive. The caller must then treat the file
+    /// as non-reusable so the encoder's strict offset check cannot reject the eventual
+    /// `add_payload_ref`. Tracking is global to catch inversions that span cache ranges.
+    fn try_record_reusable_offset(&mut self, offset: u64) -> bool {
+        try_record_strictly_greater(&mut self.last_reusable_offset, offset)
+    }
+
+    async fn is_reusable_entry(
+        &mut self,
+        previous_metadata_accessor: &Option<Directory<MetadataArchiveReader>>,
+        file_name: &Path,
+        metadata: &Metadata,
+        file_size: u64,
+    ) -> Result<Option<Range<u64>>, Error> {
+        if let Some(previous_metadata_accessor) = previous_metadata_accessor {
+            if let Some(file_entry) = previous_metadata_accessor.lookup(file_name).await? {
+                if metadata == file_entry.metadata() {
+                    if let EntryKind::File {
+                        payload_offset: Some(offset),
+                        size,
+                        ..
+                    } = file_entry.entry().kind()
+                    {
+                        if file_size != *size {
+                            return Ok(None);
+                        }
+                        // a previous archive written by an older client version may contain
+                        // duplicate or non-monotonic PXAR_PAYLOAD_REF offsets for distinct files.
+                        // Re-encoding the affected file lets the chain self-heal and avoids the
+                        // pxar strict offset check rejecting the whole backup.
+                        if !self.try_record_reusable_offset(*offset) {
+                            let last = self.last_reusable_offset.unwrap_or(0);
+                            warn!(
+                                "re-encode: {file_name:?} previous archive payload offset \
+                                 {offset} not strictly greater than last seen {last}, \
+                                 treating as non-reusable"
+                            );
+                            return Ok(None);
+                        }
+                        let range =
+                            *offset..*offset + size + size_of::<pxar::format::Header>() as u64;
+                        debug!(
+                            "reusable: {file_name:?} at range {range:?} has unchanged metadata."
+                        );
+                        return Ok(Some(range));
+                    }
+                    debug!("re-encode: {file_name:?} not a regular file.");
+                    return Ok(None);
+                }
+                debug!("re-encode: {file_name:?} metadata did not match.");
+                return Ok(None);
+            }
+            debug!("re-encode: {file_name:?} not found in previous archive.");
+        }
+
+        Ok(None)
     }
 
     /// openat() wrapper which allows but logs `EACCES` and turns `ENOENT` into `None`.
@@ -338,12 +546,16 @@ impl Archiver {
                 Ok(fd) => Ok(Some(fd)),
                 Err(Errno::ENOENT) => {
                     if existed {
-                        self.report_vanished_file()?;
+                        self.report_vanished_file();
                     }
                     Ok(None)
                 }
                 Err(Errno::EACCES) => {
-                    log::warn!("failed to open file: {:?}: access denied", file_name);
+                    warn!("failed to open file: {:?}: access denied", file_name);
+                    Ok(None)
+                }
+                Err(Errno::ESTALE) => {
+                    self.report_stale_file_handle(None);
                     Ok(None)
                 }
                 Err(Errno::EPERM) if !noatime.is_empty() => {
@@ -359,7 +571,7 @@ impl Archiver {
     }
 
     fn read_pxar_excludes(&mut self, parent: RawFd) -> Result<(), Error> {
-        let fd = match self.open_file(parent, c_str!(".pxarexclude"), OFlag::O_RDONLY, false)? {
+        let fd = match self.open_file(parent, c".pxarexclude", OFlag::O_RDONLY, false)? {
             Some(fd) => fd,
             None => return Ok(()),
         };
@@ -375,10 +587,9 @@ impl Archiver {
             let line = match line {
                 Ok(line) => line,
                 Err(err) => {
-                    log::warn!(
+                    warn!(
                         "ignoring .pxarexclude after read error in {:?}: {}",
-                        self.path,
-                        err,
+                        self.path, err,
                     );
                     self.patterns.truncate(old_pattern_count);
                     return Ok(());
@@ -393,13 +604,20 @@ impl Archiver {
 
             let mut buf;
             let (line, mode, anchored) = if line[0] == b'/' {
-                buf = Vec::with_capacity(path_bytes.len() + 1 + line.len());
+                buf = Vec::with_capacity(path_bytes.len() + 2 + line.len());
+                // need to anchor the base path if it is not
+                if !path_bytes.is_empty() && !path_bytes.starts_with(b"/") {
+                    buf.push(b'/');
+                }
                 buf.extend(path_bytes);
                 buf.extend(line);
                 (&buf[..], MatchType::Exclude, true)
             } else if line.starts_with(b"!/") {
                 // inverted case with absolute path
-                buf = Vec::with_capacity(path_bytes.len() + line.len());
+                buf = Vec::with_capacity(path_bytes.len() + 1 + line.len());
+                if !path_bytes.is_empty() && !path_bytes.starts_with(b"/") {
+                    buf.push(b'/');
+                }
                 buf.extend(path_bytes);
                 buf.extend(&line[1..]); // without the '!'
                 (&buf[..], MatchType::Include, true)
@@ -409,7 +627,20 @@ impl Archiver {
                 (line, MatchType::Exclude, false)
             };
 
-            match MatchEntry::parse_pattern(line, PatternFlag::PATH_NAME, mode) {
+            let line = OsStr::from_bytes(line);
+            let line_normalized = crate::pxar::tools::normalize_lexically(line);
+            if line_normalized.as_os_str() != line {
+                warn!(
+                    "Sanitized exclude pattern. Exclude patterns are relative to the current \
+                    backup root, not the current working directory and should not contain '.' or \
+                    '..' as path segments."
+                );
+            }
+            match MatchEntry::parse_pattern(
+                line_normalized.as_os_str().as_bytes(),
+                PatternFlag::PATH_NAME,
+                mode,
+            ) {
                 Ok(pattern) => {
                     if anchored {
                         self.patterns.push(pattern.add_flags(MatchFlag::ANCHORED));
@@ -418,7 +649,7 @@ impl Archiver {
                     }
                 }
                 Err(err) => {
-                    log::error!("bad pattern in {:?}: {}", self.path, err);
+                    error!("bad pattern in {:?}: {}", self.path, err);
                 }
             }
         }
@@ -442,6 +673,10 @@ impl Archiver {
 
         let mut metadata = Metadata::default();
         metadata.stat.mode = pxar::format::mode::IFREG | 0o600;
+        // use uid/gid of client process so the backup snapshot might be restored by the same
+        // potentially non-root user
+        metadata.stat.uid = unsafe { libc::getuid() };
+        metadata.stat.gid = unsafe { libc::getgid() };
 
         let mut file = encoder
             .create_file(&metadata, ".pxarexclude-cli", content.len() as u64)
@@ -479,34 +714,53 @@ impl Archiver {
 
             let match_path = PathBuf::from("/").join(full_path.clone());
 
-            let mut stat_results: Option<FileStat> = None;
+            let mut stat_result: Option<FileStat> = None;
 
-            let get_file_mode = || {
-                nix::sys::stat::fstatat(dir_fd, file_name, nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW)
+            let do_stat = || {
+                nix::sys::stat::fstatat(
+                    Some(dir_fd),
+                    file_name,
+                    nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW,
+                )
             };
 
             let match_result = self
                 .patterns
                 .matches(match_path.as_os_str().as_bytes(), || {
-                    Ok::<_, Errno>(match &stat_results {
+                    Ok::<_, Errno>(match &stat_result {
                         Some(result) => u32::from(result.st_mode),
-                        None => u32::from(stat_results.insert(get_file_mode()?).st_mode),
+                        None => u32::from(stat_result.insert(do_stat()?).st_mode),
                     })
                 });
 
-            match match_result {
-                Ok(Some(MatchType::Exclude)) => continue,
-                Ok(_) => (),
-                Err(err) if err.not_found() => continue,
-                Err(err) => {
-                    return Err(err).with_context(|| format!("stat failed on {full_path:?}"))
+            let stat_result = match match_result {
+                Ok(Some(MatchType::Exclude)) => {
+                    debug!("matched by exclude pattern '{full_path:?}'");
+                    continue;
                 }
-            }
+                Ok(_) => stat_result.map_or_else(do_stat, Ok),
+                Err(e) => Err(e),
+            };
 
-            let stat = stat_results
-                .map(Ok)
-                .unwrap_or_else(get_file_mode)
-                .with_context(|| format!("stat failed on {full_path:?}"))?;
+            let stat = match stat_result {
+                Ok(stat) => stat,
+                Err(err) if err.not_found() => {
+                    warn!("warning: file vanished while reading directory: {full_path:?}");
+                    continue;
+                }
+                Err(Errno::EACCES) => {
+                    // may happen for fuse mountpoints without allow_other or allow_root
+                    warn!("warning: failed to stat file: {full_path:?}: access denied");
+                    continue;
+                }
+                Err(Errno::ESTALE) => {
+                    self.report_stale_file_handle(Some(&full_path));
+                    continue;
+                }
+                Err(err) => {
+                    return Err(err).context(format!("stat failed on {full_path:?}"));
+                }
+            };
 
             self.entry_counter += 1;
             if self.entry_counter > self.entry_limit {
@@ -528,36 +782,37 @@ impl Archiver {
         Ok(file_list)
     }
 
-    fn report_vanished_file(&mut self) -> Result<(), Error> {
-        log::warn!("warning: file vanished while reading: {:?}", self.path);
-        Ok(())
+    fn report_stale_file_handle(&self, path: Option<&PathBuf>) {
+        let path = path.unwrap_or(&self.path);
+        warn!("warning: stale file handle encountered while reading: {path:?}");
     }
 
-    fn report_file_shrunk_while_reading(&mut self) -> Result<(), Error> {
-        log::warn!(
+    fn report_vanished_file(&self) {
+        warn!("warning: file vanished while reading: {:?}", self.path);
+    }
+
+    fn report_file_shrunk_while_reading(&self) {
+        warn!(
             "warning: file size shrunk while reading: {:?}, file will be padded with zeros!",
             self.path,
         );
-        Ok(())
     }
 
-    fn report_file_grew_while_reading(&mut self) -> Result<(), Error> {
-        log::warn!(
+    fn report_file_grew_while_reading(&self) {
+        warn!(
             "warning: file size increased while reading: {:?}, file will be truncated!",
             self.path,
         );
-        Ok(())
     }
 
     async fn add_entry<T: SeqWrite + Send>(
         &mut self,
         encoder: &mut Encoder<'_, T>,
+        previous_metadata: &mut Option<Directory<MetadataArchiveReader>>,
         parent: RawFd,
         c_file_name: &CStr,
         stat: &FileStat,
     ) -> Result<(), Error> {
-        use pxar::format::mode;
-
         let file_mode = stat.st_mode & libc::S_IFMT;
         let is_file_or_dir = file_mode == libc::S_IFREG || file_mode == libc::S_IFDIR;
 
@@ -565,56 +820,199 @@ impl Archiver {
         // be downloaded on read, which can take long, fill the disk or fail. Skip them.
         #[cfg(target_os = "macos")]
         if file_mode == libc::S_IFREG && stat.st_flags & SF_DATALESS != 0 {
-            log::warn!("skipping online-only file: {:?}", self.path);
+            warn!("skipping online-only file: {:?}", self.path);
             return Ok(());
         }
 
-        // Other file types are opened with O_PATH on Linux. Elsewhere they are not opened at all,
-        // as this could block (FIFOs) or have side effects (devices), their metadata is taken
-        // from `stat` alone.
-        let fd = if is_file_or_dir || cfg!(target_os = "linux") {
-            #[cfg(target_os = "linux")]
+        // Other file types are opened with O_PATH on Linux. There is no O_PATH on macOS: symlinks
+        // are opened with O_SYMLINK, other types are not opened at all, as this could block
+        // (FIFOs) or have side effects (devices). Their metadata is taken from `stat` alone and
+        // they get a duplicate of the parent directory fd as placeholder, which is never used for
+        // these types.
+        #[cfg(target_os = "linux")]
+        let fd = {
             let open_mode = if is_file_or_dir {
                 OFlag::empty()
             } else {
                 OFlag::O_PATH
             };
-            #[cfg(not(target_os = "linux"))]
-            let open_mode = OFlag::empty();
 
-            match self.open_file(
+            self.open_file(
                 parent,
                 c_file_name,
                 open_mode | OFlag::O_RDONLY | OFlag::O_NOFOLLOW,
                 true,
-            )? {
-                Some(fd) => Some(fd),
-                None => return Ok(()),
-            }
+            )?
+        };
+        #[cfg(target_os = "macos")]
+        let fd = if is_file_or_dir {
+            self.open_file(
+                parent,
+                c_file_name,
+                OFlag::O_RDONLY | OFlag::O_NOFOLLOW,
+                true,
+            )?
+        } else if file_mode == libc::S_IFLNK {
+            // O_SYMLINK opens the link itself, O_NOFOLLOW would make it fail with ELOOP
+            self.open_file(
+                parent,
+                c_file_name,
+                OFlag::O_RDONLY | OFlag::from_bits_retain(libc::O_SYMLINK),
+                true,
+            )?
         } else {
-            None
+            let parent = unsafe { std::os::fd::BorrowedFd::borrow_raw(parent) };
+            Some(parent.try_clone_to_owned()?)
         };
 
-        let match_path = PathBuf::from("/").join(self.path.clone());
-        if self
-            .patterns
-            .matches(match_path.as_os_str().as_bytes(), u32::from(stat.st_mode))?
-            == Some(MatchType::Exclude)
-        {
-            return Ok(());
-        }
+        let fd = match fd {
+            Some(fd) => fd,
+            None => return Ok(()),
+        };
 
-        let metadata = match fd {
-            Some(ref fd) => get_metadata(
+        let metadata = if is_file_or_dir || cfg!(target_os = "linux") {
+            match get_metadata(
                 fd.as_raw_fd(),
                 stat,
                 self.flags(),
                 self.fs_magic,
                 &mut self.fs_feature_flags,
                 self.skip_e2big_xattr,
-            )?,
-            None => get_stat_metadata(stat),
+            ) {
+                Ok(metadata) => metadata,
+                Err(err) => {
+                    if let Some(Errno::ESTALE) = err.downcast_ref::<Errno>() {
+                        self.report_stale_file_handle(None);
+                        return Ok(());
+                    }
+                    return Err(err);
+                }
+            }
+        } else {
+            get_stat_metadata(stat)
         };
+
+        if self.previous_payload_index.is_none() {
+            return self
+                .add_entry_to_archive(encoder, &mut None, c_file_name, stat, fd, &metadata, None)
+                .await;
+        }
+
+        // Avoid having to many open file handles in cached entries
+        if self.cache.is_full() {
+            debug!("Max cache size reached, reuse cached entries");
+            self.flush_cached_reusing_if_below_threshold(encoder, true)
+                .await?;
+        }
+
+        if metadata.is_regular_file() {
+            if stat.st_nlink > 1 {
+                let link_info = HardLinkInfo {
+                    st_dev: stat.st_dev,
+                    st_ino: stat.st_ino,
+                };
+                if self.cache.contains_hardlink(&link_info) {
+                    // This hardlink has been seen by the lookahead cache already, put it on the cache
+                    // with a dummy offset and continue without lookup and chunk injection.
+                    // On flushing or re-encoding, the logic there will store the actual hardlink with
+                    // offset.
+                    self.cache.insert(
+                        fd,
+                        c_file_name.into(),
+                        *stat,
+                        metadata.clone(),
+                        PayloadOffset::default(),
+                        self.path.clone(),
+                    );
+                    return Ok(());
+                } else {
+                    // mark this hardlink as seen by the lookahead cache
+                    self.cache.insert_hardlink(link_info);
+                }
+            }
+
+            let file_name: &Path = OsStr::from_bytes(c_file_name.to_bytes()).as_ref();
+            let file_size = stat.st_size as u64;
+            if let Some(payload_range) = self
+                .is_reusable_entry(previous_metadata, file_name, &metadata, file_size)
+                .await?
+            {
+                if !self.cache.try_extend_range(payload_range.clone()) {
+                    debug!("Cache range has hole, new range: {payload_range:?}");
+                    self.flush_cached_reusing_if_below_threshold(encoder, true)
+                        .await?;
+                    // range has to be set after flushing of cached entries, which resets the range
+                    self.cache.update_range(payload_range.clone());
+                }
+
+                // offset relative to start of current range, does not include possible padding of
+                // actual chunks, which needs to be added before encoding the payload reference
+                let offset =
+                    PayloadOffset::default().add(payload_range.start - self.cache.range().start);
+                debug!("Offset relative to range start: {offset:?}");
+
+                self.cache.insert(
+                    fd,
+                    c_file_name.into(),
+                    *stat,
+                    metadata.clone(),
+                    offset,
+                    self.path.clone(),
+                );
+                return Ok(());
+            } else {
+                self.flush_cached_reusing_if_below_threshold(encoder, false)
+                    .await?;
+            }
+        } else if self.cache.caching_enabled() {
+            self.cache.insert(
+                fd.try_clone()?,
+                c_file_name.into(),
+                *stat,
+                metadata.clone(),
+                PayloadOffset::default(),
+                self.path.clone(),
+            );
+
+            if metadata.is_dir() {
+                self.add_directory(
+                    encoder,
+                    previous_metadata,
+                    Dir::from_fd(fd.into_raw_fd())?,
+                    c_file_name,
+                    &metadata,
+                    stat,
+                )
+                .await?;
+            }
+            return Ok(());
+        }
+
+        self.encode_entries_to_archive(encoder, None).await?;
+        self.add_entry_to_archive(
+            encoder,
+            previous_metadata,
+            c_file_name,
+            stat,
+            fd,
+            &metadata,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn add_entry_to_archive<T: SeqWrite + Send>(
+        &mut self,
+        encoder: &mut Encoder<'_, T>,
+        previous_metadata: &mut Option<Directory<MetadataArchiveReader>>,
+        c_file_name: &CStr,
+        stat: &FileStat,
+        fd: OwnedFd,
+        metadata: &Metadata,
+        payload_offset: Option<PayloadOffset>,
+    ) -> Result<(), Error> {
+        use pxar::format::mode;
 
         let file_name: &Path = OsStr::from_bytes(c_file_name.to_bytes()).as_ref();
         match metadata.file_type() {
@@ -644,12 +1042,30 @@ impl Archiver {
                         .add_file(c_file_name, file_size, stat.st_mtime)?;
                 }
 
-                let fd = fd.expect("regular files are always opened");
-                let offset: LinkOffset = self
-                    .add_regular_file(encoder, fd, file_name, &metadata, file_size)
-                    .await?;
+                if let Some(sender) = self.suggested_boundaries.as_mut() {
+                    let offset = encoder.payload_position()?.raw();
+                    sender.send(offset)?;
+                }
+
+                let offset: LinkOffset = if let Some(payload_offset) = payload_offset {
+                    self.reuse_stats.total_reused_payload_size +=
+                        file_size + size_of::<pxar::format::Header>() as u64;
+                    self.reuse_stats.files_reused_count += 1;
+
+                    encoder
+                        .add_payload_ref(metadata, file_name, file_size, payload_offset)
+                        .await?
+                } else {
+                    self.reuse_stats.total_reencoded_size +=
+                        file_size + size_of::<pxar::format::Header>() as u64;
+                    self.reuse_stats.files_reencoded_count += 1;
+
+                    self.add_regular_file(encoder, fd, file_name, metadata, file_size)
+                        .await?
+                };
 
                 if stat.st_nlink > 1 {
+                    self.reuse_stats.files_hardlink_count += 1;
                     self.hardlinks
                         .insert(link_info, (self.path.clone(), offset));
                 }
@@ -657,55 +1073,44 @@ impl Archiver {
                 Ok(())
             }
             mode::IFDIR => {
-                let fd = fd.expect("directories are always opened");
                 let dir = Dir::from_fd(fd.into_raw_fd())?;
-
-                if let Some(ref catalog) = self.catalog {
-                    catalog.lock().unwrap().start_directory(c_file_name)?;
-                }
-                let result = self
-                    .add_directory(encoder, dir, c_file_name, &metadata, stat)
-                    .await;
-                if let Some(ref catalog) = self.catalog {
-                    catalog.lock().unwrap().end_directory()?;
-                }
-                result
+                self.add_directory(encoder, previous_metadata, dir, c_file_name, metadata, stat)
+                    .await
             }
             mode::IFSOCK => {
                 if let Some(ref catalog) = self.catalog {
                     catalog.lock().unwrap().add_socket(c_file_name)?;
                 }
 
-                Ok(encoder.add_socket(&metadata, file_name).await?)
+                Ok(encoder.add_socket(metadata, file_name).await?)
             }
             mode::IFIFO => {
                 if let Some(ref catalog) = self.catalog {
                     catalog.lock().unwrap().add_fifo(c_file_name)?;
                 }
 
-                Ok(encoder.add_fifo(&metadata, file_name).await?)
+                Ok(encoder.add_fifo(metadata, file_name).await?)
             }
             mode::IFLNK => {
                 if let Some(ref catalog) = self.catalog {
                     catalog.lock().unwrap().add_symlink(c_file_name)?;
                 }
 
-                self.add_symlink(encoder, fd, parent, c_file_name, file_name, &metadata)
-                    .await
+                self.add_symlink(encoder, fd, file_name, metadata).await
             }
             mode::IFBLK => {
                 if let Some(ref catalog) = self.catalog {
                     catalog.lock().unwrap().add_block_device(c_file_name)?;
                 }
 
-                self.add_device(encoder, file_name, &metadata, stat).await
+                self.add_device(encoder, file_name, metadata, stat).await
             }
             mode::IFCHR => {
                 if let Some(ref catalog) = self.catalog {
                     catalog.lock().unwrap().add_char_device(c_file_name)?;
                 }
 
-                self.add_device(encoder, file_name, &metadata, stat).await
+                self.add_device(encoder, file_name, metadata, stat).await
             }
             other => bail!(
                 "encountered unknown file type: 0x{:x} (0o{:o})",
@@ -715,17 +1120,218 @@ impl Archiver {
         }
     }
 
+    async fn flush_cached_reusing_if_below_threshold<T: SeqWrite + Send>(
+        &mut self,
+        encoder: &mut Encoder<'_, T>,
+        keep_last_chunk: bool,
+    ) -> Result<(), Error> {
+        if self.cache.range().is_empty() {
+            // only non regular file entries (e.g. directories) in cache, allows to do regular encoding
+            self.encode_entries_to_archive(encoder, None).await?;
+            return Ok(());
+        }
+
+        if let Some(ref ref_payload_index) = self.previous_payload_index {
+            // Take ownership of previous last chunk, only update where it must be injected
+            let prev_last_chunk = self.cache.take_last_chunk();
+            let range = self.cache.range();
+            let (mut indices, start_padding, end_padding) =
+                lookup_dynamic_entries(ref_payload_index, range)?;
+            let mut padding = start_padding + end_padding;
+            let total_size = (range.end - range.start) + padding;
+
+            // must use the same identity predicate as the absorb branch below; otherwise
+            // a dedup collision subtracts an unrelated chunk's bytes from padding.
+            if let (Some(first), Some(last)) = (indices.first(), prev_last_chunk.as_ref()) {
+                if last.same_indexed_chunk_as(first) {
+                    // Update padding used for threshold calculation only
+                    let used = last.size() - last.padding;
+                    padding -= used;
+                }
+            }
+
+            let ratio = padding as f64 / total_size as f64;
+
+            // do not reuse chunks if introduced padding higher than threshold
+            // opt for re-encoding in that case
+            if ratio > CHUNK_PADDING_THRESHOLD {
+                debug!(
+                    "Padding ratio: {ratio} > {CHUNK_PADDING_THRESHOLD}, padding: {}, total {}, chunks: {}",
+                    HumanByte::from(padding),
+                    HumanByte::from(total_size),
+                    indices.len(),
+                );
+                self.cache.update_last_chunk(prev_last_chunk);
+                self.encode_entries_to_archive(encoder, None).await?;
+            } else {
+                debug!(
+                    "Padding ratio: {ratio} < {CHUNK_PADDING_THRESHOLD}, padding: {}, total {}, chunks: {}",
+                    HumanByte::from(padding),
+                    HumanByte::from(total_size),
+                    indices.len(),
+                );
+
+                // inject the kept back chunk unless it refers to the same index entry
+                // as the new range's first: digests differ when the previous range ended
+                // on a chunk boundary, and matching digests at different `end_offset`s
+                // are a dedup collision in the previous archive (same content at distinct
+                // index positions). Both cases need an explicit injection.
+                if let (Some(first), Some(last)) = (indices.first_mut(), prev_last_chunk) {
+                    if !last.same_indexed_chunk_as(first) {
+                        // make sure to inject previous last chunk before encoding entries
+                        self.inject_chunks_at_current_payload_position(encoder, vec![last])?;
+                    } else {
+                        let used = last.size() - last.padding;
+                        first.padding -= used;
+                    }
+                }
+
+                let base_offset = Some(encoder.payload_position()?.add(start_padding));
+                self.encode_entries_to_archive(encoder, base_offset).await?;
+
+                if keep_last_chunk {
+                    self.cache.update_last_chunk(indices.pop());
+                }
+
+                self.inject_chunks_at_current_payload_position(encoder, indices)?;
+            }
+
+            Ok(())
+        } else {
+            bail!("cannot reuse chunks without previous index reader");
+        }
+    }
+
+    // Take ownership of cached entries and encode them to the archive
+    // Encode with reused payload chunks when base offset is some, re-encode otherwise
+    async fn encode_entries_to_archive<T: SeqWrite + Send>(
+        &mut self,
+        encoder: &mut Encoder<'_, T>,
+        base_offset: Option<PayloadOffset>,
+    ) -> Result<(), Error> {
+        if let Some(prev) = self.cache.take_last_chunk() {
+            // make sure to inject previous last chunk before encoding entries
+            self.inject_chunks_at_current_payload_position(encoder, vec![prev])?;
+        }
+
+        // take ownership of cached entries and reset caching state
+        let (entries, start_path) = self.cache.take_and_reset();
+        let old_path = self.path.clone();
+        self.path = start_path;
+        debug!(
+            "Got {} cache entries to encode: reuse is {}",
+            entries.len(),
+            base_offset.is_some()
+        );
+
+        for entry in entries {
+            match entry {
+                CacheEntry::RegEntry(CacheEntryData {
+                    fd,
+                    c_file_name,
+                    stat,
+                    metadata,
+                    payload_offset,
+                }) => {
+                    let file_name = OsStr::from_bytes(c_file_name.to_bytes());
+                    self.path.push(file_name);
+                    self.add_entry_to_archive(
+                        encoder,
+                        &mut None,
+                        &c_file_name,
+                        &stat,
+                        fd,
+                        &metadata,
+                        base_offset.map(|base_offset| payload_offset.add(base_offset.raw())),
+                    )
+                    .await?;
+                    self.path.pop();
+                }
+                CacheEntry::DirEntry(CacheEntryData {
+                    c_file_name,
+                    metadata,
+                    ..
+                }) => {
+                    let file_name = OsStr::from_bytes(c_file_name.to_bytes());
+                    self.path.push(file_name);
+                    if let Some(ref catalog) = self.catalog {
+                        catalog.lock().unwrap().start_directory(&c_file_name)?;
+                    }
+                    let dir_name = OsStr::from_bytes(c_file_name.to_bytes());
+                    encoder.create_directory(dir_name, &metadata).await?;
+                }
+                CacheEntry::DirEnd => {
+                    encoder.finish().await?;
+                    if let Some(ref catalog) = self.catalog {
+                        catalog.lock().unwrap().end_directory()?;
+                    }
+                    self.path.pop();
+                }
+            }
+        }
+
+        self.path = old_path;
+
+        Ok(())
+    }
+
+    fn inject_chunks_at_current_payload_position<T: SeqWrite + Send>(
+        &mut self,
+        encoder: &mut Encoder<'_, T>,
+        reused_chunks: Vec<ReusableDynamicEntry>,
+    ) -> Result<(), Error> {
+        let mut injection_boundary = encoder.payload_position()?;
+
+        for chunks in reused_chunks.chunks(128) {
+            let chunks = chunks.to_vec();
+            let mut size = PayloadOffset::default();
+
+            for chunk in chunks.iter() {
+                debug!(
+                    "Injecting chunk with {} padding (chunk size {})",
+                    HumanByte::from(chunk.padding),
+                    HumanByte::from(chunk.size()),
+                );
+                self.reuse_stats.total_injected_size += chunk.size();
+                self.reuse_stats.total_injected_count += 1;
+
+                if chunk.padding > 0 {
+                    self.reuse_stats.partial_chunks_count += 1;
+                }
+
+                size = size.add(chunk.size());
+            }
+
+            let inject_chunks = InjectChunks {
+                boundary: injection_boundary.raw(),
+                chunks,
+                size: size.raw() as usize,
+            };
+
+            if let Some(sender) = self.forced_boundaries.as_mut() {
+                sender.send(inject_chunks)?;
+            } else {
+                bail!("missing injection queue");
+            };
+
+            injection_boundary = injection_boundary.add(size.raw());
+            debug!("Advance payload position by: {size:?}");
+            encoder.advance(size)?;
+        }
+
+        Ok(())
+    }
+
     async fn add_directory<T: SeqWrite + Send>(
         &mut self,
         encoder: &mut Encoder<'_, T>,
+        previous_metadata_accessor: &mut Option<Directory<MetadataArchiveReader>>,
         dir: Dir,
-        dir_name: &CStr,
+        c_dir_name: &CStr,
         metadata: &Metadata,
         stat: &FileStat,
     ) -> Result<(), Error> {
-        let dir_name = OsStr::from_bytes(dir_name.to_bytes());
-
-        let mut encoder = encoder.create_directory(dir_name, metadata).await?;
+        let dir_name = OsStr::from_bytes(c_dir_name.to_bytes());
 
         let old_fs_magic = self.fs_magic;
         let old_fs_feature_flags = self.fs_feature_flags;
@@ -733,7 +1339,14 @@ impl Archiver {
 
         let mut skip_contents = false;
         if old_st_dev != stat.st_dev {
-            self.fs_magic = detect_fs_type(dir.as_raw_fd())?;
+            match detect_fs_type(dir.as_raw_fd()) {
+                Ok(fs_magic) => self.fs_magic = fs_magic,
+                Err(Errno::ESTALE) => {
+                    self.report_stale_file_handle(None);
+                    return Ok(());
+                }
+                Err(err) => return Err(err.into()),
+            }
             self.fs_feature_flags = Flags::from_magic(self.fs_magic);
             self.current_st_dev = stat.st_dev;
 
@@ -744,18 +1357,43 @@ impl Archiver {
             }
         }
 
+        if !self.cache.caching_enabled() {
+            if let Some(ref catalog) = self.catalog {
+                catalog.lock().unwrap().start_directory(c_dir_name)?;
+            }
+            encoder.create_directory(dir_name, metadata).await?;
+        }
+
         let result = if skip_contents {
-            log::info!("skipping mount point: {:?}", self.path);
+            info!("skipping mount point: {:?}", self.path);
             Ok(())
         } else {
-            self.archive_dir_contents(&mut encoder, dir, false).await
+            let mut dir_accessor = None;
+            if let Some(accessor) = previous_metadata_accessor.as_mut() {
+                if let Some(file_entry) = accessor.lookup(dir_name).await? {
+                    if file_entry.entry().is_dir() {
+                        let dir = file_entry.enter_directory().await?;
+                        dir_accessor = Some(dir);
+                    }
+                }
+            }
+            self.archive_dir_contents(encoder, dir_accessor, dir, false)
+                .await
         };
 
         self.fs_magic = old_fs_magic;
         self.fs_feature_flags = old_fs_feature_flags;
         self.current_st_dev = old_st_dev;
 
-        encoder.finish().await?;
+        if !self.cache.caching_enabled() {
+            encoder.finish().await?;
+            if let Some(ref catalog) = self.catalog {
+                catalog.lock().unwrap().end_directory()?;
+            }
+        } else {
+            self.cache.insert_dir_end();
+        }
+
         result
     }
 
@@ -778,14 +1416,14 @@ impl Archiver {
                 Err(err) => bail!(err),
             };
             if got as u64 > remaining {
-                self.report_file_grew_while_reading()?;
+                self.report_file_grew_while_reading();
                 got = remaining as usize;
             }
             out.write_all(&self.file_copy_buffer[..got]).await?;
             remaining -= got as u64;
         }
         if remaining > 0 {
-            self.report_file_shrunk_while_reading()?;
+            self.report_file_shrunk_while_reading();
             let to_zero = remaining.min(self.file_copy_buffer.len() as u64) as usize;
             vec::clear(&mut self.file_copy_buffer[..to_zero]);
             while remaining != 0 {
@@ -801,15 +1439,22 @@ impl Archiver {
     async fn add_symlink<T: SeqWrite + Send>(
         &mut self,
         encoder: &mut Encoder<'_, T>,
-        fd: Option<OwnedFd>,
-        parent: RawFd,
-        c_file_name: &CStr,
+        fd: OwnedFd,
         file_name: &Path,
         metadata: &Metadata,
     ) -> Result<(), Error> {
-        let dest = match fd {
-            Some(fd) => nix::fcntl::readlinkat(fd.as_raw_fd(), &b""[..])?,
-            None => nix::fcntl::readlinkat(parent, c_file_name)?,
+        #[cfg(target_os = "linux")]
+        let dest = nix::fcntl::readlinkat(Some(fd.as_raw_fd()), &b""[..]);
+        // opened with O_SYMLINK, which cannot be read, so read the link through its path
+        #[cfg(target_os = "macos")]
+        let dest = nix::fcntl::readlink(super::metadata::fd_path(fd.as_raw_fd())?.as_c_str());
+        let dest = match dest {
+            Ok(dest) => dest,
+            Err(Errno::ESTALE) => {
+                self.report_stale_file_handle(None);
+                return Ok(());
+            }
+            Err(err) => return Err(err.into()),
         };
         encoder.add_symlink(metadata, file_name, dest).await?;
         Ok(())
@@ -830,6 +1475,100 @@ impl Archiver {
             )
             .await?)
     }
+}
+
+/// Dynamic entry reusable by payload references
+#[derive(Clone, Debug)]
+#[repr(C)]
+pub struct ReusableDynamicEntry {
+    size: u64,
+    padding: u64,
+    digest: [u8; 32],
+    /// Absolute end position of this entry in the previous archive's payload index;
+    /// together with `digest` the canonical identity tuple for an index entry -
+    /// `digest` alone aliases dedup-collided entries at distinct index positions.
+    end_offset: u64,
+}
+
+impl ReusableDynamicEntry {
+    #[inline]
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    #[inline]
+    pub fn digest(&self) -> [u8; 32] {
+        self.digest
+    }
+
+    /// Returns whether `self` and `other` reference the same entry in the previous
+    /// archive's payload index. Two distinct entries can share a digest (same chunk
+    /// content via deduplication), so digest equality alone aliases dedup collisions;
+    /// `end_offset` is the per-index-entry identity component that disambiguates them.
+    #[inline]
+    pub fn same_indexed_chunk_as(&self, other: &Self) -> bool {
+        self.digest == other.digest && self.end_offset == other.end_offset
+    }
+}
+
+/// Updates `last` to `offset` and returns `true` if `offset` is strictly greater than the current
+/// value (or `last` is `None`). Returns `false` without modifying `last` for duplicate or
+/// backwards offsets.
+fn try_record_strictly_greater(last: &mut Option<u64>, offset: u64) -> bool {
+    if let Some(prev) = *last {
+        if offset <= prev {
+            return false;
+        }
+    }
+    *last = Some(offset);
+    true
+}
+
+/// List of dynamic entries containing the data given by an offset range
+fn lookup_dynamic_entries(
+    index: &DynamicIndexReader,
+    range: &Range<u64>,
+) -> Result<(Vec<ReusableDynamicEntry>, u64, u64), Error> {
+    let end_idx = index.index_count() - 1;
+    let chunk_end = index.chunk_end(end_idx);
+    let start = index.binary_search(0, 0, end_idx, chunk_end, range.start)?;
+
+    let mut prev_end = if start == 0 {
+        0
+    } else {
+        index.chunk_end(start - 1)
+    };
+    let padding_start = range.start - prev_end;
+    let mut padding_end = 0;
+
+    let mut indices = Vec::new();
+    for dynamic_entry in &index.index()[start..] {
+        let end = dynamic_entry.end();
+
+        let reusable_dynamic_entry = ReusableDynamicEntry {
+            size: (end - prev_end),
+            padding: 0,
+            digest: dynamic_entry.digest(),
+            end_offset: end,
+        };
+        indices.push(reusable_dynamic_entry);
+
+        if range.end < end {
+            padding_end = end - range.end;
+            break;
+        }
+        prev_end = end;
+    }
+
+    if let Some(first) = indices.first_mut() {
+        first.padding += padding_start;
+    }
+
+    if let Some(last) = indices.last_mut() {
+        last.padding += padding_end;
+    }
+
+    Ok((indices, padding_start, padding_end))
 }
 
 fn get_metadata(
@@ -899,7 +1638,7 @@ fn get_fcaps(
         return Ok(());
     }
 
-    match xattr::fgetxattr(fd, xattr::xattr_name_fcaps()) {
+    match xattr::fgetxattr(fd, xattr::XATTR_NAME_FCAPS) {
         Ok(data) => {
             meta.fcaps = Some(pxar::format::FCaps { data });
             Ok(())
@@ -977,7 +1716,7 @@ fn get_xattr_fcaps_acl(
                 };
             }
             Err(err) => {
-                return Err(err).context(format!("error reading extended attribute {attr:?}"))
+                return Err(err).context(format!("error reading extended attribute {attr:?}"));
             }
         }
     }
@@ -1241,4 +1980,348 @@ fn generate_pxar_excludes_cli(patterns: &[MatchEntry]) -> Vec<u8> {
     }
 
     content
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsString;
+    use std::fs::File;
+    use std::fs::OpenOptions;
+    use std::io::{self, BufReader, Seek, SeekFrom, Write};
+    use std::pin::Pin;
+    use std::process::Command;
+    use std::sync::mpsc;
+    use std::task::{Context, Poll};
+
+    use pbs_datastore::dynamic_index::DynamicIndexReader;
+    use pxar::accessor::sync::FileReader;
+    use pxar::encoder::SeqWrite;
+
+    use crate::pxar::OverwriteFlags;
+    use crate::pxar::extract::Extractor;
+
+    use super::*;
+
+    struct DummyWriter {
+        file: Option<File>,
+    }
+
+    impl DummyWriter {
+        fn new<P: AsRef<Path>>(path: Option<P>) -> Result<Self, Error> {
+            let file = if let Some(path) = path {
+                Some(
+                    OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .truncate(true)
+                        .create(true)
+                        .open(path)?,
+                )
+            } else {
+                None
+            };
+            Ok(Self { file })
+        }
+    }
+
+    impl Write for DummyWriter {
+        fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+            if let Some(file) = self.file.as_mut() {
+                file.write_all(data)?;
+            }
+            Ok(data.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            if let Some(file) = self.file.as_mut() {
+                file.flush()?;
+            }
+            Ok(())
+        }
+    }
+
+    impl SeqWrite for DummyWriter {
+        fn poll_seq_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(self.as_mut().write(buf))
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, _cx: &mut Context) -> Poll<Result<(), io::Error>> {
+            Poll::Ready(self.as_mut().flush())
+        }
+    }
+
+    fn prepare<P: AsRef<Path>>(dir_path: P) -> Result<(), Error> {
+        let dir = nix::dir::Dir::open(dir_path.as_ref(), OFlag::O_DIRECTORY, Mode::empty())?;
+
+        let fs_magic = detect_fs_type(dir.as_raw_fd()).unwrap();
+        let stat = nix::sys::stat::fstat(dir.as_raw_fd()).unwrap();
+        let mut fs_feature_flags = Flags::from_magic(fs_magic);
+        let metadata = get_metadata(
+            dir.as_raw_fd(),
+            &stat,
+            fs_feature_flags,
+            fs_magic,
+            &mut fs_feature_flags,
+            false,
+        )?;
+
+        let mut extractor = Extractor::new(
+            dir,
+            metadata.clone(),
+            true,
+            OverwriteFlags::empty(),
+            fs_feature_flags,
+        );
+
+        let dir_metadata = Metadata {
+            stat: pxar::Stat::default().mode(0o777u64).set_dir(),
+            ..Default::default()
+        };
+
+        let file_metadata = Metadata {
+            stat: pxar::Stat::default().mode(0o777u64).set_regular_file(),
+            ..Default::default()
+        };
+
+        extractor.enter_directory(
+            OsString::from("testdir".to_string()),
+            dir_metadata.clone(),
+            true,
+        )?;
+
+        let size = 1024 * 1024;
+        let mut cursor = BufReader::new(std::io::Cursor::new(vec![0u8; size]));
+        for i in 0..10 {
+            extractor.enter_directory(
+                OsString::from(format!("folder_{i}")),
+                dir_metadata.clone(),
+                true,
+            )?;
+            for j in 0..10 {
+                cursor.seek(SeekFrom::Start(0))?;
+                extractor.extract_file(
+                    CString::new(format!("file_{j}").as_str())?.as_c_str(),
+                    &file_metadata,
+                    size as u64,
+                    &mut cursor,
+                    true,
+                )?;
+            }
+            extractor.leave_directory()?;
+        }
+
+        extractor.leave_directory()?;
+
+        Ok(())
+    }
+
+    // Use ./target/ instead of tempfile / std::env::temp_dir to keep the test
+    // runnable in build environments where /tmp may not be writable.
+    fn create_testdir(name: &str) -> Result<PathBuf, Error> {
+        let mut testdir: PathBuf = String::from("./target/testout").into();
+        testdir.push(std::module_path!());
+        testdir.push(name);
+
+        let _ = std::fs::remove_dir_all(&testdir);
+        let _ = std::fs::create_dir_all(&testdir);
+
+        Ok(testdir)
+    }
+
+    #[test]
+    fn test_create_archive_with_reference() -> Result<(), Error> {
+        let euid = unsafe { libc::geteuid() };
+        let egid = unsafe { libc::getegid() };
+
+        if euid != 1000 || egid != 1000 {
+            // skip test, cannot create test folder structure with correct ownership
+            return Ok(());
+        }
+
+        let mut testdir = create_testdir("test_create_archive_with_reference")?;
+
+        prepare(testdir.as_path())?;
+
+        let previous_payload_index = Some(DynamicIndexReader::new(File::open(
+            "../tests/pxar/backup-client-pxar-data.ppxar.didx",
+        )?)?);
+        let metadata_archive = File::open("../tests/pxar/backup-client-pxar-data.mpxar").unwrap();
+        let metadata_size = metadata_archive.metadata()?.len();
+        let reader: MetadataArchiveReader = Arc::new(FileReader::new(metadata_archive));
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (suggested_boundaries, _rx) = mpsc::channel();
+        let (forced_boundaries, _rx) = mpsc::channel();
+
+        rt.block_on(async move {
+            testdir.push("testdir");
+            let source_dir =
+                nix::dir::Dir::open(testdir.as_path(), OFlag::O_DIRECTORY, Mode::empty()).unwrap();
+
+            let fs_magic = detect_fs_type(source_dir.as_raw_fd()).unwrap();
+            let stat = nix::sys::stat::fstat(source_dir.as_raw_fd()).unwrap();
+            let mut fs_feature_flags = Flags::from_magic(fs_magic);
+
+            let metadata = get_metadata(
+                source_dir.as_raw_fd(),
+                &stat,
+                fs_feature_flags,
+                fs_magic,
+                &mut fs_feature_flags,
+                false,
+            )?;
+
+            let writer = DummyWriter::new(Some("./target/backup-client-pxar-run.mpxar")).unwrap();
+            let payload_writer = DummyWriter::new::<PathBuf>(None).unwrap();
+
+            let mut encoder = Encoder::new(
+                pxar::PxarVariant::Split(writer, payload_writer),
+                &metadata,
+                Some(&[]),
+            )
+            .await?;
+
+            let mut archiver = Archiver {
+                feature_flags: Flags::from_magic(fs_magic),
+                fs_feature_flags: Flags::from_magic(fs_magic),
+                fs_magic,
+                callback: Box::new(|_| Ok(())),
+                patterns: Vec::new(),
+                catalog: None,
+                path: PathBuf::new(),
+                entry_counter: 0,
+                entry_limit: 1024,
+                current_st_dev: stat.st_dev,
+                device_set: None,
+                hardlinks: HashMap::new(),
+                file_copy_buffer: vec::undefined(4 * 1024 * 1024),
+                skip_e2big_xattr: false,
+                forced_boundaries: Some(forced_boundaries),
+                previous_payload_index,
+                suggested_boundaries: Some(suggested_boundaries),
+                cache: PxarLookaheadCache::new(None),
+                last_reusable_offset: None,
+                reuse_stats: ReuseStats::default(),
+                split_archive: true,
+            };
+
+            let accessor = Accessor::new(pxar::PxarVariant::Unified(reader), metadata_size)
+                .await
+                .unwrap();
+            let root = accessor.open_root().await.ok();
+            archiver
+                .archive_dir_contents(&mut encoder, root, source_dir, true)
+                .await
+                .unwrap();
+
+            archiver
+                .flush_cached_reusing_if_below_threshold(&mut encoder, false)
+                .await
+                .unwrap();
+
+            encoder.finish().await.unwrap();
+            encoder.close().await.unwrap();
+
+            let status = Command::new("diff")
+                .args([
+                    "../tests/pxar/backup-client-pxar-expected.mpxar",
+                    "./target/backup-client-pxar-run.mpxar",
+                ])
+                .status()
+                .expect("failed to execute diff");
+            assert!(status.success());
+
+            Ok::<(), Error>(())
+        })
+    }
+
+    /// Strictly-greater bookkeeping for [`Archiver::try_record_reusable_offset`]; mirrors the
+    /// encoder's accumulated strict-monotonic-offset invariant on the read side.
+    #[test]
+    fn try_record_strictly_greater_accepts_increasing() {
+        let mut last = None;
+        assert!(super::try_record_strictly_greater(&mut last, 100));
+        assert_eq!(last, Some(100));
+        assert!(super::try_record_strictly_greater(&mut last, 200));
+        assert_eq!(last, Some(200));
+    }
+
+    #[test]
+    fn try_record_strictly_greater_rejects_equal_and_backwards() {
+        let mut last = Some(200);
+        // duplicate offset: previous archive recorded two distinct files at the same offset
+        assert!(!super::try_record_strictly_greater(&mut last, 200));
+        assert_eq!(last, Some(200), "rejected offset must not update state");
+        // backwards offset: previous archive recorded the next file at a lower offset
+        assert!(!super::try_record_strictly_greater(&mut last, 150));
+        assert_eq!(last, Some(200));
+    }
+
+    #[test]
+    fn try_record_strictly_greater_first_call_accepts_any_value() {
+        let mut last = None;
+        assert!(super::try_record_strictly_greater(&mut last, 0));
+        assert_eq!(last, Some(0));
+    }
+
+    /// Pins `lookup_dynamic_entries`'s `end_offset` population to `dynamic_entry.end()`;
+    /// any range-relative substitute would alias dedup-collided entries and resurrect
+    /// the backwards-`PXAR_PAYLOAD_REF` bug class.
+    #[test]
+    fn lookup_dynamic_entries_pins_chunk_identity() {
+        use pbs_datastore::dynamic_index::{DynamicIndexReader, DynamicIndexWriter};
+
+        let testdir = create_testdir("lookup_dynamic_entries_pins_chunk_identity")
+            .expect("Should be able to create test dir");
+        let path = testdir.join("lookup_dynamic_entries.didx");
+        let _ = std::fs::remove_file(&path);
+
+        let mut writer = DynamicIndexWriter::create(&path).unwrap();
+        let digest_a = [0xAAu8; 32];
+        let digest_b = [0xBBu8; 32];
+        // chunk 0: ends at 1024, digest A
+        writer.add_chunk(1024, &digest_a).unwrap();
+        // chunk 1: ends at 2048, digest B
+        writer.add_chunk(2048, &digest_b).unwrap();
+        // chunk 2: ends at 3072, digest A again - dedup collision (same content,
+        // distinct position). This is the configuration the bug class lives on.
+        writer.add_chunk(3072, &digest_a).unwrap();
+        let _csum = writer.close().unwrap();
+
+        let reader = DynamicIndexReader::open(&path).unwrap();
+        let (indices, _start_padding, _end_padding) =
+            super::lookup_dynamic_entries(&reader, &(0..3072)).unwrap();
+
+        assert_eq!(indices.len(), 3);
+        assert_eq!(indices[0].end_offset, 1024);
+        assert_eq!(indices[1].end_offset, 2048);
+        assert_eq!(indices[2].end_offset, 3072);
+
+        // The dedup collision must NOT compare equal under same_indexed_chunk_as; this
+        // is the predicate flush_cached_reusing_if_below_threshold relies on for the
+        // absorb-vs-inject decision.
+        assert_eq!(indices[0].digest, indices[2].digest);
+        assert!(!indices[0].same_indexed_chunk_as(&indices[2]));
+        assert!(indices[0].same_indexed_chunk_as(&indices[0]));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Inversions that span cache ranges must be caught by the global tracking; a per-range
+    /// implementation would have reset on flush and accepted the second offset, after which
+    /// the encoder strict check would still abort the backup.
+    #[test]
+    fn try_record_strictly_greater_persists_across_resets() {
+        let mut last = None;
+        assert!(super::try_record_strictly_greater(&mut last, 1000));
+        // a per-range implementation would have cleared `last` here on cache flush
+        assert!(!super::try_record_strictly_greater(&mut last, 500));
+        assert_eq!(last, Some(1000));
+        assert!(super::try_record_strictly_greater(&mut last, 1500));
+        assert_eq!(last, Some(1500));
+    }
 }

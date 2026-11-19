@@ -42,7 +42,16 @@ impl<K: std::cmp::Eq + std::hash::Hash + Copy, V: Clone + Send + 'static> AsyncL
     /// Access an item either via the cache or by calling cacher.fetch. A return value of Ok(None)
     /// means the item requested has no representation, Err(_) means a call to fetch() failed,
     /// regardless of whether it was initiated by this call or a previous one.
-    pub async fn access(&self, key: K, cacher: &dyn AsyncCacher<K, V>) -> Result<Option<V>, Error> {
+    /// Calls the removed callback on  the evicted item, if any.
+    pub async fn access<F>(
+        &self,
+        key: K,
+        cacher: &dyn AsyncCacher<K, V>,
+        removed: F,
+    ) -> Result<Option<V>, Error>
+    where
+        F: Fn(K) -> Result<(), Error>,
+    {
         let (owner, result_fut) = {
             // check if already requested
             let mut maps = self.maps.lock().unwrap();
@@ -71,15 +80,39 @@ impl<K: std::cmp::Eq + std::hash::Hash + Copy, V: Clone + Send + 'static> AsyncL
             // this call was the one initiating the request, put into LRU and remove from map
             let mut maps = self.maps.lock().unwrap();
             if let Ok(Some(ref value)) = result {
-                maps.0.insert(key, value.clone());
+                maps.0.insert(key, value.clone(), removed)?;
             }
             maps.1.remove(&key);
         }
 
         result
     }
+
+    /// Insert an item as the most recently used one into the cache, calling the removed callback
+    /// on the evicted cache item, if any.
+    pub fn insert<F>(&self, key: K, value: V, removed: F) -> Result<(), Error>
+    where
+        F: Fn(K) -> Result<(), Error>,
+    {
+        let mut maps = self.maps.lock().unwrap();
+        maps.0.insert(key, value.clone(), removed)?;
+        Ok(())
+    }
+
+    /// Check if the item exists and if so, mark it as the most recently uses one.
+    pub fn contains(&self, key: K) -> bool {
+        let mut maps = self.maps.lock().unwrap();
+        maps.0.get_mut(key).is_some()
+    }
+
+    /// Remove the item from the cache.
+    pub fn remove(&self, key: K) {
+        let mut maps = self.maps.lock().unwrap();
+        maps.0.remove(key);
+    }
 }
 
+#[cfg(test)]
 mod test {
     use super::*;
 
@@ -93,7 +126,7 @@ mod test {
             key: i32,
         ) -> Box<dyn Future<Output = Result<Option<String>, Error>> + Send> {
             let x = self.prefix;
-            Box::new(async move { Ok(Some(format!("{}{}", x, key))) })
+            Box::new(async move { Ok(Some(format!("{x}{key}"))) })
         }
     }
 
@@ -105,15 +138,15 @@ mod test {
             let cache: AsyncLruCache<i32, String> = AsyncLruCache::new(2);
 
             assert_eq!(
-                cache.access(10, &cacher).await.unwrap(),
+                cache.access(10, &cacher, |_| Ok(())).await.unwrap(),
                 Some("x10".to_string())
             );
             assert_eq!(
-                cache.access(20, &cacher).await.unwrap(),
+                cache.access(20, &cacher, |_| Ok(())).await.unwrap(),
                 Some("x20".to_string())
             );
             assert_eq!(
-                cache.access(30, &cacher).await.unwrap(),
+                cache.access(30, &cacher, |_| Ok(())).await.unwrap(),
                 Some("x30".to_string())
             );
 
@@ -122,14 +155,14 @@ mod test {
                 tokio::spawn(async move {
                     let cacher = TestAsyncCacher { prefix: "y" };
                     assert_eq!(
-                        c.access(40, &cacher).await.unwrap(),
+                        c.access(40, &cacher, |_| Ok(())).await.unwrap(),
                         Some("y40".to_string())
                     );
                 });
             }
 
             assert_eq!(
-                cache.access(20, &cacher).await.unwrap(),
+                cache.access(20, &cacher, |_| Ok(())).await.unwrap(),
                 Some("x20".to_string())
             );
         });

@@ -9,13 +9,13 @@ use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use anyhow::{bail, format_err, Error};
+use anyhow::{Error, bail, format_err};
 use futures::select;
-use hyper::header::{
-    HeaderMap, HeaderValue, CONNECTION, SEC_WEBSOCKET_ACCEPT, SEC_WEBSOCKET_KEY,
+use http::header::{
+    CONNECTION, HeaderMap, HeaderValue, SEC_WEBSOCKET_ACCEPT, SEC_WEBSOCKET_KEY,
     SEC_WEBSOCKET_PROTOCOL, SEC_WEBSOCKET_VERSION, UPGRADE,
 };
-use hyper::{Body, Response, StatusCode};
+use http::{Response, StatusCode};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::mpsc;
 
@@ -23,7 +23,9 @@ use futures::future::FutureExt;
 use futures::ready;
 
 use proxmox_io::ByteBuffer;
-use proxmox_lang::error::io_err_other;
+use proxmox_lang::io_format_err;
+
+use crate::Body;
 
 // see RFC6455 section 7.4.1
 #[derive(Debug, Clone, Copy)]
@@ -228,7 +230,7 @@ pub fn create_frame(
 ///
 /// Send websocket frames to anything accepting AsyncWrite.
 ///
-/// Note: Every write to it gets encoded as a seperate websocket frame, without any fragmentation
+/// Note: Every write to it gets encoded as a separate websocket frame, without any fragmentation
 /// being enforced.
 ///
 /// Example usage:
@@ -278,7 +280,7 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for WebSocketWriter<W> {
             let frame = match create_frame(this.mask, buf, OpCode::Binary) {
                 Ok(f) => f,
                 Err(e) => {
-                    return Poll::Ready(Err(io_err_other(e)));
+                    return Poll::Ready(Err(io::Error::other(e)));
                 }
             };
             this.frame = Some((frame, 0, buf.len()));
@@ -297,7 +299,7 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for WebSocketWriter<W> {
                     }
                 }
                 Err(err) => {
-                    eprintln!("error in writer: {}", err);
+                    eprintln!("error in writer: {err}");
                     return Poll::Ready(Err(err));
                 }
             }
@@ -372,8 +374,6 @@ impl FrameHeader {
             return Ok(None);
         }
 
-        let data = data;
-
         // we do not support extensions
         if data[0] & 0b01110000 > 0 {
             return Err(WebSocketError::new(
@@ -393,7 +393,7 @@ impl FrameHeader {
             other => {
                 return Err(WebSocketError::new(
                     WebSocketErrorKind::ProtocolError,
-                    &format!("Unknown OpCode {}", other),
+                    &format!("Unknown OpCode {other}"),
                 ));
             }
         };
@@ -443,7 +443,7 @@ impl FrameHeader {
                 return Ok(None);
             }
             let mut mask = [0u8; 4];
-            mask.copy_from_slice(&data[mask_offset as usize..payload_offset as usize]);
+            mask.copy_from_slice(&data[mask_offset..payload_offset as usize]);
             Some(mask)
         } else {
             None
@@ -529,12 +529,12 @@ impl<R: AsyncRead + Unpin + Send + 'static> AsyncRead for WebSocketReader<R> {
                 ReaderState::NoData => {
                     let mut reader = match this.reader.take() {
                         Some(reader) => reader,
-                        None => return Poll::Ready(Err(io_err_other("no reader"))),
+                        None => return Poll::Ready(Err(io_format_err!("no reader"))),
                     };
 
                     let mut buffer = match this.read_buffer.take() {
                         Some(buffer) => buffer,
-                        None => return Poll::Ready(Err(io_err_other("no buffer"))),
+                        None => return Poll::Ready(Err(io_format_err!("no buffer"))),
                     };
 
                     let future = async move {
@@ -550,7 +550,7 @@ impl<R: AsyncRead + Unpin + Send + 'static> AsyncRead for WebSocketReader<R> {
 
                     this.state = ReaderState::Receiving(future.boxed());
                 }
-                ReaderState::Receiving(ref mut future) => match ready!(future.as_mut().poll(cx)) {
+                ReaderState::Receiving(future) => match ready!(future.as_mut().poll(cx)) {
                     Ok(ReadResult {
                         len,
                         reader,
@@ -568,7 +568,7 @@ impl<R: AsyncRead + Unpin + Send + 'static> AsyncRead for WebSocketReader<R> {
                 ReaderState::HaveData => {
                     let mut read_buffer = match this.read_buffer.take() {
                         Some(read_buffer) => read_buffer,
-                        None => return Poll::Ready(Err(io_err_other("no buffer"))),
+                        None => return Poll::Ready(Err(io_format_err!("no buffer"))),
                     };
 
                     let mut header = match this.header.take() {
@@ -583,9 +583,9 @@ impl<R: AsyncRead + Unpin + Send + 'static> AsyncRead for WebSocketReader<R> {
                                 }
                                 Err(err) => {
                                     if let Err(err) = this.sender.send(Err(err.clone())) {
-                                        return Poll::Ready(Err(io_err_other(err)));
+                                        return Poll::Ready(Err(io::Error::other(err)));
                                     }
-                                    return Poll::Ready(Err(io_err_other(err)));
+                                    return Poll::Ready(Err(io::Error::other(err)));
                                 }
                             };
 
@@ -599,7 +599,7 @@ impl<R: AsyncRead + Unpin + Send + 'static> AsyncRead for WebSocketReader<R> {
                             let mut data = read_buffer.remove_data(header.payload_len);
                             mask_bytes(header.mask, &mut data);
                             if let Err(err) = this.sender.send(Ok((header.frametype, data))) {
-                                eprintln!("error sending control frame: {}", err);
+                                eprintln!("error sending control frame: {err}");
                             }
 
                             this.state = if read_buffer.is_empty() {
@@ -682,9 +682,9 @@ impl WebSocket {
         // we ignore extensions
 
         let mut sha1 = openssl::sha::Sha1::new();
-        let data = format!("{}{}", key, MAGIC_WEBSOCKET_GUID);
+        let data = format!("{key}{MAGIC_WEBSOCKET_GUID}");
         sha1.update(data.as_bytes());
-        let response_key = base64::encode(sha1.finish());
+        let response_key = proxmox_base64::encode(sha1.finish());
 
         let mut response = Response::builder()
             .status(StatusCode::SWITCHING_PROTOCOLS)
@@ -768,7 +768,7 @@ impl WebSocket {
                     eof = true;
                 }
             }
-            if buf.len() > 0 {
+            if !buf.is_empty() {
                 let bytes = writer.write(&buf).await?;
                 if bytes == 0 {
                     eof = true;
@@ -787,7 +787,7 @@ impl WebSocket {
     /// and receives WebSocket frames, while 'downstream' only expects and sends raw data.
     ///
     /// This method takes care of copying the data between endpoints, and sending correct responses
-    /// for control frames (e.g. a Pont to a Ping).
+    /// for control frames (e.g. a Point to a Ping).
     pub async fn serve_connection<S, L>(&self, upstream: S, downstream: L) -> Result<(), Error>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -819,6 +819,73 @@ impl WebSocket {
                 Ok(_) => Ok(()),
                 Err(err) => Err(err),
             }
+        }
+    }
+
+    /// Takes two websocket endpoints and connects them by re-encoding the data.
+    ///
+    /// This method takes care of copying the data between endpoints, and sending correct responses
+    /// for control frames (e.g. a Point to a Ping).
+    ///
+    /// The `preamble` allows injecting initial handshake data into the proxying.
+    pub async fn proxy_connection<S, L>(
+        &self,
+        upstream: S,
+        downstream: L,
+        preamble: &[u8],
+    ) -> Result<(), Error>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+        L: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        // unmasked as the spec requires
+        let server_socket = WebSocket { mask: None };
+
+        // split to allow duplex transfer
+        let (upstream_raw_reader, upstream_raw_writer) = tokio::io::split(upstream);
+        let (downstream_raw_reader, downstream_raw_writer) = tokio::io::split(downstream);
+
+        // wire up WS handling for upstream connection
+        let (upstream_control_tx, mut upstream_control_rx) = mpsc::unbounded_channel();
+        let mut upstream_ws_reader = WebSocketReader::new(upstream_raw_reader, upstream_control_tx);
+        let mut upstream_ws_writer = WebSocketWriter::new(server_socket.mask, upstream_raw_writer);
+
+        // wire up WS handling for downstream connection
+        let (downstream_control_tx, mut downstream_control_rx) = mpsc::unbounded_channel();
+        let mut downstream_ws_reader =
+            WebSocketReader::new(downstream_raw_reader, downstream_control_tx);
+        let mut downstream_ws_writer = WebSocketWriter::new(self.mask, downstream_raw_writer);
+
+        // send preamble downstream via WS
+        if !preamble.is_empty() {
+            downstream_ws_writer.write_all(preamble).await?;
+        }
+
+        // read from upstream, write to downstream while handling control frames received from
+        // downstream
+        let downstream_future = server_socket.copy_to_websocket(
+            &mut upstream_ws_reader,
+            &mut downstream_ws_writer,
+            &mut downstream_control_rx,
+        );
+
+        // read from downstream, write to upstream while handling control frames received from
+        // upstream
+        let upstream_future = self.copy_to_websocket(
+            &mut downstream_ws_reader,
+            &mut upstream_ws_writer,
+            &mut upstream_control_rx,
+        );
+
+        select! {
+            res = downstream_future.fuse() => match res {
+                Ok(_) => Ok(()),
+                Err(err) => Err(err),
+            },
+            res = upstream_future.fuse() => match res {
+                Ok(_) => Ok(()),
+                Err(err) => Err(err),
+            },
         }
     }
 }

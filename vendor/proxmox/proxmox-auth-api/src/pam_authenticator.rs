@@ -1,9 +1,9 @@
-use std::ffi::{c_int, c_void, CStr, CString};
+use std::ffi::{CStr, CString, c_int, c_void};
 use std::future::Future;
 use std::net::IpAddr;
 use std::pin::Pin;
 
-use anyhow::{bail, format_err, Error};
+use anyhow::{Error, bail, format_err};
 use pam_sys::types::{
     PamHandle, PamItemType, PamMessage, PamMessageStyle, PamResponse, PamReturnCode,
 };
@@ -64,7 +64,7 @@ impl crate::api::Authenticator for Pam {
             handle.result =
                 pam_sys::wrapped::authenticate(handle.handle, pam_sys::types::PamFlag::NONE);
             if handle.result != PamReturnCode::SUCCESS {
-                bail!("authentication error - {err}");
+                bail!("authentication error - {}", handle.result);
             }
 
             Ok(())
@@ -183,7 +183,7 @@ struct PamGuard<'a> {
 
 impl Drop for PamGuard<'_> {
     fn drop(&mut self) {
-        pam_sys::wrapped::end(&mut self.handle, self.result);
+        pam_sys::wrapped::end(self.handle, self.result);
     }
 }
 

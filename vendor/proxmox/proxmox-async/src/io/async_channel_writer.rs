@@ -12,7 +12,7 @@ use tokio::io::AsyncWrite;
 use tokio::sync::mpsc::Sender;
 
 use proxmox_io::ByteBuffer;
-use proxmox_lang::{error::io_err_other, io_format_err};
+use proxmox_lang::io_format_err;
 
 /// Wrapper around tokio::sync::mpsc::Sender, which implements Write
 pub struct AsyncChannelWriter {
@@ -62,7 +62,7 @@ impl AsyncChannelWriter {
 
                     let sender = match self.sender.take() {
                         Some(sender) => sender,
-                        None => return Poll::Ready(Err(io_err_other("no sender"))),
+                        None => return Poll::Ready(Err(io_format_err!("no sender"))),
                     };
 
                     let data = self.buf.remove_data(self.buf.len()).to_vec();
@@ -76,7 +76,7 @@ impl AsyncChannelWriter {
 
                     self.state = WriterState::Sending(future.boxed());
                 }
-                WriterState::Sending(ref mut future) => match ready!(future.as_mut().poll(cx)) {
+                WriterState::Sending(future) => match ready!(future.as_mut().poll(cx)) {
                     Ok(sender) => {
                         self.sender = Some(sender);
                         self.state = WriterState::Ready;

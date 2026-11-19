@@ -7,6 +7,8 @@
 //!
 //! The `pam-authenticator` feature enables the `Pam` type.
 
+#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+
 pub const TICKET_LIFETIME: i64 = 3600 * 2; // 2 hours
 
 #[cfg(feature = "ticket")]
@@ -34,3 +36,8 @@ pub mod types;
 mod pam_authenticator;
 #[cfg(feature = "pam-authenticator")]
 pub use pam_authenticator::Pam;
+
+#[cfg(feature = "password-authenticator")]
+mod password_authenticator;
+#[cfg(feature = "password-authenticator")]
+pub use password_authenticator::PasswordAuthenticator;

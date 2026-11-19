@@ -4,8 +4,8 @@ A port of the [Proxmox Backup Server](https://www.proxmox.com/en/proxmox-backup-
 command line client (`proxmox-backup-client`) and the `pxar` archive tool to
 macOS on Apple Silicon.
 
-It is based on upstream proxmox-backup 3.2.4 (commit
-`4940514b0f05d6cd6a5f711edfdd47c1fa41b537`) and contains only the crates needed
+It is based on upstream proxmox-backup 4.2.10 (commit
+`1df6dff9c0acdd11386245502b2c7aeed2f440dd`) and contains only the crates needed
 for the client. This is an unofficial port and not affiliated with Proxmox
 Server Solutions GmbH.
 
@@ -48,7 +48,7 @@ extension required), all other commands run without it.
 
 ## Building
 
-Requirements: Rust, OpenSSL (e.g. `brew install openssl@3`) and FUSE-T (its
+Requirements: Rust (1.91 or newer), OpenSSL (e.g. `brew install openssl@3`) and FUSE-T (its
 headers and library are needed for building).
 
 ```sh

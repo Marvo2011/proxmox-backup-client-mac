@@ -1,20 +1,28 @@
-use std::ffi::CStr;
+use std::ffi::OsString;
 use std::os::fd::FromRawFd;
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::io::{AsRawFd, OwnedFd};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use anyhow::{bail, format_err, Error};
+use anyhow::{Error, bail, format_err};
 use nix::errno::Errno;
 use nix::fcntl::OFlag;
 use nix::sys::stat;
 use nix::unistd;
 
-use crate::fs::{fchown, CreateOptions};
+use proxmox_lang::try_block;
+
+use crate::fs::{CreateOptions, fchown};
+
+/// The default list of [`OFlag`]'s we want to use when opening directories. Besides ensuring that
+/// the FD indeed points to a directory we also must ensure that it gets closed on exec to avoid
+/// leaking a open FD to a child process.
+pub(crate) const DIR_FLAGS: OFlag = OFlag::O_DIRECTORY.union(OFlag::O_CLOEXEC);
 
 /// Creates directory at the provided path with specified ownership.
 ///
 /// Errors if the directory already exists.
-pub fn create_dir<P: AsRef<Path>>(path: P, options: CreateOptions) -> Result<(), nix::Error> {
+pub fn create_dir<P: AsRef<Path>>(path: P, options: CreateOptions) -> Result<(), Error> {
     // clippy bug?: from_bits_truncate is actually a const fn...
     #[allow(clippy::or_fun_call)]
     let mode: stat::Mode = options
@@ -22,8 +30,12 @@ pub fn create_dir<P: AsRef<Path>>(path: P, options: CreateOptions) -> Result<(),
         .unwrap_or(stat::Mode::from_bits_truncate(0o750));
 
     let path = path.as_ref();
-    nix::unistd::mkdir(path, mode)?;
-    unistd::chown(path, options.owner, options.group)?;
+
+    nix::unistd::mkdir(path, mode)
+        .map_err(|err| format_err!("unable to create directory {path:?} - {err}"))?;
+
+    unistd::chown(path, options.owner, options.group)
+        .map_err(|err| format_err!("unable to set ownership for directory {path:?} - {err}"))?;
 
     Ok(())
 }
@@ -59,14 +71,14 @@ pub fn ensure_dir_exists<P: AsRef<Path>>(
         Err(err) => bail!("unable to create directory {path:?} - {err}",),
     }
 
-    let fd = nix::fcntl::open(path, OFlag::O_DIRECTORY, stat::Mode::empty())
+    let fd = nix::fcntl::open(path, DIR_FLAGS, stat::Mode::empty())
         .map(|fd| unsafe { OwnedFd::from_raw_fd(fd) })
         .map_err(|err| format_err!("unable to open created directory {path:?} - {err}"))?;
     // umask defaults to 022 so make sure the mode is fully honowed:
     nix::sys::stat::fchmod(fd.as_raw_fd(), mode)
         .map_err(|err| format_err!("unable to set mode for directory {path:?} - {err}"))?;
     nix::unistd::fchown(fd.as_raw_fd(), uid, gid)
-        .map_err(|err| format_err!("unable to set ownership directory {path:?} - {err}"))?;
+        .map_err(|err| format_err!("unable to set ownership for directory {path:?} - {err}"))?;
 
     Ok(())
 }
@@ -109,33 +121,23 @@ fn create_path_do(
     use std::path::Component;
 
     let mut iter = path.components().peekable();
-    // `None` refers to the current working directory (AT_FDCWD), which must not be wrapped in an
-    // `OwnedFd` as it would get closed on drop.
-    let at: Option<OwnedFd> = match iter.peek() {
+    let at: OwnedFd = match iter.peek() {
         Some(Component::Prefix(_)) => bail!("illegal prefix path component encountered"),
         Some(Component::RootDir) => {
             let _ = iter.next();
-            Some(crate::fd::open(
-                unsafe { CStr::from_bytes_with_nul_unchecked(b"/\0") },
-                OFlag::O_DIRECTORY,
-                stat::Mode::empty(),
-            )?)
+            crate::fd::open(c"/", DIR_FLAGS, stat::Mode::empty())?
         }
         Some(Component::CurDir) => {
             let _ = iter.next();
-            None
+            crate::fd::cwd()?
         }
         Some(Component::ParentDir) => {
             let _ = iter.next();
-            Some(crate::fd::open(
-                unsafe { CStr::from_bytes_with_nul_unchecked(b"..\0") },
-                OFlag::O_DIRECTORY,
-                stat::Mode::empty(),
-            )?)
+            crate::fd::open(c"..", DIR_FLAGS, stat::Mode::empty())?
         }
         Some(Component::Normal(_)) => {
             // simply do not advance the iterator, heavy lifting happens in create_path_at_do()
-            None
+            crate::fd::cwd()?
         }
         None => bail!("create_path on empty path?"),
     };
@@ -144,7 +146,7 @@ fn create_path_do(
 }
 
 fn create_path_at_do(
-    mut at: Option<OwnedFd>,
+    mut at: OwnedFd,
     mut iter: std::iter::Peekable<std::path::Components>,
     intermediate_opts: Option<CreateOptions>,
     final_opts: Option<CreateOptions>,
@@ -153,18 +155,11 @@ fn create_path_at_do(
     loop {
         use std::path::Component;
 
-        let at_fd = at.as_ref().map_or(libc::AT_FDCWD, |fd| fd.as_raw_fd());
-
         match iter.next() {
             None => return Ok(created),
 
             Some(Component::ParentDir) => {
-                at = Some(crate::fd::openat(
-                    &at_fd,
-                    unsafe { CStr::from_bytes_with_nul_unchecked(b"..\0") },
-                    OFlag::O_DIRECTORY,
-                    stat::Mode::empty(),
-                )?);
+                at = crate::fd::openat(&at, c"..", DIR_FLAGS, stat::Mode::empty())?;
             }
 
             Some(Component::Normal(path)) => {
@@ -180,25 +175,71 @@ fn create_path_at_do(
                     .and_then(|o| o.perm)
                     .unwrap_or(stat::Mode::from_bits_truncate(0o755));
 
-                created = match stat::mkdirat(at_fd, path, mode) {
+                created = match stat::mkdirat(Some(at.as_raw_fd()), path, mode) {
                     Err(Errno::EEXIST) => false,
                     Err(e) => return Err(e.into()),
                     Ok(_) => true,
                 };
-                let dir = crate::fd::openat(&at_fd, path, OFlag::O_DIRECTORY, stat::Mode::empty())?;
+                at = crate::fd::openat(&at, path, DIR_FLAGS, stat::Mode::empty())?;
 
                 if let (true, Some(opts)) = (created, opts) {
                     if opts.owner.is_some() || opts.group.is_some() {
-                        fchown(dir.as_raw_fd(), opts.owner, opts.group)?;
+                        fchown(at.as_raw_fd(), opts.owner, opts.group)?;
                     }
                 }
-                at = Some(dir);
             }
 
             // impossible according to the docs:
             Some(_) => bail!("encountered unexpected special path component"),
         }
     }
+}
+
+///  Create a temporary directory.
+///
+/// `directory` determines where the temporary directory will be created. For instance, if
+/// `directory` is `/tmp`, on success the function will return a path in the style of
+/// `/tmp/tmp_XXXXXX`, where X stands for a random string, ensuring that the path is unique.
+///
+/// By default, the created directory has `0o700` permissions. If this is not desired, custom
+/// [`CreateOptions`] can be passed via the `options` parameter.
+pub fn make_tmp_dir<P: AsRef<Path>>(
+    directory: P,
+    options: Option<CreateOptions>,
+) -> Result<PathBuf, Error> {
+    let template = directory.as_ref().join("tmp_XXXXXX");
+
+    let mut template = template.into_os_string().into_vec();
+    // Push NULL byte so that we have a proper NULL-terminated string
+    template.push(0);
+
+    use std::os::raw::c_char;
+    let returned_buffer = unsafe { libc::mkdtemp(template.as_mut_ptr() as *mut c_char) };
+
+    // Check errno immediately, so that nothing else can overwrite it.
+    let err = std::io::Error::last_os_error();
+
+    if returned_buffer.is_null() {
+        return Err(err.into());
+    }
+
+    template.pop(); // drop terminating nul byte
+    let path = PathBuf::from(OsString::from_vec(template));
+
+    if let Some(options) = options {
+        if let Err(err) = try_block!({
+            let mut fd = crate::fd::open(&path, DIR_FLAGS, stat::Mode::empty())?;
+            options.apply_to(&mut fd, &path)?;
+            Ok::<(), Error>(())
+        }) {
+            if let Err(err) = std::fs::remove_dir(&path) {
+                log::error!("could not clean up temporary directory at {path:?}: {err}")
+            }
+            bail!("could not apply create options to new temporary directory: {err}");
+        }
+    }
+
+    Ok(path)
 }
 
 #[cfg(test)]
@@ -217,5 +258,22 @@ mod tests {
             ),
         )
         .expect("expected create_path to work");
+    }
+
+    #[test]
+    fn test_make_tmp_dir() -> Result<(), Error> {
+        let options = CreateOptions::new()
+            .owner(unistd::Uid::effective())
+            .group(unistd::Gid::effective())
+            .perm(stat::Mode::from_bits_truncate(0o755));
+
+        let path = make_tmp_dir("/tmp", Some(options))?;
+
+        assert!(path.exists());
+        assert!(path.is_dir());
+
+        std::fs::remove_dir_all(&path)?;
+
+        Ok(())
     }
 }

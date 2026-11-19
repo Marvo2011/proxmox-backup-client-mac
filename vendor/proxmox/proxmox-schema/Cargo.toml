@@ -1,18 +1,19 @@
 [package]
 name = "proxmox-schema"
-version = "3.1.1"
+description = "proxmox api schema and validation"
+version = "5.6.0"
+
 authors.workspace = true
 edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "proxmox api schema and validation"
-
-exclude.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
 const_format = { workspace = true, optional = true }
-lazy_static.workspace = true
 regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -20,9 +21,10 @@ textwrap = "0.16"
 
 # the upid type needs this for 'getpid'
 libc = { workspace = true, optional = true }
-nix = { workspace = true, optional = true }
+nix = { workspace = true, optional = true, features = [ "feature" ] }
 
 proxmox-api-macro = { workspace = true, optional = true }
+proxmox-const-utils.workspace = true
 
 [dev-dependencies]
 url.workspace = true
@@ -38,3 +40,8 @@ api-types = [ "dep:const_format" ]
 
 # Testing only
 test-harness = []
+
+# To be removed once lookup method deprecations are enforced.
+[lints.rust.unexpected_cfgs]
+level = "warn"
+check-cfg = ['cfg(proxmox_schema, values("strict"))']

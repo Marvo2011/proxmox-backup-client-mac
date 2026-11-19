@@ -1,0 +1,17 @@
+[package]
+name = "proxmox-product-config"
+description = "Configuration file handling for Proxmox products."
+version = "1.1.0"
+
+authors.workspace = true
+edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+nix.workspace = true
+
+proxmox-sys = { workspace = true, features = ["timer"] }

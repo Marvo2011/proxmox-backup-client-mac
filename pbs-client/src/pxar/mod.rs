@@ -32,7 +32,7 @@
 //!
 //!   * `FILENAME`          -- name of the first directory entry (strictly ordered!)
 //!   * `<archive>`         -- serialization of the first directory entry's metadata and contents,
-//!  following the exact same archive format
+//!     following the exact same archive format
 //!   * `FILENAME`          -- name of the second directory entry (strictly ordered!)
 //!   * `<archive>`         -- serialization of the second directory entry
 //!   * ...
@@ -50,21 +50,22 @@
 pub(crate) mod create;
 pub(crate) mod dir_stack;
 pub(crate) mod extract;
+pub(crate) mod look_ahead_cache;
 pub(crate) mod metadata;
-pub(crate) mod tools;
+pub mod tools;
 
 mod flags;
 pub use flags::Flags;
 
-pub use create::{create_archive, PxarCreateOptions};
+pub use create::{
+    MetadataArchiveReader, PxarCreateOptions, PxarPrevRef, PxarWriters, create_archive,
+};
 pub use extract::{
-    create_tar, create_zip, extract_archive, extract_sub_dir, extract_sub_dir_seq, ErrorHandler,
-    OverwriteFlags, PxarExtractContext, PxarExtractOptions,
+    ErrorHandler, OverwriteFlags, PxarExtractContext, PxarExtractOptions, create_tar, create_zip,
+    extract_archive, extract_sub_dir, extract_sub_dir_seq,
 };
 
 /// The format requires to build sorted directory lookup tables in
 /// memory, so we restrict the number of allowed entries to limit
 /// maximum memory usage.
 pub const ENCODER_MAX_ENTRIES: usize = 1024 * 1024;
-
-pub use tools::{format_multi_line_entry, format_single_line_entry};

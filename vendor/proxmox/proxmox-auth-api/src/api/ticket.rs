@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use anyhow::{bail, Error};
+use anyhow::{Error, bail};
 use serde::{Deserialize, Serialize};
 
 use proxmox_tfa::api::TfaChallenge;
@@ -51,7 +51,7 @@ impl fmt::Display for ApiTicket {
             ApiTicket::Full(userid) => fmt::Display::fmt(userid, f),
             ApiTicket::Partial(partial) => {
                 let data = serde_json::to_string(partial).map_err(|_| fmt::Error)?;
-                write!(f, "!tfa!{}", data)
+                write!(f, "!tfa!{data}")
             }
         }
     }

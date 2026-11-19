@@ -11,8 +11,8 @@ use std::path::Path;
 use std::ptr;
 
 use libc::{c_char, c_int, c_void};
-use nix::errno::Errno;
 use nix::NixPath;
+use nix::errno::Errno;
 
 #[rustfmt::skip]
 mod constants {
@@ -54,7 +54,7 @@ mod constants {
 pub use constants::*;
 
 #[link(name = "acl")]
-extern "C" {
+unsafe extern "C" {
     fn acl_get_file(path: *const c_char, acl_type: ACLType) -> *mut c_void;
     fn acl_set_file(path: *const c_char, acl_type: ACLType, acl: *mut c_void) -> c_int;
     fn acl_get_fd(fd: RawFd) -> *mut c_void;
@@ -126,8 +126,8 @@ impl ACL {
         Ok(ACL { ptr })
     }
 
-    pub fn create_entry(&mut self) -> Result<ACLEntry, nix::errno::Errno> {
-        let mut ptr = ptr::null_mut() as *mut c_void;
+    pub fn create_entry(&mut self) -> Result<ACLEntry<'_>, nix::errno::Errno> {
+        let mut ptr = ptr::null_mut();
         let res = unsafe { acl_create_entry(&mut self.ptr, &mut ptr) };
         if res < 0 {
             return Err(Errno::last());
@@ -178,7 +178,7 @@ pub struct ACLEntry<'a> {
     _phantom: PhantomData<&'a mut ()>,
 }
 
-impl<'a> ACLEntry<'a> {
+impl ACLEntry<'_> {
     pub fn get_tag_type(&self) -> Result<ACLTag, nix::errno::Errno> {
         let mut tag = ACL_UNDEFINED_TAG;
         let res = unsafe { acl_get_tag_type(self.ptr, &mut tag as *mut ACLTag) };
@@ -200,7 +200,7 @@ impl<'a> ACLEntry<'a> {
 
     pub fn get_permissions(&self) -> Result<u64, nix::errno::Errno> {
         let mut permissions = 0;
-        let mut permset = ptr::null_mut() as *mut c_void;
+        let mut permset = ptr::null_mut();
         let mut res = unsafe { acl_get_permset(self.ptr, &mut permset) };
         if res < 0 {
             return Err(Errno::last());
@@ -221,7 +221,7 @@ impl<'a> ACLEntry<'a> {
     }
 
     pub fn set_permissions(&mut self, permissions: u64) -> Result<u64, nix::errno::Errno> {
-        let mut permset = ptr::null_mut() as *mut c_void;
+        let mut permset = ptr::null_mut();
         let mut res = unsafe { acl_get_permset(self.ptr, &mut permset) };
         if res < 0 {
             return Err(Errno::last());

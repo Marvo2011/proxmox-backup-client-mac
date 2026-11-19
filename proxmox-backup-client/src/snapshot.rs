@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::Error;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use proxmox_router::cli::*;
 use proxmox_schema::api;
@@ -15,10 +15,10 @@ use pbs_tools::crypt_config::CryptConfig;
 use pbs_tools::json::required_string_param;
 
 use crate::{
-    api_datastore_list_snapshots, complete_backup_group, complete_backup_snapshot,
-    complete_namespace, complete_repository, connect, crypto_parameters,
-    extract_repository_from_value, optional_ns_param, record_repository, BackupDir, KEYFD_SCHEMA,
-    KEYFILE_SCHEMA, REPO_URL_SCHEMA,
+    BackupDir, BackupTargetArgs, KEYFD_SCHEMA, KEYFILE_SCHEMA, api_datastore_list_snapshots,
+    complete_backup_group, complete_backup_snapshot, complete_namespace, complete_repository,
+    connect, crypto_parameters, extract_repository_from_value, optional_ns_param,
+    record_repository,
 };
 
 fn snapshot_args(ns: &BackupNamespace, snapshot: &BackupDir) -> Result<Value, Error> {
@@ -32,13 +32,9 @@ fn snapshot_args(ns: &BackupNamespace, snapshot: &BackupDir) -> Result<Value, Er
 #[api(
    input: {
         properties: {
-            repository: {
-                schema: REPO_URL_SCHEMA,
-                optional: true,
-            },
-            ns: {
-                type: BackupNamespace,
-                optional: true,
+            repo: {
+                type: BackupTargetArgs,
+                flatten: true,
             },
             group: {
                 type: String,
@@ -108,13 +104,9 @@ async fn list_snapshots(param: Value) -> Result<Value, Error> {
 #[api(
    input: {
         properties: {
-            repository: {
-                schema: REPO_URL_SCHEMA,
-                optional: true,
-            },
-            ns: {
-                type: BackupNamespace,
-                optional: true,
+            repo: {
+                type: BackupTargetArgs,
+                flatten: true,
             },
             snapshot: {
                 type: String,
@@ -161,13 +153,9 @@ async fn list_snapshot_files(param: Value) -> Result<Value, Error> {
 #[api(
     input: {
         properties: {
-            repository: {
-                schema: REPO_URL_SCHEMA,
-                optional: true,
-            },
-            ns: {
-                type: BackupNamespace,
-                optional: true,
+            repo: {
+                type: BackupTargetArgs,
+                flatten: true,
             },
             snapshot: {
                 type: String,
@@ -200,13 +188,9 @@ async fn forget_snapshots(param: Value) -> Result<(), Error> {
 #[api(
     input: {
         properties: {
-            repository: {
-                schema: REPO_URL_SCHEMA,
-                optional: true,
-            },
-            ns: {
-                type: BackupNamespace,
-                optional: true,
+            repo: {
+                type: BackupTargetArgs,
+                flatten: true,
             },
             snapshot: {
                 type: String,
@@ -271,7 +255,7 @@ async fn upload_log(param: Value) -> Result<Value, Error> {
     );
 
     let args = snapshot_args(&backup_ns, &snapshot)?;
-    let body = hyper::Body::from(raw_data);
+    let body = proxmox_http::Body::from(raw_data);
 
     client
         .upload("application/octet-stream", body, &path, Some(args))
@@ -281,13 +265,9 @@ async fn upload_log(param: Value) -> Result<Value, Error> {
 #[api(
     input: {
         properties: {
-            repository: {
-                schema: REPO_URL_SCHEMA,
-                optional: true,
-            },
-            ns: {
-                type: BackupNamespace,
-                optional: true,
+            repo: {
+                type: BackupTargetArgs,
+                flatten: true,
             },
             snapshot: {
                 type: String,
@@ -321,7 +301,7 @@ async fn show_notes(param: Value) -> Result<Value, Error> {
 
     if output_format == "text" {
         if let Some(notes) = notes.as_str() {
-            println!("{}", notes);
+            println!("{notes}");
         }
     } else {
         format_and_print_result(
@@ -338,13 +318,9 @@ async fn show_notes(param: Value) -> Result<Value, Error> {
 #[api(
     input: {
         properties: {
-            repository: {
-                schema: REPO_URL_SCHEMA,
-                optional: true,
-            },
-            ns: {
-                type: BackupNamespace,
-                optional: true,
+            repo: {
+                type: BackupTargetArgs,
+                flatten: true,
             },
             snapshot: {
                 type: String,
@@ -380,13 +356,9 @@ async fn update_notes(param: Value) -> Result<Value, Error> {
 #[api(
     input: {
         properties: {
-            repository: {
-                schema: REPO_URL_SCHEMA,
-                optional: true,
-            },
-            ns: {
-                type: BackupNamespace,
-                optional: true,
+            repo: {
+                type: BackupTargetArgs,
+                flatten: true,
             },
             snapshot: {
                 type: String,
@@ -420,7 +392,7 @@ async fn show_protection(param: Value) -> Result<(), Error> {
 
     if output_format == "text" {
         if let Some(protected) = protected.as_bool() {
-            println!("{}", protected);
+            println!("{protected}");
         }
     } else {
         format_and_print_result(
@@ -437,13 +409,9 @@ async fn show_protection(param: Value) -> Result<(), Error> {
 #[api(
     input: {
         properties: {
-            repository: {
-                schema: REPO_URL_SCHEMA,
-                optional: true,
-            },
-            ns: {
-                type: BackupNamespace,
-                optional: true,
+            repo: {
+                type: BackupTargetArgs,
+                flatten: true,
             },
             snapshot: {
                 type: String,

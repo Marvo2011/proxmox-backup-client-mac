@@ -101,11 +101,13 @@ pub trait FuseRequest: Sized {
 }
 
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Request {
     Lookup(Lookup),
     Forget(Forget),
     Getattr(Getattr),
     Setattr(Setattr),
+    Statfs(Statfs),
     Readdir(Readdir),
     ReaddirPlus(ReaddirPlus),
     Mkdir(Mkdir),
@@ -118,6 +120,7 @@ pub enum Request {
     Rmdir(Rmdir),
     Write(Write),
     Readlink(Readlink),
+    Rename(Rename),
     ListXAttrSize(ListXAttrSize),
     ListXAttr(ListXAttr),
     GetXAttrSize(GetXAttrSize),
@@ -143,6 +146,7 @@ impl FuseRequest for Request {
             Request::Lookup(r) => r.fail(errno),
             Request::Getattr(r) => r.fail(errno),
             Request::Setattr(r) => r.fail(errno),
+            Request::Statfs(r) => r.fail(errno),
             Request::Readdir(r) => r.fail(errno),
             Request::ReaddirPlus(r) => r.fail(errno),
             Request::Mkdir(r) => r.fail(errno),
@@ -155,6 +159,7 @@ impl FuseRequest for Request {
             Request::Rmdir(r) => r.fail(errno),
             Request::Write(r) => r.fail(errno),
             Request::Readlink(r) => r.fail(errno),
+            Request::Rename(r) => r.fail(errno),
             Request::ListXAttrSize(r) => r.fail(errno),
             Request::ListXAttr(r) => r.fail(errno),
             Request::GetXAttrSize(r) => r.fail(errno),
@@ -237,6 +242,28 @@ impl Getattr {
     }
 }
 
+/// Get filesystem statistics.
+///
+/// This is the equivalent of a `statfs` call.
+#[derive(Debug)]
+pub struct Statfs {
+    pub(crate) request: RequestGuard,
+    pub inode: u64,
+}
+
+impl FuseRequest for Statfs {
+    fn fail(self, errno: libc::c_int) -> io::Result<()> {
+        reply_err(self.request, errno)
+    }
+}
+
+impl Statfs {
+    /// Send a reply for a `Statfs` request.
+    pub fn reply(self, stbuf: &libc::statvfs) -> io::Result<()> {
+        reply_result!(self: sys::fuse_reply_statfs(self.request.raw, stbuf))
+    }
+}
+
 /// Get the contents of a directory without changing any lookup counts. (Contrary to
 /// `ReaddirPlus`).
 #[derive(Debug)]
@@ -283,12 +310,8 @@ impl Readdir {
         stat: &libc::stat,
         next: isize,
     ) -> io::Result<ReplyBufState> {
-        let name = CString::new(name.as_bytes()).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                "tried to reply with invalid file name",
-            )
-        })?;
+        let name = CString::new(name.as_bytes())
+            .map_err(|_| io::Error::other("tried to reply with invalid file name"))?;
 
         Ok(self
             .reply_buffer
@@ -354,12 +377,8 @@ impl ReaddirPlus {
         attr_timeout: f64,
         entry_timeout: f64,
     ) -> io::Result<ReplyBufState> {
-        let name = CString::new(name.as_bytes()).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                "tried to reply with invalid file name",
-            )
-        })?;
+        let name = CString::new(name.as_bytes())
+            .map_err(|_| io::Error::other("tried to reply with invalid file name"))?;
 
         let entry = sys::EntryParam {
             inode: stat.st_ino,
@@ -681,6 +700,29 @@ impl Rmdir {
     }
 }
 
+/// Rename a file or directory.
+#[derive(Debug)]
+pub struct Rename {
+    pub(crate) request: RequestGuard,
+    pub parent: u64,
+    pub name: OsString,
+    pub new_parent: u64,
+    pub new_name: OsString,
+    pub flags: libc::c_int,
+}
+
+impl FuseRequest for Rename {
+    fn fail(self, errno: libc::c_int) -> io::Result<()> {
+        reply_err(self.request, errno)
+    }
+}
+
+impl Rename {
+    pub fn reply(self) -> io::Result<()> {
+        reply_err(self.request, 0)
+    }
+}
+
 /// Write to a file.
 #[derive(Debug)]
 pub struct Write {
@@ -731,9 +773,8 @@ impl FuseRequest for Readlink {
 
 impl Readlink {
     pub fn reply(self, data: &OsStr) -> io::Result<()> {
-        let data = CString::new(data.as_bytes()).map_err(|_| {
-            io::Error::new(io::ErrorKind::Other, "tried to reply with invalid link")
-        })?;
+        let data = CString::new(data.as_bytes())
+            .map_err(|_| io::Error::other("tried to reply with invalid link"))?;
 
         self.c_reply(&data)
     }

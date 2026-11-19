@@ -1,11 +1,11 @@
-//! Module to generate and format API Documenation
+//! Module to generate and format API Documentation
 
 use std::io::Write;
 
 use anyhow::Error;
 
-use proxmox_schema::format::*;
 use proxmox_schema::ObjectSchemaType;
+use proxmox_schema::format::*;
 
 #[cfg(feature = "server")]
 use crate::ApiHandler;
@@ -32,16 +32,20 @@ fn dump_method_definition(method: &str, path: &str, def: Option<&ApiMethod>) -> 
                 method = if method == "GET" { "DOWNLOAD" } else { method };
             }
 
-            let res = format!(
-                "**{} {}**\n\n{}{}\n\n{}",
-                method, path, description, param_descr, return_descr
-            );
+            #[cfg(feature = "server")]
+            if let ApiHandler::AsyncHttpBodyParameters(_) = api_method.handler {
+                method = if method == "POST" { "UPLOAD" } else { method };
+                method = if method == "GET" { "DOWNLOAD" } else { method };
+            }
+
+            let res =
+                format!("**{method} {path}**\n\n{description}{param_descr}\n\n{return_descr}");
             Some(res)
         }
     }
 }
 
-/// Generate ReST Documentaion for a complete API defined by a ``Router``.
+/// Generate ReST Documentation for a complete API defined by a ``Router``.
 pub fn dump_api(
     output: &mut dyn Write,
     router: &crate::Router,
@@ -55,7 +59,7 @@ pub fn dump_api(
             if pos > 0 {
                 writeln!(output, "-----\n")?;
             }
-            writeln!(output, "{}", text)?;
+            writeln!(output, "{text}")?;
             pos += 1;
         }
         Ok(())
@@ -70,9 +74,9 @@ pub fn dump_api(
         None => return Ok(()),
         Some(SubRoute::MatchAll { router, param_name }) => {
             let sub_path = if path == "." {
-                format!("<{}>", param_name)
+                format!("<{param_name}>")
             } else {
-                format!("{}/<{}>", path, param_name)
+                format!("{path}/<{param_name}>")
             };
             dump_api(output, router, &sub_path, pos)?;
         }
@@ -83,7 +87,7 @@ pub fn dump_api(
                 let sub_path = if path == "." {
                     (*key).to_string()
                 } else {
-                    format!("{}/{}", path, key)
+                    format!("{path}/{key}")
                 };
                 dump_api(output, sub_router, &sub_path, pos)?;
             }

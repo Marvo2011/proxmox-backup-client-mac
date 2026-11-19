@@ -1,29 +1,26 @@
-use anyhow::{bail, Error};
-use serde_json::{json, Value};
+use anyhow::{Error, bail};
+use serde_json::{Value, json};
 
-use pbs_api_types::BackupNamespace;
-use pbs_client::tools::REPO_URL_SCHEMA;
+use pbs_api_types::{BackupNamespace, NS_MAX_DEPTH_SCHEMA};
+use pbs_client::{BackupTargetArgs, view_task_result};
 
 use proxmox_router::cli::{
-    format_and_print_result, get_output_format, CliCommand, CliCommandMap, OUTPUT_FORMAT,
+    CliCommand, CliCommandMap, OUTPUT_FORMAT, extract_output_format, format_and_print_result,
+    get_output_format,
 };
 use proxmox_schema::api;
 
 use crate::{
     complete_namespace, connect, extract_repository_from_value, optional_ns_param,
-    record_repository,
+    record_repository, remove_repository_from_value,
 };
 
 #[api(
     input: {
         properties: {
-            repository: {
-                schema: REPO_URL_SCHEMA,
-                optional: true,
-            },
-            ns: {
-                type: BackupNamespace,
-                optional: true,
+            repo: {
+                type: BackupTargetArgs,
+                flatten: true,
             },
             "max-depth": {
                 description: "maximum recursion depth",
@@ -84,13 +81,9 @@ async fn list_namespaces(param: Value, max_depth: Option<usize>) -> Result<(), E
 #[api(
     input: {
         properties: {
-            repository: {
-                schema: REPO_URL_SCHEMA,
-                optional: true,
-            },
-            ns: {
-                type: BackupNamespace,
-                optional: true,
+            repo: {
+                type: BackupTargetArgs,
+                flatten: true,
             },
         }
     },
@@ -124,13 +117,9 @@ async fn create_namespace(param: Value) -> Result<(), Error> {
 #[api(
     input: {
         properties: {
-            repository: {
-                schema: REPO_URL_SCHEMA,
-                optional: true,
-            },
-            ns: {
-                type: BackupNamespace,
-                optional: true,
+            repo: {
+                type: BackupTargetArgs,
+                flatten: true,
             },
             "delete-groups": {
                 description: "Destroys all groups in the hierarchy.",
@@ -164,6 +153,64 @@ async fn delete_namespace(param: Value, delete_groups: Option<bool>) -> Result<(
     Ok(())
 }
 
+#[api(
+    input: {
+        properties: {
+            repo: {
+                type: BackupTargetArgs,
+                flatten: true,
+            },
+            "target-ns": {
+                type: BackupNamespace,
+            },
+            "max-depth": {
+                schema: NS_MAX_DEPTH_SCHEMA,
+                optional: true,
+            },
+            "delete-source": {
+                type: bool,
+                optional: true,
+                default: true,
+                description: "Remove the source namespace after moving all contents. \
+                    Defaults to true.",
+            },
+            "merge-groups": {
+                type: bool,
+                optional: true,
+                default: true,
+                description: "If a group with the same name already exists in the target \
+                    namespace, merge snapshots into it. Requires matching ownership and \
+                    non-overlapping snapshot times.",
+            },
+            "output-format": {
+                schema: OUTPUT_FORMAT,
+                optional: true,
+            },
+        }
+    },
+)]
+/// Move a backup namespace to a new location within the same datastore.
+async fn move_namespace(mut param: Value) -> Result<(), Error> {
+    let output_format = extract_output_format(&mut param);
+    let source_ns = optional_ns_param(&param)?;
+    if source_ns.is_root() {
+        bail!("root namespace cannot be moved");
+    }
+    let repo = remove_repository_from_value(&mut param)?;
+    // Forward the source ns even if it only came from PBS_NAMESPACE.
+    param["ns"] = serde_json::to_value(&source_ns)?;
+
+    let client = connect(&repo)?;
+    let path = format!("api2/json/admin/datastore/{}/move-namespace", repo.store());
+    let result = client.post(&path, Some(param)).await?;
+
+    record_repository(&repo);
+
+    view_task_result(&client, result, &output_format).await?;
+
+    Ok(())
+}
+
 pub fn cli_map() -> CliCommandMap {
     CliCommandMap::new()
         .insert(
@@ -183,5 +230,12 @@ pub fn cli_map() -> CliCommandMap {
             CliCommand::new(&API_METHOD_DELETE_NAMESPACE)
                 .arg_param(&["ns"])
                 .completion_cb("ns", complete_namespace),
+        )
+        .insert(
+            "move",
+            CliCommand::new(&API_METHOD_MOVE_NAMESPACE)
+                .arg_param(&["ns"])
+                .completion_cb("ns", complete_namespace)
+                .completion_cb("target-ns", complete_namespace),
         )
 }

@@ -6,19 +6,18 @@ use std::os::unix::io::RawFd;
 use nix::errno::Errno;
 
 use proxmox_io::vec;
-use proxmox_lang::c_str;
 
 // Thin wrappers over the libc xattr calls: on macOS they take additional
 // `position` and `options` arguments.
 
 #[cfg(not(target_os = "macos"))]
 unsafe fn sys_flistxattr(fd: RawFd, list: *mut libc::c_char, size: usize) -> isize {
-    libc::flistxattr(fd, list, size)
+    unsafe { libc::flistxattr(fd, list, size) }
 }
 
 #[cfg(target_os = "macos")]
 unsafe fn sys_flistxattr(fd: RawFd, list: *mut libc::c_char, size: usize) -> isize {
-    libc::flistxattr(fd, list, size, 0)
+    unsafe { libc::flistxattr(fd, list, size, 0) }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -28,7 +27,7 @@ unsafe fn sys_fgetxattr(
     value: *mut libc::c_void,
     size: usize,
 ) -> isize {
-    libc::fgetxattr(fd, name, value, size)
+    unsafe { libc::fgetxattr(fd, name, value, size) }
 }
 
 #[cfg(target_os = "macos")]
@@ -38,7 +37,7 @@ unsafe fn sys_fgetxattr(
     value: *mut libc::c_void,
     size: usize,
 ) -> isize {
-    libc::fgetxattr(fd, name, value, size, 0, 0)
+    unsafe { libc::fgetxattr(fd, name, value, size, 0, 0) }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -48,7 +47,7 @@ unsafe fn sys_fsetxattr(
     value: *const libc::c_void,
     size: usize,
 ) -> libc::c_int {
-    libc::fsetxattr(fd, name, value, size, 0)
+    unsafe { libc::fsetxattr(fd, name, value, size, 0) }
 }
 
 #[cfg(target_os = "macos")]
@@ -58,32 +57,17 @@ unsafe fn sys_fsetxattr(
     value: *const libc::c_void,
     size: usize,
 ) -> libc::c_int {
-    libc::fsetxattr(fd, name, value, size, 0, 0)
+    unsafe { libc::fsetxattr(fd, name, value, size, 0, 0) }
 }
 
 /// `"security.capability"` as a CStr to avoid typos.
-///
-/// This cannot be `const` until `const_cstr_unchecked` is stable.
-#[inline]
-pub fn xattr_name_fcaps() -> &'static CStr {
-    c_str!("security.capability")
-}
+pub const XATTR_NAME_FCAPS: &CStr = c"security.capability";
 
 /// `"system.posix_acl_access"` as a CStr to avoid typos.
-///
-/// This cannot be `const` until `const_cstr_unchecked` is stable.
-#[inline]
-pub fn xattr_acl_access() -> &'static CStr {
-    c_str!("system.posix_acl_access")
-}
+pub const XATTR_ACL_ACCESS: &CStr = c"system.posix_acl_access";
 
 /// `"system.posix_acl_default"` as a CStr to avoid typos.
-///
-/// This cannot be `const` until `const_cstr_unchecked` is stable.
-#[inline]
-pub fn xattr_acl_default() -> &'static CStr {
-    c_str!("system.posix_acl_default")
-}
+pub const XATTR_ACL_DEFAULT: &CStr = c"system.posix_acl_default";
 
 /// Result of `flistxattr`, allows iterating over the attributes as a list of `&CStr`s.
 ///
@@ -217,16 +201,16 @@ pub fn fsetxattr(fd: RawFd, name: &CStr, data: &[u8]) -> Result<(), nix::errno::
 
 pub fn fsetxattr_fcaps(fd: RawFd, fcaps: &[u8]) -> Result<(), nix::errno::Errno> {
     // TODO casync checks and removes capabilities if they are set
-    fsetxattr(fd, xattr_name_fcaps(), fcaps)
+    fsetxattr(fd, XATTR_NAME_FCAPS, fcaps)
 }
 
 pub fn is_security_capability(name: &CStr) -> bool {
-    name.to_bytes() == xattr_name_fcaps().to_bytes()
+    name.to_bytes() == XATTR_NAME_FCAPS.to_bytes()
 }
 
 pub fn is_acl(name: &CStr) -> bool {
-    name.to_bytes() == xattr_acl_access().to_bytes()
-        || name.to_bytes() == xattr_acl_default().to_bytes()
+    name.to_bytes() == XATTR_ACL_ACCESS.to_bytes()
+        || name.to_bytes() == XATTR_ACL_DEFAULT.to_bytes()
 }
 
 /// Check if the passed name buffer starts with a valid xattr namespace prefix
@@ -252,16 +236,14 @@ mod tests {
 
     use std::ffi::CString;
 
-    use proxmox_lang::c_str;
-
     #[test]
     fn test_is_valid_xattr_name() {
         let too_long = CString::new(vec![b'a'; 265]).unwrap();
 
         assert!(!is_valid_xattr_name(&too_long));
-        assert!(!is_valid_xattr_name(c_str!("system.attr")));
-        assert!(is_valid_xattr_name(c_str!("user.attr")));
-        assert!(is_valid_xattr_name(c_str!("trusted.attr")));
-        assert!(is_valid_xattr_name(super::xattr_name_fcaps()));
+        assert!(!is_valid_xattr_name(c"system.attr"));
+        assert!(is_valid_xattr_name(c"user.attr"));
+        assert!(is_valid_xattr_name(c"trusted.attr"));
+        assert!(is_valid_xattr_name(super::XATTR_NAME_FCAPS));
     }
 }

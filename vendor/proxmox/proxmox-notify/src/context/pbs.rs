@@ -1,11 +1,14 @@
-use serde::Deserialize;
 use std::path::Path;
+
+use serde::Deserialize;
+use tracing::error;
 
 use proxmox_schema::{ObjectSchema, Schema, StringSchema};
 use proxmox_section_config::{SectionConfig, SectionConfigPlugin};
 
-use crate::context::{common, Context};
 use crate::Error;
+use crate::context::{Context, common};
+use crate::renderer::TemplateSource;
 
 const PBS_USER_CFG_FILENAME: &str = "/etc/proxmox-backup/user.cfg";
 const PBS_NODE_CFG_FILENAME: &str = "/etc/proxmox-backup/node.cfg";
@@ -15,15 +18,14 @@ const PBS_NODE_CFG_FILENAME: &str = "/etc/proxmox-backup/node.cfg";
 // it with the less restrictive schema should be enough for the purpose of getting the mail address.
 const DUMMY_ID_SCHEMA: Schema = StringSchema::new("dummy ID").min_length(3).schema();
 const DUMMY_EMAIL_SCHEMA: Schema = StringSchema::new("dummy email").schema();
-const DUMMY_USER_SCHEMA: ObjectSchema = ObjectSchema {
-    description: "minimal PBS user",
-    properties: &[
-        ("userid", false, &DUMMY_ID_SCHEMA),
+const DUMMY_USER_SCHEMA: ObjectSchema = ObjectSchema::new(
+    "minimal PBS user",
+    &[
         ("email", true, &DUMMY_EMAIL_SCHEMA),
+        ("userid", false, &DUMMY_ID_SCHEMA),
     ],
-    additional_properties: true,
-    default_key: None,
-};
+)
+.additional_properties(true);
 
 #[derive(Deserialize)]
 struct DummyPbsUser {
@@ -46,13 +48,13 @@ fn lookup_mail_address(content: &str, username: &str) -> Option<String> {
             match parsed.lookup::<DummyPbsUser>("user", username) {
                 Ok(user) => common::normalize_for_return(user.email.as_deref()),
                 Err(err) => {
-                    log::error!("unable to parse {PBS_USER_CFG_FILENAME}: {err}");
+                    error!("unable to parse {PBS_USER_CFG_FILENAME}: {err}");
                     None
                 }
             }
         }
         Err(err) => {
-            log::error!("unable to parse {PBS_USER_CFG_FILENAME}: {err}");
+            error!("unable to parse {PBS_USER_CFG_FILENAME}: {err}");
             None
         }
     }
@@ -101,15 +103,21 @@ impl Context for PBSContext {
     }
 
     fn default_config(&self) -> &'static str {
-        return DEFAULT_CONFIG;
+        DEFAULT_CONFIG
     }
 
     fn lookup_template(
         &self,
         filename: &str,
         namespace: Option<&str>,
+        source: TemplateSource,
     ) -> Result<Option<String>, Error> {
-        let path = Path::new("/usr/share/proxmox-backup/templates")
+        let path = match source {
+            TemplateSource::Vendor => "/usr/share/proxmox-backup/templates",
+            TemplateSource::Override => "/etc/proxmox-backup/notification-templates",
+        };
+
+        let path = Path::new(&path)
             .join(namespace.unwrap_or("default"))
             .join(filename);
 

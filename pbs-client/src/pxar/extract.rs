@@ -2,33 +2,38 @@
 
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, OsStr, OsString};
-use std::io;
+use std::fs::OpenOptions;
+use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use anyhow::{bail, format_err, Context, Error};
+use anyhow::{Context, Error, bail, format_err};
 use bitflags::bitflags;
 use nix::dir::Dir;
 use nix::fcntl::OFlag;
+#[cfg(target_os = "linux")]
+use nix::fcntl::{OpenHow, ResolveFlag};
 use nix::sys::stat::Mode;
 
 use pathpatterns::{MatchEntry, MatchList, MatchType};
 use pxar::accessor::aio::{Accessor, FileContents, FileEntry};
-use pxar::decoder::{aio::Decoder, Contents};
+use pxar::decoder::{Contents, aio::Decoder};
 use pxar::format::Device;
 use pxar::{Entry, EntryKind, Metadata};
 
 use proxmox_io::{sparse_copy, sparse_copy_async};
+use proxmox_log::{debug, error, info};
 use proxmox_sys::c_result;
-use proxmox_sys::fs::{create_path, CreateOptions};
+use proxmox_sys::fs::{CreateOptions, create_path};
 
-use proxmox_compression::zip::{ZipEncoder, ZipEntry};
+use proxmox_compression::zip::{FileType, ZipEncoder, ZipEntry};
 
+use crate::pxar::Flags;
 use crate::pxar::dir_stack::PxarDirStack;
 use crate::pxar::metadata;
-use crate::pxar::Flags;
+use crate::pxar::tools::handle_root_with_optional_format_version_prelude;
 
 pub struct PxarExtractOptions<'a> {
     pub match_list: &'a [MatchEntry],
@@ -36,10 +41,11 @@ pub struct PxarExtractOptions<'a> {
     pub allow_existing_dirs: bool,
     pub overwrite_flags: OverwriteFlags,
     pub on_error: Option<ErrorHandler>,
+    pub prelude_path: Option<PathBuf>,
 }
 
 bitflags! {
-    #[derive(Default)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
     pub struct OverwriteFlags: u8 {
         /// Overwrite existing entries file content
         const FILE = 0x1;
@@ -124,10 +130,34 @@ where
         // we use this to keep track of our directory-traversal
         decoder.enable_goodbye_entries(true);
 
-        let root = decoder
-            .next()
-            .context("found empty pxar archive")?
+        let (root, prelude) = handle_root_with_optional_format_version_prelude(&mut decoder)
             .context("error reading pxar archive")?;
+
+        if let Some(ref path) = options.prelude_path {
+            if let Some(entry) = prelude {
+                let overwrite = options.overwrite_flags.contains(OverwriteFlags::FILE);
+
+                let mut open_options = OpenOptions::new();
+                open_options.write(true);
+                if overwrite {
+                    open_options.create(true);
+                    open_options.truncate(true);
+                } else {
+                    open_options.create_new(true);
+                }
+
+                let mut prelude_file = open_options
+                    .open(path)
+                    .with_context(|| format!("error creating prelude file '{path:?}'"))?;
+                if let pxar::EntryKind::Prelude(prelude) = entry.kind() {
+                    prelude_file.write_all(prelude.as_ref())?;
+                } else {
+                    info!("unexpected entry kind for prelude");
+                }
+            } else {
+                info!("No prelude entry found, skip prelude restore.");
+            }
+        }
 
         if !root.is_dir() {
             bail!("pxar archive does not start with a directory entry!");
@@ -177,30 +207,29 @@ where
     }
 }
 
-impl<'a, T, F> Iterator for ExtractorIter<'a, T, F>
+impl<T, F> Iterator for ExtractorIter<'_, T, F>
 where
     T: pxar::decoder::SeqRead,
     F: FnMut(&Path),
 {
     type Item = Result<(), Error>;
 
-    /// Performs the extraction of [`Entries`][E] yielded by the [`Decoder`][D].
+    /// Performs the extraction of [`Entries`][Entry] yielded by the [`Decoder`][D].
     ///
     /// In detail, the [`ExtractorIter`] will stop if and only if one of the
     /// following conditions is true:
     ///   * The [`Decoder`][D] is exhausted
     ///   * The [`Decoder`][D] failed to read from the archive and consequently
     ///     yielded an [`io::Error`]
-    ///   * The [`Entry`][E]'s filename is invalid (contains nul bytes or a slash)
+    ///   * The [`Entry`]'s filename is invalid (contains nul bytes or a slash)
     ///
     /// Should an error occur during any point of extraction (**not** while
-    /// fetching the next [`Entry`][E]), the error may be handled by the
+    /// fetching the next [`Entry`]), the error may be handled by the
     /// [`ErrorHandler`] provided by the [`PxarExtractOptions`] used to
     /// initialize the iterator.
     ///
     /// Extraction errors will have a corresponding [`PxarExtractContext`] attached.
     ///
-    /// [E]: pxar::Entry
     /// [D]: pxar::decoder::Decoder
     fn next(&mut self) -> Option<Self::Item> {
         if self.state.end_reached {
@@ -267,6 +296,8 @@ where
         };
 
         let extract_res = match (did_match, entry.kind()) {
+            (_, EntryKind::Version(_version)) => Ok(()),
+            (_, EntryKind::Prelude(_prelude)) => Ok(()),
             (_, EntryKind::Directory) => {
                 self.callback(entry.path());
 
@@ -353,26 +384,22 @@ where
                     Ok(())
                 }
             }
-            (true, EntryKind::File { size, .. }) => {
-                let contents = self.decoder.contents();
-
-                if let Some(mut contents) = contents {
-                    self.extractor.extract_file(
-                        &file_name,
-                        metadata,
-                        *size,
-                        &mut contents,
-                        self.extractor
-                            .overwrite_flags
-                            .contains(OverwriteFlags::FILE),
-                    )
-                } else {
-                    Err(format_err!(
-                        "found regular file entry without contents in archive"
-                    ))
-                }
-                .context(PxarExtractContext::ExtractFile)
+            (true, EntryKind::File { size, .. }) => match self.decoder.contents() {
+                Ok(Some(mut contents)) => self.extractor.extract_file(
+                    &file_name,
+                    metadata,
+                    *size,
+                    &mut contents,
+                    self.extractor
+                        .overwrite_flags
+                        .contains(OverwriteFlags::FILE),
+                ),
+                Ok(None) => Err(format_err!(
+                    "found regular file entry without contents in archive"
+                )),
+                Err(err) => Err(err.into()),
             }
+            .context(PxarExtractContext::ExtractFile),
             (false, _) => Ok(()), // skip this
         };
 
@@ -593,16 +620,64 @@ impl Extractor {
     pub fn extract_hardlink(&mut self, file_name: &CStr, link: &OsStr) -> Result<(), Error> {
         crate::pxar::tools::assert_relative_path(link)?;
 
+        let link = Path::new(link);
+        let target_name = link
+            .file_name()
+            .with_context(|| format!("invalid hardlink target {link:?}"))?;
+        let target_name = CString::new(target_name.as_bytes())?;
+
         let parent = self.parent_fd()?;
         let root = self.dir_stack.root_dir_fd()?;
-        let target = CString::new(link.as_bytes())?;
+
+        // Only resolve the directory, linkat() without AT_EMPTY_PATH needs no CAP_DAC_READ_SEARCH
+        // and does not follow the final component.
+        let target_dir = match link.parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => {
+                #[cfg(target_os = "linux")]
+                let fd = {
+                    let how = OpenHow::new()
+                        .flags(OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC)
+                        .resolve(ResolveFlag::RESOLVE_BENEATH | ResolveFlag::RESOLVE_NO_SYMLINKS);
+                    nix::fcntl::openat2(root.as_raw_fd(), dir, how)
+                };
+                // No openat2(2) on macOS: instead of RESOLVE_BENEATH and RESOLVE_NO_SYMLINKS refuse
+                // `..` (the path is relative, see above) and symlinks anywhere in the path.
+                #[cfg(target_os = "macos")]
+                let fd = {
+                    use std::path::Component;
+                    if dir
+                        .components()
+                        .any(|c| !matches!(c, Component::Normal(_) | Component::CurDir))
+                    {
+                        bail!("invalid hardlink target directory {dir:?}");
+                    }
+                    nix::fcntl::openat(
+                        Some(root.as_raw_fd()),
+                        dir,
+                        OFlag::O_RDONLY
+                            | OFlag::O_DIRECTORY
+                            | OFlag::O_CLOEXEC
+                            | OFlag::from_bits_retain(libc::O_NOFOLLOW_ANY),
+                        nix::sys::stat::Mode::empty(),
+                    )
+                };
+                let fd = fd
+                    .with_context(|| format!("failed to open hardlink target directory {dir:?}"))?;
+                Some(unsafe { OwnedFd::from_raw_fd(fd) })
+            }
+            _ => None,
+        };
+        let target_dir_fd = target_dir
+            .as_ref()
+            .map_or(root.as_raw_fd(), |fd| fd.as_raw_fd());
+
         let dolink = || {
             nix::unistd::linkat(
-                Some(root.as_raw_fd()),
-                target.as_c_str(),
+                Some(target_dir_fd),
+                target_name.as_c_str(),
                 Some(parent),
                 file_name,
-                nix::unistd::LinkatFlags::NoSymlinkFollow,
+                nix::fcntl::AtFlags::empty(),
             )
         };
 
@@ -674,14 +749,19 @@ impl Extractor {
         let parent = self.parent_fd()?;
         let mut oflags = OFlag::O_CREAT | OFlag::O_WRONLY | OFlag::O_CLOEXEC;
         if overwrite {
-            oflags |= OFlag::O_TRUNC;
+            oflags |= OFlag::O_TRUNC | OFlag::O_NOFOLLOW;
         } else {
             oflags |= OFlag::O_EXCL;
         }
         let mut file = unsafe {
             std::fs::File::from_raw_fd(
-                nix::fcntl::openat(parent, file_name, oflags, Mode::from_bits(0o600).unwrap())
-                    .with_context(|| format!("failed to create file {file_name:?}"))?,
+                nix::fcntl::openat(
+                    Some(parent),
+                    file_name,
+                    oflags,
+                    Mode::from_bits(0o600).unwrap(),
+                )
+                .with_context(|| format!("failed to create file {file_name:?}"))?,
             )
         };
 
@@ -705,7 +785,7 @@ impl Extractor {
         }
 
         if result.seeked_last {
-            while match nix::unistd::ftruncate(file.as_raw_fd(), size as i64) {
+            while match nix::unistd::ftruncate(&file, size as i64) {
                 Ok(_) => false,
                 Err(nix::errno::Errno::EINTR) => true,
                 Err(err) => return Err(err).context("error setting file size"),
@@ -716,7 +796,10 @@ impl Extractor {
             self.feature_flags,
             metadata,
             file.as_raw_fd(),
-            self.dir_stack.path(),
+            &self
+                .dir_stack
+                .path()
+                .join(file_name.to_string_lossy().to_string()),
             &mut self.on_error,
         )
     }
@@ -732,14 +815,19 @@ impl Extractor {
         let parent = self.parent_fd()?;
         let mut oflags = OFlag::O_CREAT | OFlag::O_WRONLY | OFlag::O_CLOEXEC;
         if overwrite {
-            oflags |= OFlag::O_TRUNC;
+            oflags |= OFlag::O_TRUNC | OFlag::O_NOFOLLOW;
         } else {
             oflags |= OFlag::O_EXCL;
         }
         let mut file = tokio::fs::File::from_std(unsafe {
             std::fs::File::from_raw_fd(
-                nix::fcntl::openat(parent, file_name, oflags, Mode::from_bits(0o600).unwrap())
-                    .with_context(|| format!("failed to create file {file_name:?}"))?,
+                nix::fcntl::openat(
+                    Some(parent),
+                    file_name,
+                    oflags,
+                    Mode::from_bits(0o600).unwrap(),
+                )
+                .with_context(|| format!("failed to create file {file_name:?}"))?,
             )
         });
 
@@ -764,7 +852,7 @@ impl Extractor {
         }
 
         if result.seeked_last {
-            while match nix::unistd::ftruncate(file.as_raw_fd(), size as i64) {
+            while match nix::unistd::ftruncate(&file, size as i64) {
                 Ok(_) => false,
                 Err(nix::errno::Errno::EINTR) => true,
                 Err(err) => return Err(err).context("error setting file size"),
@@ -775,7 +863,10 @@ impl Extractor {
             self.feature_flags,
             metadata,
             file.as_raw_fd(),
-            self.dir_stack.path(),
+            &self
+                .dir_stack
+                .path()
+                .join(file_name.to_string_lossy().to_string()),
             &mut self.on_error,
         )
     }
@@ -788,9 +879,9 @@ fn add_metadata_to_header(header: &mut tar::Header, metadata: &Metadata) {
     header.set_gid(metadata.stat.gid as u64);
 }
 
-async fn tar_add_file<'a, W, T>(
+async fn tar_add_file<W, T>(
     tar: &mut proxmox_compression::tar::Builder<W>,
-    contents: Option<Contents<'a, T>>,
+    contents: Option<Contents<'_, T>>,
     size: u64,
     metadata: &Metadata,
     path: &Path,
@@ -860,7 +951,8 @@ where
             match entry.kind() {
                 EntryKind::File { .. } => {
                     let size = decoder.content_size().unwrap_or(0);
-                    tar_add_file(&mut tarencoder, decoder.contents(), size, metadata, path).await?
+                    let contents = decoder.contents().await?;
+                    tar_add_file(&mut tarencoder, contents, size, metadata, path).await?
                 }
                 EntryKind::Hardlink(link) => {
                     if !link.data.is_empty() {
@@ -872,7 +964,7 @@ where
                         let metadata = realfile.entry().metadata();
                         let realpath = Path::new(link);
 
-                        log::debug!("adding '{}' to tar", path.display());
+                        debug!("adding '{}' to tar", path.display());
 
                         let stripped_path = match realpath.strip_prefix(prefix) {
                             Ok(path) => path,
@@ -882,14 +974,9 @@ where
                                     path
                                 } else {
                                     let size = decoder.content_size().unwrap_or(0);
-                                    tar_add_file(
-                                        &mut tarencoder,
-                                        decoder.contents(),
-                                        size,
-                                        metadata,
-                                        path,
-                                    )
-                                    .await?;
+                                    let contents = decoder.contents().await?;
+                                    tar_add_file(&mut tarencoder, contents, size, metadata, path)
+                                        .await?;
                                     hardlinks.insert(realpath.to_owned(), path.to_owned());
                                     continue;
                                 }
@@ -906,7 +993,7 @@ where
                     }
                 }
                 EntryKind::Symlink(link) if !link.data.is_empty() => {
-                    log::debug!("adding '{}' to tar", path.display());
+                    debug!("adding '{}' to tar", path.display());
                     let realpath = Path::new(link);
                     let mut header = tar::Header::new_gnu();
                     header.set_entry_type(tar::EntryType::Symlink);
@@ -918,7 +1005,7 @@ where
                         .context("could not send symlink entry")?;
                 }
                 EntryKind::Fifo => {
-                    log::debug!("adding '{}' to tar", path.display());
+                    debug!("adding '{}' to tar", path.display());
                     let mut header = tar::Header::new_gnu();
                     header.set_entry_type(tar::EntryType::Fifo);
                     add_metadata_to_header(&mut header, metadata);
@@ -932,7 +1019,7 @@ where
                         .context("could not send fifo entry")?;
                 }
                 EntryKind::Directory => {
-                    log::debug!("adding '{}' to tar", path.display());
+                    debug!("adding '{}' to tar", path.display());
                     // we cannot add the root path itself
                     if path != Path::new("/") {
                         let mut header = tar::Header::new_gnu();
@@ -947,7 +1034,7 @@ where
                     }
                 }
                 EntryKind::Device(device) => {
-                    log::debug!("adding '{}' to tar", path.display());
+                    debug!("adding '{}' to tar", path.display());
                     let entry_type = if metadata.stat.is_chardev() {
                         tar::EntryType::Char
                     } else {
@@ -970,7 +1057,7 @@ where
     }
 
     tarencoder.finish().await.map_err(|err| {
-        log::error!("error during finishing of zip: {}", err);
+        error!("error during finishing of zip: {}", err);
         err
     })?;
     Ok(())
@@ -1005,7 +1092,7 @@ where
                 path,
                 metadata.stat.mtime.secs,
                 metadata.stat.mode as u16,
-                false,
+                FileType::Directory,
             );
             zip.add_entry::<FileContents<T>>(entry, None).await?;
         }
@@ -1019,14 +1106,15 @@ where
 
             match entry.kind() {
                 EntryKind::File { .. } => {
-                    log::debug!("adding '{}' to zip", path.display());
+                    debug!("adding '{}' to zip", path.display());
                     let entry = ZipEntry::new(
                         path,
                         metadata.stat.mtime.secs,
                         metadata.stat.mode as u16,
-                        true,
+                        FileType::Regular,
                     );
-                    zip.add_entry(entry, decoder.contents())
+                    let contents = decoder.contents().await?;
+                    zip.add_entry(entry, contents)
                         .await
                         .context("could not send file entry")?;
                 }
@@ -1034,29 +1122,41 @@ where
                     let entry = root
                         .lookup(&path)
                         .await?
-                        .with_context(|| format!("error looking up {:?}", path))?;
+                        .with_context(|| format!("error looking up {path:?}"))?;
                     let realfile = accessor.follow_hardlink(&entry).await?;
                     let metadata = realfile.entry().metadata();
-                    log::debug!("adding '{}' to zip", path.display());
+                    debug!("adding '{}' to zip", path.display());
                     let entry = ZipEntry::new(
                         path,
                         metadata.stat.mtime.secs,
                         metadata.stat.mode as u16,
-                        true,
+                        FileType::Regular,
                     );
-                    zip.add_entry(entry, decoder.contents())
+                    let contents = decoder.contents().await?;
+                    zip.add_entry(entry, contents)
                         .await
                         .context("could not send file entry")?;
                 }
                 EntryKind::Directory => {
-                    log::debug!("adding '{}' to zip", path.display());
+                    debug!("adding '{}' to zip", path.display());
                     let entry = ZipEntry::new(
                         path,
                         metadata.stat.mtime.secs,
                         metadata.stat.mode as u16,
-                        false,
+                        FileType::Directory,
                     );
                     zip.add_entry::<FileContents<T>>(entry, None).await?;
+                }
+                EntryKind::Symlink(target) => {
+                    debug!("adding '{}' to zip", path.display());
+                    let entry = ZipEntry::new(
+                        path,
+                        metadata.stat.mtime.secs,
+                        metadata.stat.mode as u16,
+                        FileType::Symlink,
+                    );
+                    let target = io::Cursor::<&[u8]>::new(target.as_ref());
+                    zip.add_entry(entry, Some(target)).await?;
                 }
                 _ => {} // ignore all else
             };
@@ -1064,7 +1164,7 @@ where
     }
 
     zip.finish().await.map_err(|err| {
-        eprintln!("error during finishing of zip: {}", err);
+        eprintln!("error during finishing of zip: {err}");
         err
     })
 }
@@ -1139,7 +1239,7 @@ where
     let mut extractor = get_extractor(destination, root.metadata().clone())?;
 
     if let Err(err) = seq_files_extractor(&mut extractor, decoder).await {
-        log::error!("error extracting pxar archive: {}", err);
+        error!("error extracting pxar archive: {}", err);
     }
 
     Ok(())
@@ -1203,7 +1303,7 @@ where
     let metadata = entry.metadata();
     let (file_name_os, file_name) = get_filename(entry)?;
 
-    log::debug!("extracting: {}", file.path().display());
+    debug!("extracting: {}", file.path().display());
 
     match file.kind() {
         EntryKind::Directory => {
@@ -1255,7 +1355,7 @@ where
         let (file_name_os, file_name) = get_filename(&entry)?;
 
         if !matches!(entry.kind(), EntryKind::GoodbyeTable) {
-            log::debug!("extracting: {}", entry.path().display());
+            debug!("extracting: {}", entry.path().display());
         }
 
         if let Err(err) = async {
@@ -1267,14 +1367,16 @@ where
                         .with_context(|| format!("error at entry {file_name_os:?}"))?;
                 }
                 EntryKind::File { size, .. } => {
+                    let mut contents = decoder
+                        .contents()
+                        .await?
+                        .context("found regular file entry without contents in archive")?;
                     extractor
                         .async_extract_file(
                             &file_name,
                             metadata,
                             *size,
-                            &mut decoder
-                                .contents()
-                                .context("found regular file entry without contents in archive")?,
+                            &mut contents,
                             extractor.overwrite_flags.contains(OverwriteFlags::FILE),
                         )
                         .await?
@@ -1289,16 +1391,11 @@ where
         }
         .await
         {
-            let display = entry.path().display().to_string();
-            log::error!(
-                "error extracting {}: {}",
-                if matches!(entry.kind(), EntryKind::GoodbyeTable) {
-                    "<directory>"
-                } else {
-                    &display
-                },
-                err
-            );
+            let path_display = match entry.kind() {
+                EntryKind::GoodbyeTable => "<directory>".to_string(),
+                _ => entry.path().display().to_string(),
+            };
+            error!("error extracting {path_display}: {err}");
         }
 
         if dir_level < 0 {

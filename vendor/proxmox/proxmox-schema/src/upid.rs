@@ -1,6 +1,6 @@
-use anyhow::{bail, Error};
+use anyhow::{Error, bail};
 
-use crate::{const_regex, ApiStringFormat, ApiType, Schema, StringSchema};
+use crate::{ApiStringFormat, ApiType, Schema, StringSchema};
 
 /// Unique Process/Task Identifier
 ///
@@ -123,7 +123,7 @@ impl<'de> serde::Deserialize<'de> for UPID {
     {
         struct ForwardToStrVisitor;
 
-        impl<'a> serde::de::Visitor<'a> for ForwardToStrVisitor {
+        impl serde::de::Visitor<'_> for ForwardToStrVisitor {
             type Value = UPID;
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -156,7 +156,7 @@ fn escape_id(unit: &str) -> String {
             || !matches!(c, b'_' | b'.' | b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z')
         {
             // unwrap: writing to a String
-            write!(escaped, "\\x{:02x}", c).unwrap();
+            write!(escaped, "\\x{c:02x}").unwrap();
         } else {
             escaped.push(char::from(c));
         }
@@ -191,7 +191,7 @@ fn unescape_id(text: &str) -> Result<String, Error> {
             }
             let h1 = hex_digit(i[2])?;
             let h0 = hex_digit(i[3])?;
-            data.push(h1 << 4 | h0);
+            data.push((h1 << 4) | h0);
             i = &i[4..]
         } else if next == b'-' {
             data.push(b'/');
@@ -212,7 +212,7 @@ mod upid_impl {
     use std::os::unix::ffi::OsStrExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use anyhow::{bail, format_err, Error};
+    use anyhow::{Error, bail, format_err};
 
     use super::UPID;
 
@@ -258,7 +258,7 @@ mod upid_impl {
     }
 
     fn get_pid_start(pid: libc::pid_t) -> Result<u64, Error> {
-        let statstr = String::from_utf8(std::fs::read(format!("/proc/{}/stat", pid))?)?;
+        let statstr = String::from_utf8(std::fs::read(format!("/proc/{pid}/stat"))?)?;
         let cmdend = statstr
             .rfind(')')
             .ok_or_else(|| format_err!("missing ')' in /proc/PID/stat"))?;

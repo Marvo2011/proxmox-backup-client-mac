@@ -6,7 +6,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use anyhow::{bail, format_err, Error};
+use anyhow::{Error, bail, format_err};
 use nix::sys::stat;
 use nix::unistd::Pid;
 
@@ -182,7 +182,7 @@ impl MountInfo {
 
     /// Read the mount point information of a specific pid.
     pub fn read_for_pid(pid: Pid) -> Result<Self, Error> {
-        Self::parse(&std::fs::read(format!("/proc/{}/mountinfo", pid))?)
+        Self::parse(&std::fs::read(format!("/proc/{pid}/mountinfo"))?)
     }
 
     /// Parse a `mountinfo` file.
@@ -211,7 +211,7 @@ impl MountInfo {
     }
 
     /// Iterate over mount entries.
-    pub fn iter(&self) -> Iter {
+    pub fn iter(&self) -> Iter<'_> {
         self.entries.iter()
     }
 

@@ -38,26 +38,26 @@ impl fmt::Debug for Permission {
             Permission::Superuser => f.write_str("Superuser"),
             Permission::World => f.write_str("World"),
             Permission::Anybody => f.write_str("Anybody"),
-            Permission::User(ref userid) => write!(f, "User({})", userid),
-            Permission::UserParam(param_name) => write!(f, "UserParam({})", param_name),
-            Permission::Group(ref group) => write!(f, "Group({})", group),
+            Permission::User(userid) => write!(f, "User({userid})"),
+            Permission::UserParam(param_name) => write!(f, "UserParam({param_name})"),
+            Permission::Group(group) => write!(f, "Group({group})"),
             Permission::WithParam(param_name, subtest) => {
-                write!(f, "WithParam({}, {:?})", param_name, subtest)
+                write!(f, "WithParam({param_name}, {subtest:?})")
             }
             Permission::Privilege(path, privs, partial) => {
-                write!(f, "Privilege({:?}, {:0b}, {})", path, privs, partial)
+                write!(f, "Privilege({path:?}, {privs:0b}, {partial})")
             }
             Permission::And(list) => {
                 f.write_str("And(\n")?;
                 for subtest in list.iter() {
-                    writeln!(f, "  {:?}", subtest)?;
+                    writeln!(f, "  {subtest:?}")?;
                 }
                 f.write_str(")\n")
             }
             Permission::Or(list) => {
                 f.write_str("Or(\n")?;
                 for subtest in list.iter() {
-                    writeln!(f, "  {:?}", subtest)?;
+                    writeln!(f, "  {subtest:?}")?;
                 }
                 f.write_str(")\n")
             }
@@ -122,12 +122,12 @@ fn check_api_permission_tail(
         },
         Permission::User(expected_userid) => match userid {
             None => return false,
-            Some(ref userid) => return userid == expected_userid,
+            Some(userid) => return &userid == expected_userid,
         },
         Permission::UserParam(param_name) => match (userid, param.get(&param_name.to_string())) {
             (None, _) => return false,
             (_, None) => return false,
-            (Some(ref userid), Some(ref expected)) => return userid == expected,
+            (Some(userid), Some(expected)) => return userid == expected,
         },
         Permission::Group(expected_group) => match userid {
             None => return false,
@@ -200,7 +200,7 @@ fn check_api_permission_tail(
 
 #[cfg(test)]
 mod test {
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     use crate::permission::*;
 
@@ -268,7 +268,7 @@ mod test {
         param.insert("ns".to_string(), "bar/baz".to_string());
 
         let test_check = |perm: &Permission, userid: Option<&str>, should_succeed: bool| {
-            println!("{:?} on {:?}: {}", userid, perm, should_succeed);
+            println!("{userid:?} on {perm:?}: {should_succeed}");
             assert_eq!(
                 check_api_permission(perm, userid, &param, &userinfo),
                 should_succeed

@@ -1,10 +1,11 @@
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum DateTimeValue {
     Single(u32),
     Range(u32, u32),
     Repeated(u32, u32, Option<u32>),
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl DateTimeValue {
     // Test if the entry contains the value
     pub fn contains(&self, value: u32) -> bool {
@@ -15,7 +16,7 @@ impl DateTimeValue {
                 if value >= *start {
                     if *repetition > 0 {
                         let offset = value - start;
-                        let res = offset % repetition == 0;
+                        let res = offset.is_multiple_of(*repetition);
                         if let Some(end) = opt_end {
                             res && value <= *end
                         } else {

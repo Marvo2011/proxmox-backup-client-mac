@@ -18,8 +18,9 @@ use anyhow::Error;
 use proc_macro2::{Ident, Span, TokenStream};
 use quote::quote_spanned;
 
-use super::attributes::UpdaterFieldAttributes;
 use super::Schema;
+use super::attributes::CheckedAttributes;
+use super::attributes::UpdaterFieldAttributes;
 use crate::api::{self, ObjectEntry, SchemaItem};
 use crate::serde;
 use crate::util::{self, FieldName, JSONObject, Maybe};
@@ -141,9 +142,15 @@ fn handle_regular_struct(
     // fields if there are any.
     let mut schema_fields: HashMap<String, &mut ObjectEntry> = HashMap::new();
 
+    let mut additional_properties = None;
+
     // We also keep a reference to the SchemaObject around since we derive missing fields
     // automatically.
     if let SchemaItem::Object(obj) = &mut schema.item {
+        additional_properties = obj
+            .additional_properties
+            .as_ref()
+            .and_then(|a| a.to_option_string());
         for field in obj.properties_mut() {
             schema_fields.insert(field.name.as_str().to_string(), field);
         }
@@ -158,7 +165,7 @@ fn handle_regular_struct(
     let mut all_of_schemas = TokenStream::new();
     let mut to_remove = Vec::new();
 
-    if let syn::Fields::Named(ref fields) = &stru.fields {
+    if let syn::Fields::Named(fields) = &stru.fields {
         for field in &fields.named {
             let attrs = serde::FieldAttrib::try_from(&field.attrs[..])?;
 
@@ -178,8 +185,18 @@ fn handle_regular_struct(
                 }
             };
 
+            if additional_properties.as_deref() == Some(name.as_ref()) {
+                // we just *skip* the additional properties field, it is supposed to be a flattened
+                // `HashMap<String, Value>` collecting all the values that have no schema
+                continue;
+            }
+
+            let checked_attrs = CheckedAttributes::from_slice(&field.attrs);
+
             match schema_fields.remove(&name) {
                 Some(field_def) => {
+                    field_def.attrs = checked_attrs;
+
                     if attrs.flatten {
                         to_remove.push(name.clone());
 
@@ -204,7 +221,11 @@ fn handle_regular_struct(
                     handle_regular_field(field_def, field, false, &attrs)?;
 
                     if attrs.flatten {
-                        all_of_schemas.extend(quote::quote! {&});
+                        let checked_attrs = &field_def.attrs;
+                        all_of_schemas.extend(quote::quote! {
+                            #checked_attrs
+                            &
+                        });
                         field_def.schema.to_schema(&mut all_of_schemas)?;
                         all_of_schemas.extend(quote::quote! {,});
                     }
@@ -215,10 +236,15 @@ fn handle_regular_struct(
                         false,
                         Schema::blank(span),
                     );
+                    field_def.attrs = checked_attrs;
                     handle_regular_field(&mut field_def, field, true, &attrs)?;
 
                     if attrs.flatten {
-                        all_of_schemas.extend(quote::quote! {&});
+                        let checked_attrs = &field_def.attrs;
+                        all_of_schemas.extend(quote::quote! {
+                            #checked_attrs
+                            &
+                        });
                         field_def.schema.to_schema(&mut all_of_schemas)?;
                         all_of_schemas.extend(quote::quote! {,});
                         to_remove.push(name.clone());
@@ -241,12 +267,52 @@ fn handle_regular_struct(
         );
     }
 
+    // Auto-inject `#[serde(alias = "<old>")]` on the field matching each declared deprecated
+    // alias so direct serde-driven deserialization (section_config, `serde_json::from_value`,
+    // ...) accepts the old name end-to-end without the caller having to maintain the alias
+    // list in two places. Field matching uses the effective serde name (`rename` /
+    // `rename_all` / ident).
+    let aliases: Vec<(String, syn::LitStr)> = match &schema.item {
+        SchemaItem::Object(obj) => obj
+            .property_aliases()
+            .iter()
+            .map(|(alias, target)| (target.value(), alias.clone()))
+            .collect(),
+        _ => Vec::new(),
+    };
+    if !aliases.is_empty() {
+        if let syn::Fields::Named(fields) = &mut stru.fields {
+            for field in &mut fields.named {
+                let attrs = serde::FieldAttrib::try_from(&field.attrs[..])?;
+                let Some(ident) = field.ident.as_ref() else {
+                    continue;
+                };
+                let effective_name = if let Some(renamed) = &attrs.rename {
+                    renamed.value()
+                } else if let Some(rename_all) = container_attrs.rename_all {
+                    rename_all.apply_to_field(&ident.to_string())
+                } else {
+                    ident.to_string()
+                };
+                for (target, alias) in &aliases {
+                    if *target != effective_name {
+                        continue;
+                    }
+                    let alias_value = alias.value();
+                    let alias_lit = syn::LitStr::new(&alias_value, ident.span());
+                    field.attrs.push(syn::parse_quote_spanned! {ident.span() =>
+                        #[serde(alias = #alias_lit)]
+                    });
+                }
+            }
+        }
+    }
+
     {
         let obj = schema.item.check_object_mut()?;
         // remove flattened fields
         for field in to_remove {
-            //if !obj.remove_property_by_ident(&field)
-            if let Some(item) = obj.find_property_by_ident_mut(&field) {
+            if let Some(item) = obj.find_property_mut(&field) {
                 item.flatten_in_struct = true;
             } else {
                 error!(
@@ -271,7 +337,8 @@ fn handle_regular_struct(
             }
         });
         if derive {
-            let updater = derive_updater(stru.clone(), schema.clone(), &mut stru)?;
+            let updater =
+                derive_updater(stru.clone(), schema.clone(), &mut stru, &container_attrs)?;
 
             // make sure we don't leave #[updater] attributes on the original struct:
             if let syn::Fields::Named(fields) = &mut stru.fields {
@@ -403,6 +470,7 @@ fn derive_updater(
     mut stru: syn::ItemStruct,
     mut schema: Schema,
     original_struct: &mut syn::ItemStruct,
+    container_attrs: &serde::ContainerAttrib,
 ) -> Result<TokenStream, Error> {
     let original_name = &original_struct.ident;
     stru.ident = Ident::new(&format!("{}Updater", stru.ident), stru.ident.span());
@@ -425,6 +493,7 @@ fn derive_updater(
                 &mut schema,
                 &mut all_of_schemas,
                 &mut is_empty_impl,
+                container_attrs,
             ) {
                 Ok(FieldAction::Keep) => fields.named.push(field),
                 Ok(FieldAction::Skip) => (),
@@ -442,17 +511,14 @@ fn derive_updater(
         finish_all_of_struct(schema, &stru, all_of_schemas)?
     };
 
-    if !is_empty_impl.is_empty() {
-        output.extend(quote::quote!(
-            impl ::proxmox_schema::Updater for #updater_name {
-                fn is_empty(&self) -> bool {
-                    #is_empty_impl
-                }
-            }
-        ));
-    }
-
     output.extend(quote::quote!(
+        impl ::proxmox_schema::Updater for #updater_name {
+            fn is_empty(&self) -> bool {
+                #is_empty_impl
+                true
+            }
+        }
+
         impl ::proxmox_schema::UpdaterType for #original_name {
             type Updater = #updater_name;
         }
@@ -471,32 +537,39 @@ fn handle_updater_field(
     schema: &mut Schema,
     all_of_schemas: &mut TokenStream,
     is_empty_impl: &mut TokenStream,
+    container_attrs: &serde::ContainerAttrib,
 ) -> Result<FieldAction, syn::Error> {
     let updater_attrs = UpdaterFieldAttributes::from_attributes(&mut field.attrs);
+    let serde_attrs = serde::FieldAttrib::try_from(&field.attrs[..])?;
 
     let field_name = field.ident.as_ref().expect("unnamed field in FieldsNamed");
-    let field_name_string = field_name.to_string();
+
+    let (name, name_span) = {
+        let ident: &Ident = field
+            .ident
+            .as_ref()
+            .ok_or_else(|| format_err!(&field => "field without name?"))?;
+
+        if let Some(renamed) = serde_attrs.rename.clone() {
+            (renamed.value(), ident.span())
+        } else if let Some(rename_all) = container_attrs.rename_all {
+            let name = rename_all.apply_to_field(&ident.to_string());
+            (name, ident.span())
+        } else {
+            (ident.to_string(), ident.span())
+        }
+    };
 
     if updater_attrs.skip() {
-        if !schema.remove_obj_property_by_ident(&field_name_string) {
-            bail!(
-                field_name.span(),
-                "failed to find schema entry for {:?}",
-                field_name_string,
-            );
+        if !schema.remove_obj_property(&name) {
+            bail!(name_span, "failed to find schema entry for {:?}", name);
         }
         return Ok(FieldAction::Skip);
     }
 
-    let field_schema = match schema.find_obj_property_by_ident_mut(&field_name_string) {
+    let field_schema = match schema.find_obj_property_mut(&name) {
         Some(obj) => obj,
-        None => {
-            bail!(
-                field_name.span(),
-                "failed to find schema entry for {:?}",
-                field_name_string,
-            );
-        }
+        None => bail!(name_span, "failed to find schema entry for {:?}", name),
     };
 
     let span = Span::call_site();
@@ -530,17 +603,22 @@ fn handle_updater_field(
 
     field.ty = syn::Type::Path(updater);
 
+    // The field keeps its `#[cfg]` attributes, so every reference to it must carry them as well.
+    let checked_attrs = CheckedAttributes::from_slice(&field.attrs);
+
     if field_schema.flatten_in_struct {
         let updater_ty = &field.ty;
-        all_of_schemas
-            .extend(quote::quote! {&<#updater_ty as ::proxmox_schema::ApiType>::API_SCHEMA,});
+        all_of_schemas.extend(quote::quote! {
+            #checked_attrs
+            &<#updater_ty as ::proxmox_schema::ApiType>::API_SCHEMA,
+        });
     }
 
-    if !is_empty_impl.is_empty() {
-        is_empty_impl.extend(quote::quote! { && });
-    }
     is_empty_impl.extend(quote::quote! {
-        self.#field_name.is_empty()
+        #checked_attrs
+        if !self.#field_name.is_empty() {
+            return false;
+        }
     });
 
     Ok(FieldAction::Keep)

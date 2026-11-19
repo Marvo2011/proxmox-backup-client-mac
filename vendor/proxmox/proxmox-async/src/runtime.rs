@@ -33,24 +33,21 @@
 //! [openssl-bug]: https://github.com/openssl/openssl/issues/6214
 
 use std::future::Future;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 use std::task::{Context, Poll, Waker};
 use std::thread::{self, Thread};
 
-use lazy_static::lazy_static;
 use pin_utils::pin_mut;
 use tokio::runtime::{self, Runtime, RuntimeFlavor};
 
-lazy_static! {
-    // avoid openssl bug: https://github.com/openssl/openssl/issues/6214
-    // by dropping the runtime as early as possible
-    static ref RUNTIME: Mutex<Weak<Runtime>> = Mutex::new(Weak::new());
-}
+// avoid openssl bug: https://github.com/openssl/openssl/issues/6214
+// by dropping the runtime as early as possible
+static RUNTIME: LazyLock<Mutex<Weak<Runtime>>> = LazyLock::new(|| Mutex::new(Weak::new()));
 
 // On macOS libcrypto is linked via openssl-sys anyway, linking it here by name would pull in the
 // shared library even when openssl-sys links it statically.
 #[cfg_attr(not(target_os = "macos"), link(name = "crypto"))]
-extern "C" {
+unsafe extern "C" {
     fn OPENSSL_thread_stop();
 }
 
@@ -59,7 +56,7 @@ fn panic_on_bad_flavor(runtime: &runtime::Runtime) {
     match runtime.handle().runtime_flavor() {
         RuntimeFlavor::CurrentThread => (),
         RuntimeFlavor::MultiThread => (),
-        bad_flavor => panic!("unsupported tokio runtime flavor: \"{:#?}\"", bad_flavor),
+        bad_flavor => panic!("unsupported tokio runtime flavor: \"{bad_flavor:#?}\""),
     }
 }
 
@@ -143,7 +140,7 @@ pub fn block_in_place<R>(func: impl FnOnce() -> R) -> R {
         match runtime.runtime_flavor() {
             RuntimeFlavor::CurrentThread => func(),
             RuntimeFlavor::MultiThread => tokio::task::block_in_place(func),
-            bad_flavor => panic!("unsupported tokio runtime flavor: \"{:#?}\"", bad_flavor),
+            bad_flavor => panic!("unsupported tokio runtime flavor: \"{bad_flavor:#?}\""),
         }
     } else {
         func()
@@ -173,7 +170,7 @@ pub fn block_on<F: Future>(future: F) -> F::Output {
             RuntimeFlavor::MultiThread => {
                 tokio::task::block_in_place(move || block_on_local_future(future))
             }
-            bad_flavor => panic!("unsupported tokio runtime flavor: \"{:#?}\"", bad_flavor),
+            bad_flavor => panic!("unsupported tokio runtime flavor: \"{bad_flavor:#?}\""),
         }
     } else {
         let runtime = get_runtime();

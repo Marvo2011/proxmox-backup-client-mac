@@ -1,6 +1,8 @@
+#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+
 use std::fmt;
 
-use serde::{ser::SerializeStruct, Serialize, Serializer};
+use serde::{Serialize, Serializer, ser::SerializeStruct};
 
 #[doc(hidden)]
 pub use http::StatusCode;
@@ -59,12 +61,11 @@ macro_rules! http_bail {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
 
     #[test]
     fn test_http_err() {
         // Make sure the macro generates valid code.
-        http_err!(IM_A_TEAPOT, "Cannot brew coffee");
+        let _ = http_err!(IM_A_TEAPOT, "Cannot brew coffee");
     }
 
     #[test]

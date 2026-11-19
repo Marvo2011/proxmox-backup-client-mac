@@ -1,5 +1,6 @@
-use crate::context::{common, Context};
 use crate::Error;
+use crate::context::{Context, common};
+use crate::renderer::TemplateSource;
 use std::path::Path;
 
 fn lookup_mail_address(content: &str, user: &str) -> Option<String> {
@@ -51,17 +52,24 @@ impl Context for PVEContext {
     }
 
     fn default_config(&self) -> &'static str {
-        return DEFAULT_CONFIG;
+        DEFAULT_CONFIG
     }
 
     fn lookup_template(
         &self,
         filename: &str,
         namespace: Option<&str>,
+        source: TemplateSource,
     ) -> Result<Option<String>, Error> {
-        let path = Path::new("/usr/share/pve-manager/templates")
+        let path = match source {
+            TemplateSource::Vendor => "/usr/share/pve-manager/templates",
+            TemplateSource::Override => "/etc/pve/notification-templates",
+        };
+
+        let path = Path::new(&path)
             .join(namespace.unwrap_or("default"))
             .join(filename);
+
         let template_string = proxmox_sys::fs::file_read_optional_string(path)
             .map_err(|err| Error::Generic(format!("could not load template: {err}")))?;
         Ok(template_string)

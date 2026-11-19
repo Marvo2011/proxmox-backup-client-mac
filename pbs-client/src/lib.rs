@@ -7,7 +7,9 @@ pub mod catalog_shell;
 pub mod pxar;
 pub mod tools;
 
+mod inject_reused_chunks;
 mod merge_known_chunks;
+pub use merge_known_chunks::MergedChunkInfo;
 pub mod pipe_to_stream;
 
 mod http_client;
@@ -40,6 +42,12 @@ mod backup_specification;
 pub use backup_specification::*;
 
 mod chunk_stream;
-pub use chunk_stream::{ChunkStream, FixedChunkStream};
+pub use chunk_stream::{ChunkStream, FixedChunkStream, InjectionData};
+
+mod backup_stats;
+pub use backup_stats::BackupStats;
+
+mod log_throttle;
+pub use log_throttle::LogThrottle;
 
 pub const PROXMOX_BACKUP_TCP_KEEPALIVE_TIME: u32 = 120;

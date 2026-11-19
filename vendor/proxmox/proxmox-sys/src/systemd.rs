@@ -2,10 +2,9 @@ use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
 
-use anyhow::{bail, Error};
+use anyhow::{Error, bail};
 
 #[allow(clippy::manual_range_contains)]
-
 fn parse_hex_digit(d: u8) -> Result<u8, Error> {
     if d >= b'0' && d <= b'9' {
         return Ok(d - b'0');
@@ -20,6 +19,7 @@ fn parse_hex_digit(d: u8) -> Result<u8, Error> {
 }
 
 /// Escape strings for usage in systemd unit names
+#[deprecated = "use proxmox_systemd::escape_unit"]
 pub fn escape_unit<P: AsRef<[u8]>>(unit: P, is_path: bool) -> String {
     escape_unit_bytes(unit.as_ref(), is_path)
 }
@@ -50,7 +50,7 @@ fn escape_unit_bytes(mut unit: &[u8], is_path: bool) -> String {
                 || (*c >= b'a' && *c <= b'z'))
         {
             use std::fmt::Write as _;
-            let _ = write!(escaped, "\\x{:02x}", c);
+            let _ = write!(escaped, "\\x{c:02x}");
         } else {
             escaped.push(*c as char);
         }
@@ -59,11 +59,13 @@ fn escape_unit_bytes(mut unit: &[u8], is_path: bool) -> String {
 }
 
 /// Unescape strings used in systemd unit names
+#[deprecated = "use proxmox_systemd::unescape_unit"]
 pub fn unescape_unit(text: &str) -> Result<String, Error> {
     Ok(String::from_utf8(unescape_unit_do(text)?)?)
 }
 
 /// Unescape strings used in systemd unit names
+#[deprecated = "use proxmox_systemd::unescape_unit_path"]
 pub fn unescape_unit_path(text: &str) -> Result<PathBuf, Error> {
     Ok(OsString::from_vec(unescape_unit_do(text)?).into())
 }
@@ -88,7 +90,7 @@ fn unescape_unit_do(text: &str) -> Result<Vec<u8>, Error> {
             }
             let h1 = parse_hex_digit(i[2])?;
             let h0 = parse_hex_digit(i[3])?;
-            data.push(h1 << 4 | h0);
+            data.push((h1 << 4) | h0);
             i = &i[4..]
         } else if next == b'-' {
             data.push(b'/');

@@ -11,10 +11,7 @@ fn main() {
 
     let mut cc = cc::Build::new();
 
-    cc.pic(true)
-        .shared_flag(false)
-        .opt_level(3)
-        .flag("-DFUSE_USE_VERSION=35");
+    cc.pic(true).opt_level(3).flag("-DFUSE_USE_VERSION=35");
 
     for flag in ccflags.split_ascii_whitespace() {
         cc.flag(flag);

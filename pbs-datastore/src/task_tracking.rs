@@ -6,7 +6,7 @@ use std::iter::Sum;
 use std::path::PathBuf;
 
 use pbs_api_types::Operation;
-use proxmox_sys::fs::{file_read_optional_string, open_file_locked, replace_file, CreateOptions};
+use proxmox_sys::fs::{CreateOptions, file_read_optional_string, open_file_locked, replace_file};
 #[cfg(target_os = "linux")]
 use proxmox_sys::linux::procfs;
 use serde::{Deserialize, Serialize};
@@ -60,19 +60,14 @@ struct TaskOperations {
 }
 
 fn open_lock_file(name: &str) -> Result<(std::fs::File, CreateOptions), Error> {
-    let user = pbs_config::backup_user()?;
-
     let lock_path = PathBuf::from(format!("{}/{}.lock", crate::ACTIVE_OPERATIONS_DIR, name));
 
-    let options = CreateOptions::new()
-        .group(user.gid)
-        .owner(user.uid)
-        .perm(nix::sys::stat::Mode::from_bits_truncate(0o660));
+    let options = proxmox_product_config::lockfile_create_options();
 
     let timeout = std::time::Duration::new(10, 0);
 
     Ok((
-        open_file_locked(lock_path, timeout, true, options.clone())?,
+        open_file_locked(lock_path, timeout, true, options)?,
         options,
     ))
 }
@@ -131,6 +126,7 @@ pub fn update_active_operations(
         Operation::Write => ActiveOperationStats { read: 0, write: 1 },
         Operation::Lookup => ActiveOperationStats { read: 0, write: 0 },
     };
+    let mut found_entry = false;
     let mut updated_tasks: Vec<TaskOperations> = match file_read_optional_string(&path)? {
         Some(data) => serde_json::from_str::<Vec<TaskOperations>>(&data)?
             .iter_mut()
@@ -138,6 +134,7 @@ pub fn update_active_operations(
                 Some(starttime) if pid == task.pid && starttime != task.starttime => None,
                 Some(_) => {
                     if pid == task.pid {
+                        found_entry = true;
                         match operation {
                             Operation::Read => task.active_operations.read += count,
                             Operation::Write => task.active_operations.write += count,
@@ -153,7 +150,7 @@ pub fn update_active_operations(
         None => Vec::new(),
     };
 
-    if updated_tasks.is_empty() {
+    if !found_entry {
         updated_tasks.push(TaskOperations {
             pid,
             starttime,

@@ -14,15 +14,16 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::SystemTime;
 
-use anyhow::{format_err, Error, Result};
+use anyhow::{Error, Result, format_err};
 use endian_trait::Endian;
 use futures::ready;
+use libc::{S_IFDIR, S_IFLNK, S_IFREG};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use crc32fast::Hasher;
 use proxmox_time::gmtime;
 
-use crate::compression::{DeflateEncoder, Level};
+use crate::deflate::{DeflateEncoder, Level};
 
 const LOCAL_FH_SIG: u32 = 0x04034B50;
 const LOCAL_FF_SIG: u32 = 0x08074B50;
@@ -69,6 +70,13 @@ fn epoch_to_dos(epoch: i64) -> (u16, u16) {
     };
 
     (date, time)
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub enum FileType {
+    Directory,
+    Regular,
+    Symlink,
 }
 
 #[derive(Endian)]
@@ -202,16 +210,15 @@ pub struct ZipEntry {
     uncompressed_size: u64,
     compressed_size: u64,
     offset: u64,
-    is_file: bool,
     is_utf8_filename: bool,
 }
 
 impl ZipEntry {
     /// Creates a new ZipEntry
     ///
-    /// if is_file is false the path will contain an trailing separator,
+    /// if file_type is Directory, the path will contain a trailing separator,
     /// so that the zip file understands that it is a directory
-    pub fn new<P: AsRef<Path>>(path: P, mtime: i64, mode: u16, is_file: bool) -> Self {
+    pub fn new<P: AsRef<Path>>(path: P, mtime: i64, mut mode: u16, file_type: FileType) -> Self {
         let mut relpath = PathBuf::new();
 
         for comp in path.as_ref().components() {
@@ -220,12 +227,18 @@ impl ZipEntry {
             }
         }
 
-        if !is_file {
+        if file_type == FileType::Directory {
             relpath.push(""); // adds trailing slash
         }
 
         let filename: OsString = relpath.into();
         let is_utf8_filename = filename.to_str().is_some();
+
+        mode |= match file_type {
+            FileType::Regular => S_IFREG,
+            FileType::Directory => S_IFDIR,
+            FileType::Symlink => S_IFLNK,
+        } as u16;
 
         Self {
             filename,
@@ -235,7 +248,6 @@ impl ZipEntry {
             uncompressed_size: 0,
             compressed_size: 0,
             offset: 0,
-            is_file,
             is_utf8_filename,
         }
     }
@@ -342,6 +354,8 @@ impl ZipEntry {
             )
         };
 
+        let is_directory = (self.mode & S_IFDIR as u16) != 0;
+
         write_struct(
             &mut buf,
             CentralDirectoryFileHeader {
@@ -360,7 +374,7 @@ impl ZipEntry {
                 comment_len: 0,
                 start_disk: 0,
                 internal_flags: 0,
-                external_flags: (self.mode as u32) << 16 | (!self.is_file as u32) << 4,
+                external_flags: ((self.mode as u32) << 16) | ((is_directory as u32) << 4),
                 offset,
             },
         )
@@ -437,7 +451,7 @@ where
 /// use anyhow::{Error, Result};
 /// use tokio::fs::File;
 ///
-/// use proxmox_compression::zip::{ZipEncoder, ZipEntry};
+/// use proxmox_compression::zip::{FileType, ZipEncoder, ZipEntry};
 ///
 /// //#[tokio::main]
 /// async fn main_() -> Result<(), Error> {
@@ -449,7 +463,7 @@ where
 ///         "foo.txt",
 ///         0,
 ///         0o100755,
-///         true,
+///         FileType::Regular,
 ///     ), Some(source)).await?;
 ///
 ///     zip.finish().await?;
@@ -635,7 +649,7 @@ where
         let entry = match entry {
             Ok(entry) => entry,
             Err(err) => {
-                eprintln!("zip: error reading directory entry: {}", err);
+                eprintln!("zip: error reading directory entry: {err}");
                 continue;
             }
         };
@@ -644,7 +658,8 @@ where
         let encoder = &mut encoder;
 
         let entry = async move {
-            let entry_path_no_base = entry.path().strip_prefix(base_path)?;
+            let entrypath = entry.path();
+            let entry_path_no_base = entrypath.strip_prefix(base_path)?;
             let metadata = entry.metadata()?;
             let mtime = match metadata
                 .modified()
@@ -657,13 +672,18 @@ where
             let mode = metadata.mode() as u16;
 
             if entry.file_type().is_file() {
-                let file = tokio::fs::File::open(entry.path()).await?;
-                let ze = ZipEntry::new(entry_path_no_base, mtime, mode, true);
-                Ok(Some((ze, Some(file))))
+                let file = Box::new(tokio::fs::File::open(entrypath).await?);
+                let ze = ZipEntry::new(entry_path_no_base, mtime, mode, FileType::Regular);
+                Ok(Some((ze, Some::<Box<dyn AsyncRead + Send + Unpin>>(file))))
             } else if entry.file_type().is_dir() {
-                let ze = ZipEntry::new(entry_path_no_base, mtime, mode, false);
-                let content: Option<tokio::fs::File> = None;
-                Ok(Some((ze, content)))
+                let ze = ZipEntry::new(entry_path_no_base, mtime, mode, FileType::Directory);
+                Ok(Some((ze, None)))
+            } else if entry.file_type().is_symlink() {
+                let target: Box<dyn AsyncRead + Send + Unpin> = Box::new(io::Cursor::new(
+                    entrypath.read_link()?.into_os_string().into_encoded_bytes(),
+                ));
+                let ze = ZipEntry::new(entry_path_no_base, mtime, mode, FileType::Symlink);
+                Ok(Some((ze, Some(target))))
             } else {
                 // ignore other file types
                 Ok::<_, Error>(None)

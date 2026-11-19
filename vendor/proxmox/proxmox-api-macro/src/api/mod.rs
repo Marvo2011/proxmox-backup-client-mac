@@ -12,7 +12,7 @@ use std::convert::{TryFrom, TryInto};
 use anyhow::Error;
 
 use proc_macro2::{Span, TokenStream};
-use quote::{quote, quote_spanned, ToTokens};
+use quote::{ToTokens, quote, quote_spanned};
 use syn::parse::{Parse, ParseStream, Parser};
 use syn::spanned::Spanned;
 use syn::{Expr, ExprPath, Ident};
@@ -155,7 +155,7 @@ impl Schema {
         }
     }
 
-    fn to_typed_schema(&self, ts: &mut TokenStream) -> Result<(), Error> {
+    fn to_typed_schema(&self, ts: &mut TokenStream) -> Result<(), syn::Error> {
         self.item.to_schema(
             ts,
             self.description.as_ref(),
@@ -165,7 +165,7 @@ impl Schema {
         )
     }
 
-    fn to_schema(&self, ts: &mut TokenStream) -> Result<(), Error> {
+    fn to_schema(&self, ts: &mut TokenStream) -> Result<(), syn::Error> {
         self.item.to_schema(
             ts,
             self.description.as_ref(),
@@ -199,10 +199,15 @@ impl Schema {
             .and_then(|obj| obj.find_property_by_ident_mut(key))
     }
 
-    fn remove_obj_property_by_ident(&mut self, key: &str) -> bool {
+    fn find_obj_property_mut(&mut self, name: &str) -> Option<&mut ObjectEntry> {
+        self.as_object_mut()
+            .and_then(|obj| obj.find_property_mut(name))
+    }
+
+    fn remove_obj_property(&mut self, name: &str) -> bool {
         self.as_object_mut()
             .expect("tried to remove object property on non-object schema")
-            .remove_property_by_ident(key)
+            .remove_property(name)
     }
 
     // FIXME: Should we turn the property list into a map? We used to have no need to find keys in
@@ -232,6 +237,8 @@ pub enum SchemaItem {
     Number(Span),
     String(Span),
     Object(SchemaObject),
+    AllOf(SchemaAllOf),
+    OneOf(SchemaOneOf),
     Array(SchemaArray),
     ExternType(ExprPath),
     ExternSchema(Expr),
@@ -247,6 +254,8 @@ impl SchemaItem {
             SchemaItem::Number(span) => *span,
             SchemaItem::String(span) => *span,
             SchemaItem::Object(inner) => inner.span,
+            SchemaItem::AllOf(inner) => inner.span,
+            SchemaItem::OneOf(inner) => inner.span,
             SchemaItem::Array(inner) => inner.span,
             SchemaItem::ExternType(inner) => inner.span(),
             SchemaItem::ExternSchema(inner) => inner.span(),
@@ -267,6 +276,10 @@ impl SchemaItem {
             None => {
                 if obj.contains_key("properties") {
                     return Ok(SchemaItem::Object(SchemaObject::try_extract_from(obj)?));
+                } else if obj.contains_key("allOf") {
+                    return Ok(SchemaItem::AllOf(SchemaAllOf::try_extract_from(obj)?));
+                } else if obj.contains_key("oneOf") {
+                    return Ok(SchemaItem::OneOf(SchemaOneOf::try_extract_from(obj)?));
                 } else if obj.contains_key("items") {
                     return Ok(SchemaItem::Array(SchemaArray::try_extract_from(obj)?));
                 } else {
@@ -302,6 +315,10 @@ impl SchemaItem {
             Ok(SchemaItem::String(ty.span()))
         } else if name == "Object" {
             Ok(SchemaItem::Object(SchemaObject::try_extract_from(obj)?))
+        } else if name == "AllOf" {
+            Ok(SchemaItem::AllOf(SchemaAllOf::try_extract_from(obj)?))
+        } else if name == "OneOf" {
+            Ok(SchemaItem::OneOf(SchemaOneOf::try_extract_from(obj)?))
         } else if name == "Array" {
             Ok(SchemaItem::Array(SchemaArray::try_extract_from(obj)?))
         } else {
@@ -315,7 +332,7 @@ impl SchemaItem {
         description: Maybe<&syn::LitStr>,
         span: Span,
         properties: &[(Ident, syn::Expr)],
-    ) -> Result<bool, Error> {
+    ) -> Result<bool, syn::Error> {
         let check_description =
             move || description.ok_or_else(|| format_err!(span, "missing description"));
 
@@ -356,6 +373,50 @@ impl SchemaItem {
                 obj.to_schema_inner(&mut elems)?;
                 ts.extend(quote_spanned! { obj.span =>
                     ::proxmox_schema::ObjectSchema::new(#description, &[#elems])
+                });
+                if obj
+                    .additional_properties
+                    .as_ref()
+                    .is_some_and(|a| a.to_bool())
+                {
+                    ts.extend(quote_spanned! { obj.span => .additional_properties(true) });
+                }
+                if !obj.property_aliases.is_empty() {
+                    let pairs = obj.property_aliases.iter().map(|(alias, target)| {
+                        quote! { (#alias, #target) }
+                    });
+                    ts.extend(quote_spanned! { obj.span =>
+                        .property_aliases(&[#( #pairs ),*])
+                    });
+                }
+            }
+            SchemaItem::AllOf(all_of) => {
+                let description = check_description()?;
+                let mut list = TokenStream::new();
+                all_of.to_schema_inner(&mut list)?;
+                ts.extend(quote_spanned! { all_of.span =>
+                    ::proxmox_schema::AllOfSchema::new(#description, &[#list])
+                });
+            }
+            SchemaItem::OneOf(one_of) => {
+                let description = check_description()?;
+
+                let type_property = &one_of.type_property;
+
+                let mut type_property_schema = TokenStream::new();
+                one_of
+                    .type_property_schema
+                    .to_schema(&mut type_property_schema)?;
+
+                let mut list = TokenStream::new();
+                one_of.to_schema_inner(&mut list)?;
+
+                ts.extend(quote_spanned! { one_of.span =>
+                    ::proxmox_schema::OneOfSchema::new(
+                        #description,
+                        &(#type_property, false, &#type_property_schema),
+                        &[#list],
+                    )
                 });
             }
             SchemaItem::Array(array) => {
@@ -411,7 +472,7 @@ impl SchemaItem {
         span: Span,
         properties: &[(Ident, syn::Expr)],
         typed: bool,
-    ) -> Result<(), Error> {
+    ) -> Result<(), syn::Error> {
         if typed {
             let _: bool = self.to_inner_schema(ts, description, span, properties)?;
             return Ok(());
@@ -443,6 +504,7 @@ pub enum OptionType {
 
     /// An updater type uses its "base" type's field's updaters to determine whether the field is
     /// supposed to be an option.
+    #[allow(dead_code)]
     Updater(Box<syn::Type>),
 }
 
@@ -484,6 +546,9 @@ pub struct ObjectEntry {
     pub optional: OptionType,
     pub schema: Schema,
 
+    /// Some attributes, such as `#[cfg]`, need to also be added to the schema expression.
+    pub attrs: attributes::CheckedAttributes,
+
     /// This is only valid for methods. Methods should reset this to false after dealing with it,
     /// as encountering this during schema serialization will always cause an error.
     pub flatten: Option<Span>,
@@ -499,6 +564,7 @@ impl ObjectEntry {
             name,
             optional: optional.into(),
             schema,
+            attrs: Default::default(),
             flatten: None,
             flatten_in_struct: false,
         }
@@ -515,6 +581,53 @@ impl ObjectEntry {
 pub struct SchemaObject {
     span: Span,
     properties_: Vec<ObjectEntry>,
+    additional_properties: Option<AdditionalProperties>,
+    /// Deprecated property names that map to a canonical property, sorted by alias name.
+    property_aliases: Vec<(syn::LitStr, syn::LitStr)>,
+}
+
+#[derive(Clone)]
+pub enum AdditionalProperties {
+    /// `additional_properties: false`.
+    No,
+    /// `additional_properties: true`.
+    Ignored,
+    /// `additional_properties: "field_name"`.
+    Field(syn::LitStr),
+}
+
+impl TryFrom<JSONValue> for AdditionalProperties {
+    type Error = syn::Error;
+
+    fn try_from(value: JSONValue) -> Result<Self, Self::Error> {
+        let span = value.span();
+        if let JSONValue::Expr(syn::Expr::Lit(expr_lit)) = value {
+            match expr_lit.lit {
+                syn::Lit::Str(s) => return Ok(Self::Field(s)),
+                syn::Lit::Bool(b) => {
+                    return Ok(if b.value() { Self::Ignored } else { Self::No });
+                }
+                _ => (),
+            }
+        }
+        bail!(
+            span,
+            "invalid value for additional_properties, expected boolean or field name"
+        );
+    }
+}
+
+impl AdditionalProperties {
+    pub fn to_option_string(&self) -> Option<String> {
+        match self {
+            Self::Field(name) => Some(name.value()),
+            _ => None,
+        }
+    }
+
+    pub fn to_bool(&self) -> bool {
+        !matches!(self, Self::No)
+    }
 }
 
 impl SchemaObject {
@@ -522,10 +635,12 @@ impl SchemaObject {
         Self {
             span,
             properties_: Vec::new(),
+            additional_properties: None,
+            property_aliases: Vec::new(),
         }
     }
 
-    /// Check whether ther are any kind of fields defined in the struct, regardless of whether
+    /// Check whether there are any kind of fields defined in the struct, regardless of whether
     /// they're flattened or not.
     #[inline]
     pub fn is_empty(&self) -> bool {
@@ -546,6 +661,11 @@ impl SchemaObject {
     #[inline]
     fn properties_mut(&mut self) -> &mut [ObjectEntry] {
         &mut self.properties_
+    }
+
+    #[inline]
+    pub fn property_aliases(&self) -> &[(syn::LitStr, syn::LitStr)] {
+        &self.property_aliases
     }
 
     fn drain_filter<F>(&mut self, mut func: F) -> Vec<ObjectEntry>
@@ -571,50 +691,74 @@ impl SchemaObject {
     }
 
     fn try_extract_from(obj: &mut JSONObject) -> Result<Self, syn::Error> {
+        let mut property_aliases = Vec::new();
+        let properties_ = obj
+            .remove_required_element("properties")?
+            .into_object("object field definition")?
+            .into_iter()
+            .try_fold(
+                Vec::new(),
+                |mut properties, (key, value)| -> Result<_, syn::Error> {
+                    let mut schema: JSONObject =
+                        value.into_object("schema definition for field")?;
+
+                    if let Some(target) = schema.remove("alias") {
+                        if !schema.is_empty() {
+                            let extra = schema.keys().next().expect("non-empty checked above");
+                            bail!(
+                                extra.span(),
+                                "`alias` property entry must not carry other attributes \
+                                 (offending key: `{}`)",
+                                extra.as_str(),
+                            );
+                        }
+                        let target: syn::LitStr = target.try_into()?;
+                        let alias = syn::LitStr::new(key.as_str(), key.span());
+                        property_aliases.push((alias, target));
+                        return Ok(properties);
+                    }
+
+                    let optional: bool = schema
+                        .remove("optional")
+                        .map(|opt| -> Result<bool, syn::Error> {
+                            let v: syn::LitBool = opt.try_into()?;
+                            Ok(v.value)
+                        })
+                        .transpose()?
+                        .unwrap_or(false);
+
+                    let flatten: Option<Span> = schema
+                        .remove_entry("flatten")
+                        .map(|(field, value)| -> Result<(Span, bool), syn::Error> {
+                            let v: syn::LitBool = value.try_into()?;
+                            Ok((field.span(), v.value))
+                        })
+                        .transpose()?
+                        .and_then(|(span, value)| if value { Some(span) } else { None });
+
+                    properties.push(
+                        ObjectEntry::new(key, optional, schema.try_into()?).with_flatten(flatten),
+                    );
+
+                    Ok(properties)
+                },
+            )?;
+        property_aliases.sort_by(|a, b| a.0.value().cmp(&b.0.value()));
+
         let mut this = Self {
             span: obj.span(),
-            properties_: obj
-                .remove_required_element("properties")?
-                .into_object("object field definition")?
-                .into_iter()
-                .try_fold(
-                    Vec::new(),
-                    |mut properties, (key, value)| -> Result<_, syn::Error> {
-                        let mut schema: JSONObject =
-                            value.into_object("schema definition for field")?;
-
-                        let optional: bool = schema
-                            .remove("optional")
-                            .map(|opt| -> Result<bool, syn::Error> {
-                                let v: syn::LitBool = opt.try_into()?;
-                                Ok(v.value)
-                            })
-                            .transpose()?
-                            .unwrap_or(false);
-
-                        let flatten: Option<Span> = schema
-                            .remove_entry("flatten")
-                            .map(|(field, value)| -> Result<(Span, bool), syn::Error> {
-                                let v: syn::LitBool = value.try_into()?;
-                                Ok((field.span(), v.value))
-                            })
-                            .transpose()?
-                            .and_then(|(span, value)| if value { Some(span) } else { None });
-
-                        properties.push(
-                            ObjectEntry::new(key, optional, schema.try_into()?)
-                                .with_flatten(flatten),
-                        );
-
-                        Ok(properties)
-                    },
-                )?,
+            additional_properties: obj
+                .remove("additional_properties")
+                .map(AdditionalProperties::try_from)
+                .transpose()?,
+            property_aliases,
+            properties_,
         };
         this.sort_properties();
         Ok(this)
     }
 
-    fn to_schema_inner(&self, ts: &mut TokenStream) -> Result<(), Error> {
+    fn to_schema_inner(&self, ts: &mut TokenStream) -> Result<(), syn::Error> {
         for element in self.properties_.iter() {
             if element.flatten_in_struct {
                 continue;
@@ -630,9 +774,13 @@ impl SchemaObject {
 
             let key = element.name.as_str();
             let optional = &element.optional;
+            let attrs = &element.attrs;
             let mut schema = TokenStream::new();
             element.schema.to_schema(&mut schema)?;
-            ts.extend(quote! { (#key, #optional, &#schema), });
+            ts.extend(quote! {
+                #attrs
+                (#key, #optional, &#schema),
+            });
         }
         Ok(())
     }
@@ -649,11 +797,17 @@ impl SchemaObject {
             .find(|p| p.name.as_ident_str() == key)
     }
 
-    fn remove_property_by_ident(&mut self, key: &str) -> bool {
+    fn find_property_mut(&mut self, name: &str) -> Option<&mut ObjectEntry> {
+        self.properties_
+            .iter_mut()
+            .find(|p| p.name.as_str() == name)
+    }
+
+    fn remove_property(&mut self, name: &str) -> bool {
         match self
             .properties_
             .iter()
-            .position(|p| p.name.as_ident_str() == key)
+            .position(|p| p.name.as_str() == name)
         {
             Some(idx) => {
                 self.properties_.remove(idx);
@@ -666,6 +820,116 @@ impl SchemaObject {
     fn extend_properties(&mut self, new_fields: Vec<ObjectEntry>) {
         self.properties_.extend(new_fields);
         self.sort_properties();
+    }
+}
+
+#[derive(Clone)]
+/// Contains a list of subschemas which must be object schemas.
+pub struct SchemaAllOf {
+    span: Span,
+    list: Vec<Schema>,
+}
+
+impl SchemaAllOf {
+    /*
+    pub fn new(span: Span) -> Self {
+        Self {
+            span,
+            list: Vec::new(),
+        }
+    }
+    */
+
+    fn to_schema_inner(&self, ts: &mut TokenStream) -> Result<(), syn::Error> {
+        for schema in &self.list {
+            ts.extend(quote! { & });
+            schema.to_schema(ts)?;
+            ts.extend(quote! { , });
+        }
+        Ok(())
+    }
+
+    fn try_extract_from(obj: &mut JSONObject) -> Result<Self, syn::Error> {
+        Ok(Self {
+            span: obj.span(),
+            list: obj
+                .remove_required_element("allOf")?
+                .into_array("array of schema entries")?
+                .into_iter()
+                .try_fold(Vec::new(), |mut acc, item| {
+                    acc.push(item.try_into()?);
+                    Ok::<_, syn::Error>(acc)
+                })?,
+        })
+    }
+}
+
+#[derive(Clone)]
+/// Contains a list of subschemas which must be object schemas.
+pub struct SchemaOneOf {
+    span: Span,
+    type_property: syn::LitStr,
+    type_property_schema: Box<Schema>,
+    list: Vec<(syn::LitStr, Schema)>,
+}
+
+impl SchemaOneOf {
+    /*
+    pub fn new(span: Span, type_property: syn::LitStr, type_property_schema: Schema) -> Self {
+        Self {
+            span,
+            type_property,
+            type_property_schema: Box::new(type_property_schema),
+            list: Vec::new(),
+        }
+    }
+    */
+
+    fn to_schema_inner(&self, ts: &mut TokenStream) -> Result<(), syn::Error> {
+        for entry in &self.list {
+            let variant = &entry.0;
+            let mut schema = TokenStream::new();
+            entry.1.to_schema(&mut schema)?;
+            ts.extend(quote! { ( #variant, &#schema ), });
+        }
+        Ok(())
+    }
+
+    fn sort_variants(&mut self) {
+        self.list.sort_by(|a, b| (a.0.value()).cmp(&b.0.value()));
+    }
+
+    fn try_extract_from(obj: &mut JSONObject) -> Result<Self, syn::Error> {
+        let type_property: syn::LitStr =
+            obj.remove_required_element("type-property")?.try_into()?;
+
+        let type_property_schema: Schema = obj
+            .remove_required_element("type-property-schema")?
+            .try_into()?;
+
+        let mut list = Vec::new();
+        for item in obj
+            .remove_required_element("oneOf")?
+            .into_array("array of oneOf schema variants")?
+        {
+            let mut obj = item.into_object("oneOf schema entry")?;
+
+            let instance_type: syn::LitStr =
+                obj.remove_required_element("instance-type")?.try_into()?;
+
+            let schema: Schema = obj.try_into()?;
+
+            list.push((instance_type, schema));
+        }
+
+        let mut this = Self {
+            span: obj.span(),
+            type_property,
+            type_property_schema: Box::new(type_property_schema),
+            list,
+        };
+        this.sort_variants();
+        Ok(this)
     }
 }
 
@@ -683,9 +947,15 @@ impl SchemaArray {
         })
     }
 
-    fn to_schema(&self, ts: &mut TokenStream) -> Result<(), Error> {
+    fn to_schema(&self, ts: &mut TokenStream) -> Result<(), syn::Error> {
         self.item.to_schema(ts)
     }
+}
+
+/// Removes the attributes `#[api]` consumes itself, so that the item can be emitted as-is when the
+/// macro fails with a fatal error.
+pub(crate) fn strip_helper_attributes(item: TokenStream) -> TokenStream {
+    method::strip_state_attributes(item)
 }
 
 /// Parse `input`, `returns` and `protected` attributes out of an function annotated
@@ -702,4 +972,14 @@ pub(crate) fn api(attr: TokenStream, item: TokenStream) -> Result<TokenStream, E
         syn::Item::Enum(item) => enums::handle_enum(attribs, item),
         _ => bail!(item => "api macro only works on functions"),
     }
+}
+
+/// Directly convert a json schema into a `Schema` expression.
+pub(crate) fn json_schema(item: TokenStream) -> Result<TokenStream, Error> {
+    let attribs = JSONObject::parse_inner.parse2(item)?;
+    let schema: Schema = attribs.try_into()?;
+
+    let mut ts = TokenStream::new();
+    schema.to_schema(&mut ts)?;
+    Ok(ts)
 }

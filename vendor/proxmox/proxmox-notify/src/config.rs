@@ -3,11 +3,9 @@ use std::sync::OnceLock;
 use proxmox_schema::{ApiType, ObjectSchema};
 use proxmox_section_config::{SectionConfig, SectionConfigData, SectionConfigPlugin};
 
-use crate::filter::{FilterConfig, FILTER_TYPENAME};
-use crate::group::{GroupConfig, GROUP_TYPENAME};
-use crate::matcher::{MatcherConfig, MATCHER_TYPENAME};
-use crate::schema::BACKEND_NAME_SCHEMA;
 use crate::Error;
+use crate::matcher::{MATCHER_TYPENAME, MatcherConfig};
+use crate::schema::BACKEND_NAME_SCHEMA;
 
 /// Section config schema for the public config file.
 pub fn config_parser() -> &'static SectionConfig {
@@ -26,7 +24,7 @@ fn config_init() -> SectionConfig {
 
     #[cfg(feature = "sendmail")]
     {
-        use crate::endpoints::sendmail::{SendmailConfig, SENDMAIL_TYPENAME};
+        use crate::endpoints::sendmail::{SENDMAIL_TYPENAME, SendmailConfig};
 
         const SENDMAIL_SCHEMA: &ObjectSchema = SendmailConfig::API_SCHEMA.unwrap_object_schema();
         config.register_plugin(SectionConfigPlugin::new(
@@ -37,7 +35,7 @@ fn config_init() -> SectionConfig {
     }
     #[cfg(feature = "smtp")]
     {
-        use crate::endpoints::smtp::{SmtpConfig, SMTP_TYPENAME};
+        use crate::endpoints::smtp::{SMTP_TYPENAME, SmtpConfig};
 
         const SMTP_SCHEMA: &ObjectSchema = SmtpConfig::API_SCHEMA.unwrap_object_schema();
         config.register_plugin(SectionConfigPlugin::new(
@@ -48,7 +46,7 @@ fn config_init() -> SectionConfig {
     }
     #[cfg(feature = "gotify")]
     {
-        use crate::endpoints::gotify::{GotifyConfig, GOTIFY_TYPENAME};
+        use crate::endpoints::gotify::{GOTIFY_TYPENAME, GotifyConfig};
 
         const GOTIFY_SCHEMA: &ObjectSchema = GotifyConfig::API_SCHEMA.unwrap_object_schema();
         config.register_plugin(SectionConfigPlugin::new(
@@ -57,26 +55,23 @@ fn config_init() -> SectionConfig {
             GOTIFY_SCHEMA,
         ));
     }
+    #[cfg(feature = "webhook")]
+    {
+        use crate::endpoints::webhook::{WEBHOOK_TYPENAME, WebhookConfig};
+
+        const WEBHOOK_SCHEMA: &ObjectSchema = WebhookConfig::API_SCHEMA.unwrap_object_schema();
+        config.register_plugin(SectionConfigPlugin::new(
+            WEBHOOK_TYPENAME.to_string(),
+            Some(String::from("name")),
+            WEBHOOK_SCHEMA,
+        ));
+    }
 
     const MATCHER_SCHEMA: &ObjectSchema = MatcherConfig::API_SCHEMA.unwrap_object_schema();
     config.register_plugin(SectionConfigPlugin::new(
         MATCHER_TYPENAME.to_string(),
         Some(String::from("name")),
         MATCHER_SCHEMA,
-    ));
-
-    const GROUP_SCHEMA: &ObjectSchema = GroupConfig::API_SCHEMA.unwrap_object_schema();
-    config.register_plugin(SectionConfigPlugin::new(
-        GROUP_TYPENAME.to_string(),
-        Some(String::from("name")),
-        GROUP_SCHEMA,
-    ));
-
-    const FILTER_SCHEMA: &ObjectSchema = FilterConfig::API_SCHEMA.unwrap_object_schema();
-    config.register_plugin(SectionConfigPlugin::new(
-        FILTER_TYPENAME.to_string(),
-        Some(String::from("name")),
-        FILTER_SCHEMA,
     ));
 
     config
@@ -88,7 +83,7 @@ fn private_config_init() -> SectionConfig {
 
     #[cfg(feature = "gotify")]
     {
-        use crate::endpoints::gotify::{GotifyPrivateConfig, GOTIFY_TYPENAME};
+        use crate::endpoints::gotify::{GOTIFY_TYPENAME, GotifyPrivateConfig};
 
         const GOTIFY_SCHEMA: &ObjectSchema = GotifyPrivateConfig::API_SCHEMA.unwrap_object_schema();
         config.register_plugin(SectionConfigPlugin::new(
@@ -100,7 +95,7 @@ fn private_config_init() -> SectionConfig {
 
     #[cfg(feature = "smtp")]
     {
-        use crate::endpoints::smtp::{SmtpPrivateConfig, SMTP_TYPENAME};
+        use crate::endpoints::smtp::{SMTP_TYPENAME, SmtpPrivateConfig};
 
         const SMTP_SCHEMA: &ObjectSchema = SmtpPrivateConfig::API_SCHEMA.unwrap_object_schema();
         config.register_plugin(SectionConfigPlugin::new(
@@ -110,36 +105,26 @@ fn private_config_init() -> SectionConfig {
         ));
     }
 
+    #[cfg(feature = "webhook")]
+    {
+        use crate::endpoints::webhook::{WEBHOOK_TYPENAME, WebhookPrivateConfig};
+
+        const WEBHOOK_SCHEMA: &ObjectSchema =
+            WebhookPrivateConfig::API_SCHEMA.unwrap_object_schema();
+        config.register_plugin(SectionConfigPlugin::new(
+            WEBHOOK_TYPENAME.to_string(),
+            Some(String::from("name")),
+            WEBHOOK_SCHEMA,
+        ));
+    }
     config
 }
 
 pub fn config(raw_config: &str) -> Result<(SectionConfigData, [u8; 32]), Error> {
     let digest = openssl::sha::sha256(raw_config.as_bytes());
-    let mut data = config_parser()
+    let data = config_parser()
         .parse("notifications.cfg", raw_config)
         .map_err(|err| Error::ConfigDeserialization(err.into()))?;
-
-    // TODO: Remove this once this has been in production for a while.
-    // 'group' and 'filter' sections are remnants of the 'old'
-    // notification routing approach that already hit pvetest...
-    // This mechanism cleans out left-over entries.
-    let entries: Vec<GroupConfig> = data.convert_to_typed_array("group").unwrap_or_default();
-    if !entries.is_empty() {
-        log::warn!("clearing left-over 'group' entries from notifications.cfg");
-    }
-
-    for entry in entries {
-        data.sections.remove(&entry.name);
-    }
-
-    let entries: Vec<FilterConfig> = data.convert_to_typed_array("filter").unwrap_or_default();
-    if !entries.is_empty() {
-        log::warn!("clearing left-over 'filter' entries from notifications.cfg");
-    }
-
-    for entry in entries {
-        data.sections.remove(&entry.name);
-    }
 
     Ok((data, digest))
 }

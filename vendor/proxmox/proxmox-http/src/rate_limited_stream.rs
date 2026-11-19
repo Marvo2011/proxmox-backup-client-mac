@@ -2,21 +2,53 @@ use std::future::Future;
 use std::io::IoSlice;
 use std::marker::Unpin;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use hyper::client::connect::{Connected, Connection};
+use hyper_util::client::legacy::connect::{Connected, Connection};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::time::Sleep;
 
 use std::task::{Context, Poll};
 
-use super::{RateLimiter, ShareableRateLimit};
+use proxmox_rate_limiter::{RateLimiter, ShareableRateLimit};
 
 type SharedRateLimit = Arc<dyn ShareableRateLimit>;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RateLimiterTag {
+    User(String),
+}
+
+pub type RateLimiterTags = Vec<RateLimiterTag>;
+
+#[derive(Clone, Debug)]
+pub struct RateLimiterTagsHandle {
+    tags: Arc<Mutex<RateLimiterTags>>,
+    dirty: Arc<AtomicBool>,
+}
+
+impl RateLimiterTagsHandle {
+    fn new() -> Self {
+        Self {
+            tags: Arc::new(Mutex::new(Vec::new())),
+            dirty: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub fn lock(&self) -> std::sync::MutexGuard<'_, RateLimiterTags> {
+        self.tags.lock().unwrap()
+    }
+
+    pub fn set_tags(&self, tags: RateLimiterTags) {
+        *self.tags.lock().unwrap() = tags;
+        self.dirty.store(true, Ordering::Release);
+    }
+}
+
 pub type RateLimiterCallback =
-    dyn Fn() -> (Option<SharedRateLimit>, Option<SharedRateLimit>) + Send;
+    dyn Fn(&[RateLimiterTag]) -> (Option<SharedRateLimit>, Option<SharedRateLimit>) + Send;
 
 /// A rate limited stream using [RateLimiter]
 pub struct RateLimitedStream<S> {
@@ -26,6 +58,7 @@ pub struct RateLimitedStream<S> {
     write_delay: Option<Pin<Box<Sleep>>>,
     update_limiter_cb: Option<Box<RateLimiterCallback>>,
     last_limiter_update: Instant,
+    tag_handle: Option<RateLimiterTagsHandle>,
     stream: S,
 }
 
@@ -53,6 +86,7 @@ impl<S> RateLimitedStream<S> {
             write_delay: None,
             update_limiter_cb: None,
             last_limiter_update: Instant::now(),
+            tag_handle: None,
             stream,
         }
     }
@@ -64,12 +98,15 @@ impl<S> RateLimitedStream<S> {
     /// Note: This function is called within an async context, so it
     /// should be fast and must not block.
     pub fn with_limiter_update_cb<
-        F: Fn() -> (Option<SharedRateLimit>, Option<SharedRateLimit>) + Send + 'static,
+        F: Fn(&[RateLimiterTag]) -> (Option<SharedRateLimit>, Option<SharedRateLimit>)
+            + Send
+            + 'static,
     >(
         stream: S,
         update_limiter_cb: F,
     ) -> Self {
-        let (read_limiter, write_limiter) = update_limiter_cb();
+        let tag_handle = Some(RateLimiterTagsHandle::new());
+        let (read_limiter, write_limiter) = update_limiter_cb(&[]);
         Self {
             read_limiter,
             read_delay: None,
@@ -77,15 +114,29 @@ impl<S> RateLimitedStream<S> {
             write_delay: None,
             update_limiter_cb: Some(Box::new(update_limiter_cb)),
             last_limiter_update: Instant::now(),
+            tag_handle,
             stream,
         }
     }
 
     fn update_limiters(&mut self) {
         if let Some(ref update_limiter_cb) = self.update_limiter_cb {
-            if self.last_limiter_update.elapsed().as_secs() >= 5 {
+            let mut force_update = false;
+
+            if let Some(ref handle) = self.tag_handle {
+                if handle.dirty.swap(false, Ordering::Acquire) {
+                    force_update = true;
+                }
+            }
+
+            if force_update || self.last_limiter_update.elapsed().as_secs() >= 5 {
                 self.last_limiter_update = Instant::now();
-                let (read_limiter, write_limiter) = update_limiter_cb();
+                let (read_limiter, write_limiter) = if let Some(ref handle) = self.tag_handle {
+                    let tags = handle.lock();
+                    update_limiter_cb(&tags)
+                } else {
+                    update_limiter_cb(&[])
+                };
                 self.read_limiter = read_limiter;
                 self.write_limiter = write_limiter;
             }
@@ -99,9 +150,19 @@ impl<S> RateLimitedStream<S> {
     pub fn inner_mut(&mut self) -> &mut S {
         &mut self.stream
     }
+
+    pub fn tag_handle(&self) -> Option<Arc<Mutex<RateLimiterTags>>> {
+        self.tag_handle
+            .as_ref()
+            .map(|handle| Arc::clone(&handle.tags))
+    }
+
+    pub fn rate_limiter_tags_handle(&self) -> Option<&RateLimiterTagsHandle> {
+        self.tag_handle.as_ref()
+    }
 }
 
-fn register_traffic(limiter: &(dyn ShareableRateLimit), count: usize) -> Option<Pin<Box<Sleep>>> {
+fn register_traffic(limiter: &dyn ShareableRateLimit, count: usize) -> Option<Pin<Box<Sleep>>> {
     const MIN_DELAY: Duration = Duration::from_millis(10);
 
     let now = Instant::now();
@@ -116,7 +177,7 @@ fn register_traffic(limiter: &(dyn ShareableRateLimit), count: usize) -> Option<
 
 fn delay_is_ready(delay: &mut Option<Pin<Box<Sleep>>>, ctx: &mut Context<'_>) -> bool {
     match delay {
-        Some(ref mut future) => future.as_mut().poll(ctx).is_ready(),
+        Some(future) => future.as_mut().poll(ctx).is_ready(),
         None => true,
     }
 }

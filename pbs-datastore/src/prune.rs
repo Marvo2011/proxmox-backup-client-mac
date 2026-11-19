@@ -13,6 +13,7 @@ pub enum PruneMark {
     Keep,
     KeepPartial,
     Remove,
+    TimestampInFuture,
 }
 
 impl PruneMark {
@@ -32,6 +33,7 @@ impl std::fmt::Display for PruneMark {
             PruneMark::Keep => "keep",
             PruneMark::KeepPartial => "keep-partial",
             PruneMark::Remove => "remove",
+            PruneMark::TimestampInFuture => "timestamp-in-future",
         })
     }
 }
@@ -55,7 +57,7 @@ fn mark_selections<F: Fn(&BackupInfo) -> Result<String, Error>>(
 
     for info in list {
         let backup_id = info.backup_dir.relative_path();
-        if mark.get(&backup_id).is_some() {
+        if mark.contains_key(&backup_id) {
             continue;
         }
         if info.protected {
@@ -82,11 +84,21 @@ fn mark_selections<F: Fn(&BackupInfo) -> Result<String, Error>>(
     Ok(())
 }
 
-fn remove_incomplete_snapshots(mark: &mut HashMap<PathBuf, PruneMark>, list: &[BackupInfo]) {
+// Mark unfinished backup snapshots for removal, unless the newest and mark
+// all snapshots with a timestamp laying in the future as to be ignored.
+fn remove_incomplete_and_ignore_future(
+    mark: &mut HashMap<PathBuf, PruneMark>,
+    list: &[BackupInfo],
+) {
     let mut keep_unfinished = true;
+    let now = proxmox_time::epoch_i64();
+
     for info in list.iter() {
         // backup is considered unfinished if there is no manifest
-        if info.is_finished() {
+        if info.backup_dir.backup_time() > now {
+            let backup_id = info.backup_dir.relative_path();
+            mark.insert(backup_id, PruneMark::TimestampInFuture);
+        } else if info.is_finished() {
             // There is a new finished backup, so there is no need
             // to keep older unfinished backups.
             keep_unfinished = false;
@@ -112,7 +124,7 @@ pub fn compute_prune_info(
 
     BackupInfo::sort_list(&mut list, false);
 
-    remove_incomplete_snapshots(&mut mark, &list);
+    remove_incomplete_and_ignore_future(&mut mark, &list);
 
     if let Some(keep_last) = options.keep_last {
         mark_selections(&mut mark, &list, keep_last as usize, |info| {
@@ -124,13 +136,13 @@ pub fn compute_prune_info(
 
     if let Some(keep_hourly) = options.keep_hourly {
         mark_selections(&mut mark, &list, keep_hourly as usize, |info| {
-            strftime_local("%Y/%m/%d/%H", info.backup_dir.backup_time()).map_err(Error::from)
+            strftime_local("%Y/%m/%d/%H", info.backup_dir.backup_time())
         })?;
     }
 
     if let Some(keep_daily) = options.keep_daily {
         mark_selections(&mut mark, &list, keep_daily as usize, |info| {
-            strftime_local("%Y/%m/%d", info.backup_dir.backup_time()).map_err(Error::from)
+            strftime_local("%Y/%m/%d", info.backup_dir.backup_time())
         })?;
     }
 
@@ -138,19 +150,19 @@ pub fn compute_prune_info(
         mark_selections(&mut mark, &list, keep_weekly as usize, |info| {
             // Note: Use iso-week year/week here. This year number
             // might not match the calendar year number.
-            strftime_local("%G/%V", info.backup_dir.backup_time()).map_err(Error::from)
+            strftime_local("%G/%V", info.backup_dir.backup_time())
         })?;
     }
 
     if let Some(keep_monthly) = options.keep_monthly {
         mark_selections(&mut mark, &list, keep_monthly as usize, |info| {
-            strftime_local("%Y/%m", info.backup_dir.backup_time()).map_err(Error::from)
+            strftime_local("%Y/%m", info.backup_dir.backup_time())
         })?;
     }
 
     if let Some(keep_yearly) = options.keep_yearly {
         mark_selections(&mut mark, &list, keep_yearly as usize, |info| {
-            strftime_local("%Y", info.backup_dir.backup_time()).map_err(Error::from)
+            strftime_local("%Y", info.backup_dir.backup_time())
         })?;
     }
 

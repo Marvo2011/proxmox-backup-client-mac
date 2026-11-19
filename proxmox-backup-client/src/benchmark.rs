@@ -6,30 +6,30 @@ use serde::Serialize;
 use serde_json::Value;
 
 use proxmox_router::{
-    cli::{
-        default_table_format_options, format_and_print_result_full, get_output_format,
-        ColumnConfig, OUTPUT_FORMAT,
-    },
     ApiMethod, RpcEnvironment,
+    cli::{
+        ColumnConfig, OUTPUT_FORMAT, default_table_format_options, format_and_print_result_full,
+        get_output_format,
+    },
 };
-use proxmox_schema::{api, ApiType, ReturnType};
+use proxmox_schema::{ApiType, ReturnType, api};
 
 use pbs_api_types::{BackupNamespace, BackupType};
 use pbs_client::tools::key_source::get_encryption_key_password;
-use pbs_client::{BackupRepository, BackupWriter};
+use pbs_client::{BackupRepository, BackupWriter, BackupWriterOptions};
 use pbs_datastore::data_blob::{DataBlob, DataChunkBuilder};
-use pbs_key_config::{load_and_decrypt_key, KeyDerivationConfig};
+use pbs_key_config::{KeyDerivationConfig, load_and_decrypt_key};
 use pbs_tools::crypt_config::CryptConfig;
 
 use crate::{
-    connect, extract_repository_from_value, record_repository, KEYFILE_SCHEMA, REPO_URL_SCHEMA,
+    BackupRepositoryArgs, KEYFILE_SCHEMA, connect, extract_repository_from_value, record_repository,
 };
 
 #[api()]
 #[derive(Copy, Clone, Serialize)]
 /// Speed test result
 struct Speed {
-    /// The meassured speed in Bytes/second
+    /// The measured speed in Bytes/second
     #[serde(skip_serializing_if = "Option::is_none")]
     speed: Option<f64>,
     /// Top result we want to compare with
@@ -103,26 +103,33 @@ static BENCHMARK_RESULT_2020_TOP: BenchmarkResult = BenchmarkResult {
 };
 
 #[api(
-   input: {
-       properties: {
-           repository: {
-               schema: REPO_URL_SCHEMA,
-               optional: true,
-           },
-           keyfile: {
-               schema: KEYFILE_SCHEMA,
-               optional: true,
-           },
-           "output-format": {
-               schema: OUTPUT_FORMAT,
-               optional: true,
-           },
-       }
-   }
+    input: {
+        properties: {
+            repo: {
+                type: BackupRepositoryArgs,
+                flatten: true,
+            },
+            keyfile: {
+                schema: KEYFILE_SCHEMA,
+                optional: true,
+            },
+            "no-cache": {
+                type: Boolean,
+                description: "Bypass local datastore cache for network storages.",
+                optional: true,
+                default: false,
+            },
+            "output-format": {
+                schema: OUTPUT_FORMAT,
+                optional: true,
+            },
+        },
+    },
 )]
 /// Run benchmark tests
 pub async fn benchmark(
     param: Value,
+    no_cache: bool,
     _info: &ApiMethod,
     _rpcenv: &mut dyn RpcEnvironment,
 ) -> Result<(), Error> {
@@ -145,7 +152,7 @@ pub async fn benchmark(
 
     // do repo tests first, because this may prompt for a password
     if let Some(repo) = repo {
-        test_upload_speed(&mut benchmark_result, repo, crypt_config.clone()).await?;
+        test_upload_speed(&mut benchmark_result, repo, crypt_config.clone(), no_cache).await?;
     }
 
     test_crypt_speed(&mut benchmark_result)?;
@@ -221,6 +228,7 @@ async fn test_upload_speed(
     benchmark_result: &mut BenchmarkResult,
     repo: BackupRepository,
     crypt_config: Option<Arc<CryptConfig>>,
+    no_cache: bool,
 ) -> Result<(), Error> {
     let backup_time = proxmox_time::epoch_i64();
 
@@ -230,12 +238,15 @@ async fn test_upload_speed(
     log::debug!("Connecting to backup server");
     let client = BackupWriter::start(
         &client,
-        crypt_config.clone(),
-        repo.store(),
-        &BackupNamespace::root(),
-        &(BackupType::Host, "benchmark".to_string(), backup_time).into(),
-        false,
-        true,
+        BackupWriterOptions {
+            datastore: repo.store(),
+            ns: &BackupNamespace::root(),
+            backup: &(BackupType::Host, "benchmark".to_string(), backup_time).into(),
+            crypt_config: crypt_config.clone(),
+            debug: false,
+            benchmark: true,
+            no_cache,
+        },
     )
     .await?;
 
@@ -331,9 +342,10 @@ fn test_crypt_speed(benchmark_result: &mut BenchmarkResult) -> Result<(), Error>
     let start_time = std::time::Instant::now();
 
     let mut bytes = 0;
+    let mut out = Vec::new();
     loop {
-        let mut out = Vec::new();
         DataBlob::encrypt_benchmark(&crypt_config, &random_data, &mut out)?;
+        out.clear();
         bytes += random_data.len();
         if start_time.elapsed().as_micros() > 1_000_000 {
             break;

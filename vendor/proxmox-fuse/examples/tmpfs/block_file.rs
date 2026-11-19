@@ -7,6 +7,7 @@ pub struct Extent {
     data: Vec<u8>,
 }
 
+#[allow(dead_code)]
 enum SearchBias {
     Low,
     High,
@@ -14,7 +15,7 @@ enum SearchBias {
 
 pub struct BlockFile {
     extents: Vec<Extent>,
-    block_size: usize,
+    _block_size: usize,
     block_mask: u64,
     max_extent_size: usize,
 }
@@ -31,7 +32,7 @@ impl BlockFile {
 
         Self {
             extents: Vec::new(),
-            block_size,
+            _block_size: block_size,
             block_mask,
             max_extent_size,
         }

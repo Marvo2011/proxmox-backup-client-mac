@@ -2,7 +2,7 @@ use std::borrow::{Borrow, BorrowMut};
 use std::ops::{Deref, DerefMut};
 use std::os::unix::io::{AsRawFd, RawFd};
 
-use anyhow::{format_err, Error};
+use anyhow::{Error, format_err};
 use nix::dir;
 use nix::dir::Dir;
 use nix::fcntl::OFlag;
@@ -79,7 +79,7 @@ impl ReadDirEntry {
     /// It is up to the user to ensure that the file name is valid utf-8 *before* calling this
     /// method.
     pub unsafe fn file_name_utf8_unchecked(&self) -> &str {
-        std::str::from_utf8_unchecked(self.file_name().to_bytes())
+        unsafe { std::str::from_utf8_unchecked(self.file_name().to_bytes()) }
     }
 }
 
@@ -108,7 +108,7 @@ impl Iterator for ReadDir {
 /// Create an iterator over sub directory entries.
 /// This uses `openat` on `dirfd`, so `path` can be relative to that or an absolute path.
 pub fn read_subdir<P: ?Sized + nix::NixPath>(dirfd: RawFd, path: &P) -> nix::Result<ReadDir> {
-    let dir = Dir::openat(dirfd, path, OFlag::O_RDONLY, Mode::empty())?;
+    let dir = Dir::openat(Some(dirfd), path, OFlag::O_RDONLY, Mode::empty())?;
     let fd = dir.as_raw_fd();
     let iter = dir.into_iter();
     Ok(ReadDir { iter, dir_fd: fd })
@@ -171,7 +171,7 @@ where
 
     /// Filter by file name. Note that file names which aren't valid utf-8 will be treated as if
     /// they do not match the pattern.
-    fn filter_file_name_regex(self, regex: &Regex) -> FileNameRegexFilter<Self, T, E> {
+    fn filter_file_name_regex(self, regex: &Regex) -> FileNameRegexFilter<'_, Self, T, E> {
         FileNameRegexFilter { inner: self, regex }
     }
 }
@@ -345,7 +345,11 @@ pub fn get_file_type<P: ?Sized + nix::NixPath>(
     parent_fd: RawFd,
     path: &P,
 ) -> Result<nix::dir::Type, Error> {
-    let stat = nix::sys::stat::fstatat(parent_fd, path, nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW)?;
+    let stat = nix::sys::stat::fstatat(
+        Some(parent_fd),
+        path,
+        nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW,
+    )?;
     let file_type =
         file_type_from_file_stat(&stat).ok_or_else(|| format_err!("unable to detect file type"))?;
     Ok(file_type)

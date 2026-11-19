@@ -1,5 +1,5 @@
 use anyhow::Error;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use proxmox_router::cli::*;
 use proxmox_schema::api;
@@ -10,14 +10,14 @@ use pbs_tools::json::required_string_param;
 
 use pbs_api_types::UPID;
 
-use crate::{complete_repository, connect, extract_repository_from_value, REPO_URL_SCHEMA};
+use crate::{BackupRepositoryArgs, complete_repository, connect, extract_repository_from_value};
 
 #[api(
     input: {
         properties: {
-            repository: {
-                schema: REPO_URL_SCHEMA,
-                optional: true,
+            repo: {
+                type: BackupRepositoryArgs,
+                flatten: true,
             },
             limit: {
                 description: "The maximal number of tasks to list.",
@@ -87,9 +87,9 @@ async fn task_list(param: Value) -> Result<Value, Error> {
 #[api(
     input: {
         properties: {
-            repository: {
-                schema: REPO_URL_SCHEMA,
-                optional: true,
+            repo: {
+                type: BackupRepositoryArgs,
+                flatten: true,
             },
             upid: {
                 type: UPID,
@@ -112,9 +112,9 @@ async fn task_log(param: Value) -> Result<Value, Error> {
 #[api(
     input: {
         properties: {
-            repository: {
-                schema: REPO_URL_SCHEMA,
-                optional: true,
+            repo: {
+                type: BackupRepositoryArgs,
+                flatten: true,
             },
             upid: {
                 type: UPID,

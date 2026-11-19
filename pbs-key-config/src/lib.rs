@@ -1,15 +1,20 @@
 use std::io::Write;
+use std::os::fd::AsRawFd;
 use std::path::Path;
 
-use anyhow::{bail, format_err, Context, Error};
+use anyhow::{Context, Error, bail, format_err};
+use nix::sys::stat::Mode;
+use nix::unistd::{Gid, Uid};
 use serde::{Deserialize, Serialize};
 
 use proxmox_lang::try_block;
-use proxmox_sys::fs::{file_get_contents, replace_file, CreateOptions};
+use proxmox_sys::fs::{CreateOptions, file_get_contents, replace_file};
 
 use pbs_api_types::{Fingerprint, Kdf, KeyInfo};
 
 use pbs_tools::crypt_config::CryptConfig;
+
+const EXPECTED_KEY_LEN: usize = 32;
 
 /// Key derivation function configuration
 #[derive(Deserialize, Serialize, Clone, Debug)]
@@ -30,8 +35,8 @@ pub enum KeyDerivationConfig {
 
 impl KeyDerivationConfig {
     /// Derive a key from provided passphrase
-    pub fn derive_key(&self, passphrase: &[u8]) -> Result<[u8; 32], Error> {
-        let mut key = [0u8; 32];
+    pub fn derive_key(&self, passphrase: &[u8]) -> Result<[u8; EXPECTED_KEY_LEN], Error> {
+        let mut key = [0u8; EXPECTED_KEY_LEN];
 
         match self {
             KeyDerivationConfig::Scrypt { n, r, p, salt } => {
@@ -96,15 +101,15 @@ impl From<&KeyConfig> for KeyInfo {
 
 impl KeyConfig {
     /// Creates a new key using random data, protected by passphrase.
-    pub fn new(passphrase: &[u8], kdf: Kdf) -> Result<([u8; 32], Self), Error> {
-        let mut key = [0u8; 32];
+    pub fn new(passphrase: &[u8], kdf: Kdf) -> Result<([u8; EXPECTED_KEY_LEN], Self), Error> {
+        let mut key = [0u8; EXPECTED_KEY_LEN];
         proxmox_sys::linux::fill_with_random_data(&mut key)?;
         let key_config = Self::with_key(&key, passphrase, kdf)?;
         Ok((key, key_config))
     }
 
     /// Creates a new, unencrypted key.
-    pub fn without_password(raw_key: [u8; 32]) -> Result<Self, Error> {
+    pub fn without_password(raw_key: [u8; EXPECTED_KEY_LEN]) -> Result<Self, Error> {
         // always compute fingerprint
         let crypt_config = CryptConfig::new(raw_key)?;
         let fingerprint = Some(Fingerprint::new(crypt_config.fingerprint()));
@@ -121,11 +126,11 @@ impl KeyConfig {
     }
 
     /// Creates a new instance, protect raw_key with passphrase.
-    pub fn with_key(raw_key: &[u8; 32], passphrase: &[u8], kdf: Kdf) -> Result<Self, Error> {
-        if raw_key.len() != 32 {
-            bail!("got strange key length ({} != 32)", raw_key.len())
-        }
-
+    pub fn with_key(
+        raw_key: &[u8; EXPECTED_KEY_LEN],
+        passphrase: &[u8],
+        kdf: Kdf,
+    ) -> Result<Self, Error> {
         let salt = proxmox_sys::linux::random_data(32)?;
 
         let kdf = match kdf {
@@ -176,6 +181,18 @@ impl KeyConfig {
     pub fn load<P: AsRef<Path>>(path: P) -> Result<KeyConfig, Error> {
         let keydata = file_get_contents(path)?;
         let key_config: KeyConfig = serde_json::from_reader(&keydata[..])?;
+        if key_config.kdf.is_none() && key_config.data.len() != EXPECTED_KEY_LEN {
+            bail!(
+                "unexpected key length ({} != {EXPECTED_KEY_LEN})",
+                key_config.data.len()
+            )
+        } else if key_config.kdf.is_some() && key_config.data.len() < EXPECTED_KEY_LEN {
+            bail!(
+                "unexpected short data for key ({} < {EXPECTED_KEY_LEN})",
+                key_config.data.len()
+            );
+        }
+
         Ok(key_config)
     }
 
@@ -183,7 +200,7 @@ impl KeyConfig {
     pub fn decrypt(
         &self,
         passphrase: &dyn Fn() -> Result<Vec<u8>, Error>,
-    ) -> Result<([u8; 32], i64, Fingerprint), Error> {
+    ) -> Result<([u8; EXPECTED_KEY_LEN], i64, Fingerprint), Error> {
         let raw_data = &self.data;
 
         let key = if let Some(ref kdf) = self.kdf {
@@ -216,8 +233,12 @@ impl KeyConfig {
             raw_data.clone()
         };
 
-        let mut result = [0u8; 32];
-        result.copy_from_slice(&key);
+        let result: [u8; EXPECTED_KEY_LEN] = key.as_slice().try_into().map_err(|_err| {
+            format_err!(
+                "unexpected key length {} (expected {EXPECTED_KEY_LEN})",
+                key.len(),
+            )
+        })?;
 
         let crypt_config = CryptConfig::new(result)?;
         let fingerprint = Fingerprint::new(crypt_config.fingerprint());
@@ -236,24 +257,49 @@ impl KeyConfig {
 
     /// Store a KeyConfig to path
     pub fn store<P: AsRef<Path>>(&self, path: P, replace: bool) -> Result<(), Error> {
+        self.store_with(path, replace, None, None, None)
+    }
+
+    /// Store a KeyConfig to path with given ownership and mode.
+    /// Requires the process to run with permissions to do so.
+    pub fn store_with<P: AsRef<Path>>(
+        &self,
+        path: P,
+        replace: bool,
+        mode: Option<Mode>,
+        owner: Option<Uid>,
+        group: Option<Gid>,
+    ) -> Result<(), Error> {
         let path: &Path = path.as_ref();
 
         let data = serde_json::to_string(self)?;
 
         try_block!({
             if replace {
-                let mode = nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR;
-                replace_file(path, data.as_bytes(), CreateOptions::new().perm(mode), true)?;
+                let mode =
+                    mode.unwrap_or(nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR);
+                let mut create_options = CreateOptions::new().perm(mode);
+                if let Some(owner) = owner {
+                    create_options = create_options.owner(owner);
+                }
+                if let Some(group) = group {
+                    create_options = create_options.group(group);
+                }
+                replace_file(path, data.as_bytes(), create_options, true)?;
             } else {
                 use std::os::unix::fs::OpenOptionsExt;
-
+                let mode = mode.map(|m| m.bits()).unwrap_or(0o0600);
                 let mut file = std::fs::OpenOptions::new()
                     .write(true)
-                    .mode(0o0600)
+                    .mode(u32::from(mode))
                     .create_new(true)
                     .open(path)?;
 
                 file.write_all(data.as_bytes())?;
+
+                let fd = file.as_raw_fd();
+                nix::unistd::fchown(fd, owner, group)?;
+                nix::unistd::fsync(fd)?;
             }
 
             Ok(())
@@ -268,16 +314,16 @@ impl KeyConfig {
 pub fn load_and_decrypt_key(
     path: &std::path::Path,
     passphrase: &dyn Fn() -> Result<Vec<u8>, Error>,
-) -> Result<([u8; 32], i64, Fingerprint), Error> {
+) -> Result<([u8; EXPECTED_KEY_LEN], i64, Fingerprint), Error> {
     decrypt_key(&file_get_contents(path)?, passphrase)
-        .with_context(|| format!("failed to load decryption key from {:?}", path))
+        .with_context(|| format!("failed to load decryption key from {path:?}"))
 }
 
 /// Decrypt a KeyConfig from raw keydata.
 pub fn decrypt_key(
     mut keydata: &[u8],
     passphrase: &dyn Fn() -> Result<Vec<u8>, Error>,
-) -> Result<([u8; 32], i64, Fingerprint), Error> {
+) -> Result<([u8; EXPECTED_KEY_LEN], i64, Fingerprint), Error> {
     let key_config: KeyConfig = serde_json::from_reader(&mut keydata)?;
     key_config.decrypt(passphrase)
 }
@@ -302,7 +348,7 @@ pub fn rsa_decrypt_key_config(
     rsa: openssl::rsa::Rsa<openssl::pkey::Private>,
     key: &[u8],
     passphrase: &dyn Fn() -> Result<Vec<u8>, Error>,
-) -> Result<([u8; 32], i64, Fingerprint), Error> {
+) -> Result<([u8; EXPECTED_KEY_LEN], i64, Fingerprint), Error> {
     let mut buffer = vec![0u8; rsa.size() as usize];
     let decrypted = rsa
         .private_decrypt(key, &mut buffer, openssl::rsa::Padding::PKCS1)
@@ -350,6 +396,19 @@ fn encrypt_decrypt_test() -> Result<(), Error> {
     assert_eq!(key.created, created);
     assert_eq!(key.data, decrypted);
     assert_eq!(key.fingerprint, Some(fingerprint));
+
+    Ok(())
+}
+
+#[test]
+fn plain_key_length_check() -> Result<(), Error> {
+    let key: [u8; 32] = [0x11; 32];
+    let empty_passphrase = || -> Result<Vec<u8>, Error> { Ok(Vec::new()) };
+
+    let mut key_config = KeyConfig::without_password(key).unwrap();
+    assert!(key_config.decrypt(&empty_passphrase).is_ok());
+    key_config.data = vec![0x11; 31]; // short raw key data
+    assert!(key_config.decrypt(&empty_passphrase).is_err());
 
     Ok(())
 }

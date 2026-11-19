@@ -1,22 +1,21 @@
 //! Traffic Control Settings (Network rate limits)
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
 use anyhow::Error;
-use lazy_static::lazy_static;
 
 use proxmox_schema::{ApiType, Schema};
 
-use pbs_api_types::{TrafficControlRule, TRAFFIC_CONTROL_ID_SCHEMA};
+use pbs_api_types::{TRAFFIC_CONTROL_ID_SCHEMA, TrafficControlRule};
 
+use proxmox_product_config::replace_privileged_config;
 use proxmox_section_config::{SectionConfig, SectionConfigData, SectionConfigPlugin};
 
 use crate::ConfigVersionCache;
-use crate::{open_backup_lockfile, replace_backup_config, BackupLockGuard};
+use crate::{BackupLockGuard, open_backup_lockfile};
 
-lazy_static! {
-    /// Static [`SectionConfig`] to access parser/writer functions.
-    pub static ref CONFIG: SectionConfig = init();
-}
+/// Static [`SectionConfig`] to access parser/writer functions.
+pub static CONFIG: LazyLock<SectionConfig> = LazyLock::new(init);
 
 fn init() -> SectionConfig {
     let mut config = SectionConfig::new(&TRAFFIC_CONTROL_ID_SCHEMA);
@@ -54,7 +53,7 @@ pub fn config() -> Result<(SectionConfigData, [u8; 32]), Error> {
 /// Save the configuration file
 pub fn save_config(config: &SectionConfigData) -> Result<(), Error> {
     let raw = CONFIG.write(TRAFFIC_CONTROL_CFG_FILENAME, config)?;
-    replace_backup_config(TRAFFIC_CONTROL_CFG_FILENAME, raw.as_bytes())?;
+    replace_privileged_config(TRAFFIC_CONTROL_CFG_FILENAME, raw.as_bytes())?;
 
     // increase traffic control version
     // We use this in TrafficControlCache
@@ -87,7 +86,7 @@ mod test {
  timeframe fri 9:00-12:00
 ";
         let data = CONFIG.parse(TRAFFIC_CONTROL_CFG_FILENAME, content)?;
-        eprintln!("GOT {:?}", data);
+        eprintln!("GOT {data:?}");
 
         Ok(())
     }

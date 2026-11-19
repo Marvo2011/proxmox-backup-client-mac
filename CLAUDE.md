@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A macOS (Apple Silicon) port of the Proxmox Backup client (`proxmox-backup-client`) and the `pxar` tool. It is trimmed from the upstream proxmox-backup 3.2.4 workspace (commit `4940514b`): only the crates the client needs are included, and the server, web UI, docs and Debian packaging are not.
+A macOS (Apple Silicon) port of the Proxmox Backup client (`proxmox-backup-client`) and the `pxar` tool. It is trimmed from the upstream proxmox-backup 4.2.10 workspace (commit `1df6dff9`): only the crates the client needs are included, and the server, web UI, docs and Debian packaging are not.
 
 ## Commands
 
@@ -12,9 +12,9 @@ A macOS (Apple Silicon) port of the Proxmox Backup client (`proxmox-backup-clien
 cargo build --release -p proxmox-backup-client -p pxar-bin
 cargo test -p pbs-client -p pbs-datastore -p pbs-key-config -p pbs-pxar-fuse -p pxar-bin
 cargo test -p pbs-datastore --test index_mmap        # single integration test
-# vendored crates are not workspace members, test them via their manifest:
-cargo test --manifest-path vendor/proxmox/Cargo.toml -p proxmox-sys
-cargo fmt                                            # rustfmt.toml: edition 2021
+# vendored crates are tested through the workspace, which patches them in:
+cargo test -p proxmox-sys -p proxmox-time -p pathpatterns -p pxar --lib --tests
+cargo fmt                                            # rustfmt.toml: edition 2024
 cargo clippy
 ```
 
@@ -22,13 +22,13 @@ The build needs FUSE-T installed (https://www.fuse-t.org), because `proxmox-fuse
 
 ## Versioning
 
-The workspace version in `Cargo.toml` is the upstream version plus the release date of the port as build metadata, e.g. `3.2.4+20261119`. Bump the date for a new release and add a `## <version>` section to `CHANGELOG.md`: the workflow uses it as release notes and fails without it. Note user-visible changes there as they are made. The release workflow tags it as `v3.2.4-20261119`; pushes without a bump replace the binaries of the existing release. The workflow then writes the Homebrew formula (prebuilt binaries) to `<owner>/homebrew-tap`, if the `HOMEBREW_TAP_TOKEN` secret is set.
+The workspace version in `Cargo.toml` is the upstream version plus the release date of the port as build metadata, e.g. `4.2.10+20261119`. Bump the date for a new release and add a `## <version>` section to `CHANGELOG.md`: the workflow uses it as release notes and fails without it. Note user-visible changes there as they are made. The release workflow tags it as `v4.2.10-20261119`; pushes without a bump replace the binaries of the existing release. The workflow then writes the Homebrew formula (prebuilt binaries) to `<owner>/homebrew-tap`, if the `HOMEBREW_TAP_TOKEN` secret is set.
 
 ## Layout
 
 - `vendor/`: Proxmox crates (proxmox-sys, proxmox-time, pxar, proxmox-fuse, …) patched in via `.cargo/config.toml`, most with macOS changes. `vendor/README.md` lists the upstream commits and every local change. Keep it updated when changing vendored code.
 - `pbs-client`: backup protocol client and the pxar archiver (`src/pxar/create.rs`, `extract.rs`, `metadata.rs`, `flags.rs`).
-- `pbs-datastore`: index/blob formats used by the client. `pbs-config` and the datastore server paths compile here but are not used. Linux-only parts are stubbed (`config_version_cache_stub.rs`, `task_tracking.rs`).
+- `pbs-datastore`: index/blob formats used by the client (`pbs-api-types` comes from proxmox.git in `vendor/`). `pbs-config` and the datastore server paths compile here but are not used. Linux-only parts are stubbed (`config_version_cache_stub.rs`, `task_tracking.rs`).
 - `pbs-pxar-fuse` (`mount`) and `pbs-fuse-loop` (`map`, using `hdiutil` on macOS in `src/hdiutil.rs`).
 - `proxmox-backup-client`, `pxar-bin`: the binaries.
 
@@ -36,8 +36,8 @@ The workspace version in `Cargo.toml` is the upstream version plus the release d
 
 - Platform code uses `#[cfg(target_os = "linux")]` / `"macos"`, and the Linux code paths stay unchanged. This keeps the changes reviewable against upstream and makes it possible to send them upstream.
 - Archive format compatibility with Linux matters: archives created on macOS must restore on Linux and vice versa.
-- macOS specifics that came up: `mode_t` is `u16`, `dev_t` is `i32` (8 bit major / 24 bit minor), `ENOTSUP` != `EOPNOTSUPP`, `ENOATTR` instead of `ENODATA`, 16 KiB pages (mmap offsets must be page aligned), no `/proc`, `O_PATH`, `O_TMPFILE`, `statfs64`, `renameat2`, `epoll`.
-- Metadata is restored through `F_GETPATH` paths with no-follow syscalls (`metadata.rs`). The archiver only opens regular files and directories (`create.rs`), and other file types get stat-only metadata.
+- macOS specifics that came up: `mode_t` is `u16`, `dev_t` is `i32` (8 bit major / 24 bit minor), `ENOTSUP` != `EOPNOTSUPP`, `ENOATTR` instead of `ENODATA`, 16 KiB pages (mmap offsets must be page aligned), no `/proc`, `O_PATH`, `O_TMPFILE`, `statfs64`, `renameat2`, `openat2`, `mremap`, `pipe2`, `epoll`, libsystemd. `RLIMIT_NOFILE` cannot be raised to `RLIM_INFINITY` (`kern.maxfilesperproc` is the limit).
+- Metadata is restored through `F_GETPATH` paths with no-follow syscalls (`metadata.rs`). The archiver opens regular files and directories, symlinks with `O_SYMLINK` (target read via `F_GETPATH` and `readlink`). Other file types are not opened, they get stat-only metadata and a duplicate of the parent directory fd as placeholder, as the lookahead cache of the metadata change detection holds an fd per entry (`create.rs`).
 - FUSE-T peculiarities, handled in `proxmox-fuse` and `pbs-pxar-fuse`:
   - It retries `EAGAIN` inside `fuse_session_receive_buf`, so input is checked with `poll` first.
   - It looks up `.`/`..` explicitly.

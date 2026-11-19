@@ -2,45 +2,127 @@ use std::io::{IsTerminal, Write};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
-use anyhow::{bail, format_err, Error};
+use anyhow::{Error, bail, format_err};
+use bytes::Bytes;
 use futures::*;
-use http::header::HeaderValue;
-use http::Uri;
-use http::{Request, Response};
-use hyper::client::{Client, HttpConnector};
-use hyper::Body;
+use http_body_util::{BodyDataStream, BodyExt};
+use hyper::body::Incoming;
+use hyper::header::SET_COOKIE;
+use hyper::http::Uri;
+use hyper::http::header::HeaderValue;
+use hyper::http::{Request, Response};
+#[cfg(not(target_feature = "crt-static"))]
+use hyper_util::client::legacy::connect::dns::GaiResolver;
+use hyper_util::client::legacy::{Client, connect::HttpConnector};
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use openssl::{
     ssl::{SslConnector, SslMethod},
     x509::X509StoreContextRef,
 };
 use percent_encoding::percent_encode;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use xdg::BaseDirectories;
 
 use proxmox_router::HttpError;
-use proxmox_sys::fs::{file_get_json, replace_file, CreateOptions};
+use proxmox_sys::fs::{CreateOptions, file_get_json, replace_file};
 use proxmox_sys::linux::tty;
 
 use proxmox_async::broadcast_future::BroadcastFuture;
+use proxmox_http::Body;
+use proxmox_http::ProxyConfig;
 use proxmox_http::client::HttpsConnector;
 use proxmox_http::uri::{build_authority, json_object_to_query};
-use proxmox_http::{ProxyConfig, RateLimiter};
+use proxmox_log::{error, info, warn};
+use proxmox_rate_limiter::RateLimiter;
 
 use pbs_api_types::percent_encoding::DEFAULT_ENCODE_SET;
 use pbs_api_types::{Authid, RateLimitConfig, Userid};
 
-use super::pipe_to_stream::PipeToSendStream;
 use super::PROXMOX_BACKUP_TCP_KEEPALIVE_TIME;
+use super::pipe_to_stream::PipeToSendStream;
+
+#[cfg(not(target_feature = "crt-static"))]
+type DnsResolver = GaiResolver;
+
+#[cfg(target_feature = "crt-static")]
+type DnsResolver = resolver::HickoryDnsResolver;
+
+#[cfg(target_feature = "crt-static")]
+mod resolver {
+    use std::net::SocketAddr;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::task::{Context, Poll};
+
+    use futures::Future;
+    use hickory_resolver::TokioAsyncResolver;
+    use hickory_resolver::error::ResolveError;
+    use hickory_resolver::lookup_ip::LookupIpIntoIter;
+    use hyper_util::client::legacy::connect::dns::Name;
+    use tower_service::Service;
+
+    pub(crate) struct SocketAddrIter {
+        inner: LookupIpIntoIter,
+    }
+
+    impl Iterator for SocketAddrIter {
+        type Item = SocketAddr;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            self.inner.next().map(|ip_addr| SocketAddr::new(ip_addr, 0))
+        }
+    }
+
+    #[derive(Clone)]
+    pub(crate) struct HickoryDnsResolver {
+        inner: Arc<TokioAsyncResolver>,
+    }
+
+    impl HickoryDnsResolver {
+        pub(crate) fn new() -> Self {
+            Self {
+                inner: Arc::new(TokioAsyncResolver::tokio_from_system_conf().unwrap()),
+            }
+        }
+    }
+
+    impl Service<Name> for HickoryDnsResolver {
+        type Response = SocketAddrIter;
+        type Error = ResolveError;
+        type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+        fn poll_ready(&mut self, _ctx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, name: Name) -> Self::Future {
+            let inner = self.inner.clone();
+            Box::pin(async move {
+                inner
+                    .lookup_ip(name.as_str())
+                    .await
+                    .map(|r| SocketAddrIter {
+                        inner: r.into_iter(),
+                    })
+            })
+        }
+    }
+}
 
 /// Timeout used for several HTTP operations that are expected to finish quickly but may block in
 /// certain error conditions. Keep it generous, to avoid false-positive under high load.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(2 * 60);
+
+const PROXMOX_BACKUP_AUTH_COOKIE: &str = "PBSAuthCookie";
+const PROXMOX_BACKUP_PREFIXED_AUTH_COOKIE: &str = "__Host-PBSAuthCookie";
 
 #[derive(Clone)]
 pub struct AuthInfo {
     pub auth_id: Authid,
     pub ticket: String,
     pub token: String,
+    // Whether the server uses HttpOnly cookies for authentication
+    pub http_only: bool,
 }
 
 pub struct HttpClientOptions {
@@ -52,6 +134,7 @@ pub struct HttpClientOptions {
     fingerprint_cache: bool,
     verify_cert: bool,
     limit: RateLimitConfig,
+    proxy: Option<ProxyConfig>,
 }
 
 impl HttpClientOptions {
@@ -114,6 +197,11 @@ impl HttpClientOptions {
         self.limit = rate_limit;
         self
     }
+
+    pub fn proxy(mut self, proxy: Option<ProxyConfig>) -> Self {
+        self.proxy = proxy;
+        self
+    }
 }
 
 impl Default for HttpClientOptions {
@@ -127,13 +215,14 @@ impl Default for HttpClientOptions {
             fingerprint_cache: false,
             verify_cert: true,
             limit: RateLimitConfig::default(), // unlimited
+            proxy: None,
         }
     }
 }
 
 /// HTTP(S) API client
 pub struct HttpClient {
-    client: Client<HttpsConnector>,
+    client: Client<HttpsConnector<DnsResolver>, Body>,
     server: String,
     port: u16,
     fingerprint: Arc<Mutex<Option<String>>>,
@@ -155,7 +244,11 @@ pub fn delete_ticket_info(prefix: &str, server: &str, username: &Userid) -> Resu
     let mut data = file_get_json(&path, Some(json!({})))?;
 
     if let Some(map) = data[server].as_object_mut() {
-        map.remove(username.as_str());
+        if map.remove(username.as_str()).is_none() {
+            warn!("no ticket found for {username} on server {server}");
+        }
+    } else {
+        warn!("no ticket found for server {server}");
     }
 
     replace_file(
@@ -299,8 +392,8 @@ fn build_uri(server: &str, port: u16, path: &str, query: Option<String>) -> Resu
         .scheme("https")
         .authority(build_authority(server, port)?)
         .path_and_query(match query {
-            Some(query) => format!("/{}?{}", path, query),
-            None => format!("/{}", path),
+            Some(query) => format!("/{path}?{query}"),
+            None => format!("/{path}"),
         })
         .build()
         .map_err(|err| format_err!("error building uri - {}", err))
@@ -344,18 +437,18 @@ impl HttpClient {
                 ) {
                     Ok(None) => true,
                     Ok(Some(fingerprint)) => {
-                        if fingerprint_cache && prefix.is_some() {
-                            if let Err(err) =
-                                store_fingerprint(prefix.as_ref().unwrap(), &server, &fingerprint)
-                            {
-                                log::error!("{}", err);
+                        if fingerprint_cache {
+                            if let Some(ref prefix) = prefix {
+                                if let Err(err) = store_fingerprint(prefix, &server, &fingerprint) {
+                                    error!("{}", err);
+                                }
                             }
                         }
                         *verified_fingerprint.lock().unwrap() = Some(fingerprint);
                         true
                     }
                     Err(err) => {
-                        log::error!("certificate validation failed - {}", err);
+                        error!("certificate validation failed - {}", err);
                         false
                     }
                 },
@@ -364,7 +457,8 @@ impl HttpClient {
             ssl_connector_builder.set_verify(openssl::ssl::SslVerifyMode::NONE);
         }
 
-        let mut httpc = HttpConnector::new();
+        let resolver = DnsResolver::new();
+        let mut httpc = HttpConnector::new_with_resolver(resolver);
         httpc.set_nodelay(true); // important for h2 download performance!
         httpc.enforce_http(false); // we want https...
 
@@ -391,13 +485,15 @@ impl HttpClient {
             )))));
         }
 
-        let proxy_config = ProxyConfig::from_proxy_env()?;
+        let proxy_config = options.proxy.clone();
+        let proxy_config = proxy_config.or(ProxyConfig::from_proxy_env()?);
+
         if let Some(config) = proxy_config {
-            log::info!("Using proxy connection: {}:{}", config.host, config.port);
+            info!("Using proxy connection: {}:{}", config.host, config.port);
             https.set_proxy(config);
         }
 
-        let client = Client::builder()
+        let client = Client::builder(TokioExecutor::new())
             //.http2_initial_stream_window_size( (1 << 31) - 2)
             //.http2_initial_connection_window_size( (1 << 31) - 2)
             .build::<_, Body>(https);
@@ -428,6 +524,7 @@ impl HttpClient {
             auth_id: auth_id.clone(),
             ticket: password.clone(),
             token: "".to_string(),
+            http_only: false,
         }));
 
         let server2 = server.to_string();
@@ -452,24 +549,25 @@ impl HttpClient {
                 .await
                 {
                     Ok(auth) => {
-                        if use_ticket_cache && prefix2.is_some() {
-                            if let Err(err) = store_ticket_info(
-                                prefix2.as_ref().unwrap(),
-                                &server2,
-                                &auth.auth_id.to_string(),
-                                &auth.ticket,
-                                &auth.token,
-                            ) {
-                                if std::io::stdout().is_terminal() {
-                                    log::error!("storing login ticket failed: {}", err);
+                        if use_ticket_cache {
+                            if let Some(ref prefix) = prefix2 {
+                                if let Err(err) = store_ticket_info(
+                                    prefix,
+                                    &server2,
+                                    &auth.auth_id.to_string(),
+                                    &auth.ticket,
+                                    &auth.token,
+                                ) {
+                                    if std::io::stdout().is_terminal() {
+                                        error!("storing login ticket failed: {}", err);
+                                    }
                                 }
                             }
                         }
                         *auth2.write().unwrap() = auth;
                     }
                     Err(err) => {
-                        log::error!("re-authentication failed: {}", err);
-                        return;
+                        error!("re-authentication failed: {}", err);
                     }
                 }
             }
@@ -490,19 +588,22 @@ impl HttpClient {
             let authinfo = auth.clone();
 
             move |auth| {
-                if use_ticket_cache && prefix.is_some() {
-                    if let Err(err) = store_ticket_info(
-                        prefix.as_ref().unwrap(),
-                        &server,
-                        &auth.auth_id.to_string(),
-                        &auth.ticket,
-                        &auth.token,
-                    ) {
-                        if std::io::stdout().is_terminal() {
-                            log::error!("storing login ticket failed: {}", err);
+                if use_ticket_cache {
+                    if let Some(ref prefix) = prefix {
+                        if let Err(err) = store_ticket_info(
+                            prefix,
+                            &server,
+                            &auth.auth_id.to_string(),
+                            &auth.ticket,
+                            &auth.token,
+                        ) {
+                            if std::io::stdout().is_terminal() {
+                                error!("storing login ticket failed: {}", err);
+                            }
                         }
                     }
                 }
+
                 *authinfo.write().unwrap() = auth;
                 tokio::spawn(renewal_future);
             }
@@ -526,7 +627,9 @@ impl HttpClient {
             _options: options,
         })
     }
+}
 
+impl HttpClient {
     /// Login
     ///
     /// Login is done on demand, so this is only required if you need
@@ -551,7 +654,7 @@ impl HttpClient {
     fn get_password(username: &Userid, interactive: bool) -> Result<String, Error> {
         // If we're on a TTY, query the user for a password
         if interactive && std::io::stdin().is_terminal() {
-            let msg = format!("Password for \"{}\": ", username);
+            let msg = format!("Password for \"{username}\": ");
             return Ok(String::from_utf8(tty::read_password(&msg)?)?);
         }
 
@@ -601,14 +704,14 @@ impl HttpClient {
             if expected_fingerprint == fp_string {
                 return Ok(Some(fp_string));
             } else {
-                log::warn!("WARNING: certificate fingerprint does not match expected fingerprint!");
-                log::warn!("expected:    {}", expected_fingerprint);
+                warn!("WARNING: certificate fingerprint does not match expected fingerprint!");
+                warn!("expected:    {}", expected_fingerprint);
             }
         }
 
         // If we're on a TTY, query the user
         if interactive && std::io::stdin().is_terminal() {
-            log::info!("fingerprint: {}", fp_string);
+            info!("fingerprint: {}", fp_string);
             loop {
                 eprint!("Are you sure you want to continue connecting? (y/n): ");
                 let _ = std::io::stdout().flush();
@@ -648,10 +751,18 @@ impl HttpClient {
                 HeaderValue::from_str(&enc_api_token).unwrap(),
             );
         } else {
+            let cookie_name = if auth.http_only {
+                // server has switched to http only flow, provide ticket in properly prefixed cookie
+                PROXMOX_BACKUP_PREFIXED_AUTH_COOKIE
+            } else {
+                PROXMOX_BACKUP_AUTH_COOKIE
+            };
+
             let enc_ticket = format!(
-                "PBSAuthCookie={}",
+                "{cookie_name}={}",
                 percent_encode(auth.ticket.as_bytes(), DEFAULT_ENCODE_SET)
             );
+
             req.headers_mut()
                 .insert("Cookie", HeaderValue::from_str(&enc_ticket).unwrap());
             req.headers_mut().insert(
@@ -690,10 +801,18 @@ impl HttpClient {
 
         let auth = self.login().await?;
 
+        let cookie_name = if auth.http_only {
+            // server has switched to http only flow, provide ticket in properly prefixed cookie
+            PROXMOX_BACKUP_PREFIXED_AUTH_COOKIE
+        } else {
+            PROXMOX_BACKUP_AUTH_COOKIE
+        };
+
         let enc_ticket = format!(
-            "PBSAuthCookie={}",
+            "{cookie_name}={}",
             percent_encode(auth.ticket.as_bytes(), DEFAULT_ENCODE_SET)
         );
+
         req.headers_mut()
             .insert("Cookie", HeaderValue::from_str(&enc_ticket).unwrap());
 
@@ -706,8 +825,7 @@ impl HttpClient {
                 .map(|_| Err(format_err!("unknown error")))
                 .await?
         } else {
-            resp.into_body()
-                .map_err(Error::from)
+            futures::TryStreamExt::map_err(BodyDataStream::new(resp.into_body()), Error::from)
                 .try_fold(output, move |acc, chunk| async move {
                     acc.write_all(&chunk)?;
                     Ok::<_, Error>(acc)
@@ -760,10 +878,18 @@ impl HttpClient {
                 HeaderValue::from_str(&enc_api_token).unwrap(),
             );
         } else {
+            let cookie_name = if auth.http_only {
+                // server has switched to http only flow, provide ticket in properly prefixed cookie
+                PROXMOX_BACKUP_PREFIXED_AUTH_COOKIE
+            } else {
+                PROXMOX_BACKUP_AUTH_COOKIE
+            };
+
             let enc_ticket = format!(
-                "PBSAuthCookie={}",
+                "{cookie_name}={}",
                 percent_encode(auth.ticket.as_bytes(), DEFAULT_ENCODE_SET)
             );
+
             req.headers_mut()
                 .insert("Cookie", HeaderValue::from_str(&enc_ticket).unwrap());
             req.headers_mut().insert(
@@ -782,12 +908,12 @@ impl HttpClient {
             .map_err(|_| format_err!("http upgrade request timed out"))??;
         let status = resp.status();
 
-        if status != http::StatusCode::SWITCHING_PROTOCOLS {
+        if status != hyper::http::StatusCode::SWITCHING_PROTOCOLS {
             Self::api_response(resp).await?;
             bail!("unknown error");
         }
 
-        let upgraded = hyper::upgrade::on(resp).await?;
+        let upgraded = TokioIo::new(hyper::upgrade::on(resp).await?);
 
         let max_window_size = (1 << 31) - 2;
 
@@ -798,7 +924,7 @@ impl HttpClient {
             .handshake(upgraded)
             .await?;
 
-        let connection = connection.map_err(|_| log::error!("HTTP/2.0 connection failed"));
+        let connection = connection.map_err(|_| error!("HTTP/2.0 connection failed"));
 
         let (connection, abort) = futures::future::abortable(connection);
         // A cancellable future returns an Option which is None when cancelled and
@@ -815,7 +941,7 @@ impl HttpClient {
     }
 
     async fn credentials(
-        client: Client<HttpsConnector>,
+        client: Client<HttpsConnector<DnsResolver>, Body>,
         server: String,
         port: u16,
         username: Userid,
@@ -829,22 +955,51 @@ impl HttpClient {
             "/api2/json/access/ticket",
             Some(data),
         )?;
-        let cred = Self::api_request(client, req).await?;
+
+        let res = tokio::time::timeout(HTTP_TIMEOUT, client.request(req))
+            .await
+            .map_err(|_| format_err!("http request timed out"))??;
+
+        // check if the headers contain a newer HttpOnly cookie
+        let http_only_ticket = res
+            .headers()
+            .get_all(SET_COOKIE)
+            .iter()
+            .filter_map(|c| c.to_str().ok())
+            .filter_map(|c| match (c.find('='), c.find(';')) {
+                (Some(begin), Some(end))
+                    if begin < end && &c[..begin] == PROXMOX_BACKUP_PREFIXED_AUTH_COOKIE =>
+                {
+                    Some(c[begin + 1..end].to_string())
+                }
+                _ => None,
+            })
+            .next();
+
+        // if the headers contained a new HttpOnly cookie, the server switched to providing these
+        // by default. this means that older cookies may no longer be supported, so switch to using
+        // the new cookie name.
+        let http_only = http_only_ticket.is_some();
+
+        let cred = Self::api_response(res).await?;
         let auth = AuthInfo {
             auth_id: cred["data"]["username"].as_str().unwrap().parse()?,
-            ticket: cred["data"]["ticket"].as_str().unwrap().to_owned(),
+            ticket: http_only_ticket
+                .or(cred["data"]["ticket"].as_str().map(|t| t.to_string()))
+                .unwrap(),
             token: cred["data"]["CSRFPreventionToken"]
                 .as_str()
                 .unwrap()
                 .to_owned(),
+            http_only,
         };
 
         Ok(auth)
     }
 
-    async fn api_response(response: Response<Body>) -> Result<Value, Error> {
+    async fn api_response(response: Response<Incoming>) -> Result<Value, Error> {
         let status = response.status();
-        let data = hyper::body::to_bytes(response.into_body()).await?;
+        let data = response.into_body().collect().await?.to_bytes();
 
         let text = String::from_utf8(data.to_vec()).unwrap();
         if status.is_success() {
@@ -860,7 +1015,7 @@ impl HttpClient {
     }
 
     async fn api_request(
-        client: Client<HttpsConnector>,
+        client: Client<HttpsConnector<DnsResolver>, Body>,
         req: Request<Body>,
     ) -> Result<Value, Error> {
         Self::api_response(
@@ -895,7 +1050,7 @@ impl HttpClient {
                     .uri(url)
                     .header("User-Agent", "proxmox-backup-client/1.0")
                     .header(hyper::header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(data.to_string()))?;
+                    .body(data.to_string().into())?;
                 Ok(request)
             } else {
                 let query = json_object_to_query(data)?;
@@ -936,11 +1091,11 @@ impl Drop for HttpClient {
 
 #[derive(Clone)]
 pub struct H2Client {
-    h2: h2::client::SendRequest<bytes::Bytes>,
+    h2: h2::client::SendRequest<Bytes>,
 }
 
 impl H2Client {
-    pub fn new(h2: h2::client::SendRequest<bytes::Bytes>) -> Self {
+    pub fn new(h2: h2::client::SendRequest<Bytes>) -> Self {
         Self { h2 }
     }
 
@@ -1020,7 +1175,7 @@ impl H2Client {
         &self,
         request: Request<()>,
         data: Option<bytes::Bytes>,
-    ) -> impl Future<Output = Result<h2::client::ResponseFuture, Error>> {
+    ) -> impl Future<Output = Result<h2::client::ResponseFuture, Error>> + use<> {
         self.h2
             .clone()
             .ready()

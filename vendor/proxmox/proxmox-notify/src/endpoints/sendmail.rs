@@ -1,13 +1,14 @@
+use proxmox_sendmail::Mail;
 use serde::{Deserialize, Serialize};
 
 use proxmox_schema::api_types::COMMENT_SCHEMA;
-use proxmox_schema::{api, Updater};
+use proxmox_schema::{Updater, api};
 
 use crate::context;
 use crate::endpoints::common::mail;
 use crate::renderer::TemplateType;
 use crate::schema::{EMAIL_SCHEMA, ENTITY_NAME_SCHEMA, USER_SCHEMA};
-use crate::{renderer, Content, Endpoint, Error, Notification, Origin};
+use crate::{Content, Endpoint, Error, Notification, Origin, renderer};
 
 pub(crate) const SENDMAIL_TYPENAME: &str = "sendmail";
 
@@ -81,6 +82,7 @@ pub struct SendmailConfig {
 #[api]
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+/// The set of properties that can be deleted from a sendmail endpoint configuration.
 pub enum DeleteableSendmailProperty {
     /// Delete `author`
     Author,
@@ -133,19 +135,18 @@ impl Endpoint for SendmailEndpoint {
                     .clone()
                     .unwrap_or_else(|| context().default_sendmail_author());
 
-                proxmox_sys::email::sendmail(
-                    &recipients_str,
-                    &subject,
-                    Some(&text_part),
-                    Some(&html_part),
-                    Some(&mailfrom),
-                    Some(&author),
-                )
-                .map_err(|err| Error::NotifyFailed(self.config.name.clone(), err.into()))
+                let mut mail = Mail::new(&author, &mailfrom, &subject, &text_part)
+                    .with_html_alt(&html_part)
+                    .with_unmasked_recipients();
+
+                recipients_str.iter().for_each(|r| mail.add_recipient(r));
+
+                mail.send()
+                    .map_err(|err| Error::NotifyFailed(self.config.name.clone(), err.into()))
             }
             #[cfg(feature = "mail-forwarder")]
             Content::ForwardedMail { raw, uid, .. } => {
-                proxmox_sys::email::forward(&recipients_str, &mailfrom, raw, *uid)
+                Mail::forward(&recipients_str, &mailfrom, raw, *uid)
                     .map_err(|err| Error::NotifyFailed(self.config.name.clone(), err.into()))
             }
         }

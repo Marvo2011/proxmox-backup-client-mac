@@ -1,31 +1,46 @@
+use std::io::Read;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
-use anyhow::{bail, format_err, Error};
+use anyhow::{Context, Error, bail, format_err};
+use hex::FromHex;
+use tracing::{info, warn};
 
 use pbs_api_types::{DatastoreFSyncLevel, GarbageCollectionStatus};
-use proxmox_io::ReadExt;
-use proxmox_sys::fs::{create_dir, create_path, file_type_from_file_stat, CreateOptions};
+use pbs_config::BackupLockGuard;
+use proxmox_s3_client::S3Client;
+use proxmox_sys::fs::{CreateOptions, create_dir, create_path, file_type_from_file_stat};
 use proxmox_sys::process_locker::{
     ProcessLockExclusiveGuard, ProcessLockSharedGuard, ProcessLocker,
 };
-use proxmox_sys::task_log;
-use proxmox_sys::WorkerTaskContext;
+use proxmox_worker_task::WorkerTaskContext;
 
+use crate::backup_info::DATASTORE_LOCKS_DIR;
+use crate::data_blob::DataChunkBuilder;
 use crate::file_formats::{
     COMPRESSED_BLOB_MAGIC_1_0, ENCRYPTED_BLOB_MAGIC_1_0, UNCOMPRESSED_BLOB_MAGIC_1_0,
 };
-use crate::DataBlob;
+use crate::{DataBlob, LocalDatastoreLruCache};
+
+const USING_MARKER_FILENAME_EXT: &str = "using";
+
+#[derive(Default)]
+/// Configurable runtime properties of a chunk store
+pub(crate) struct ChunkStoreProperties {
+    pub(crate) sync_level: DatastoreFSyncLevel,
+}
 
 /// File system based chunk store
 pub struct ChunkStore {
     name: String, // used for error reporting
     pub(crate) base: PathBuf,
     chunk_dir: PathBuf,
-    mutex: Mutex<()>,
+    // Mutex to sync chunk store access, including property updates
+    mutex: Mutex<ChunkStoreProperties>,
     locker: Option<Arc<Mutex<ProcessLocker>>>,
-    sync_level: DatastoreFSyncLevel,
 }
 
 // TODO: what about sysctl setting vm.vfs_cache_pressure (0 - 100) ?
@@ -70,9 +85,8 @@ impl ChunkStore {
             name: String::new(),
             base: PathBuf::new(),
             chunk_dir: PathBuf::new(),
-            mutex: Mutex::new(()),
+            mutex: Mutex::new(Default::default()),
             locker: None,
-            sync_level: Default::default(),
         }
     }
 
@@ -92,7 +106,6 @@ impl ChunkStore {
         path: P,
         uid: nix::unistd::Uid,
         gid: nix::unistd::Gid,
-        worker: Option<&dyn WorkerTaskContext>,
         sync_level: DatastoreFSyncLevel,
     ) -> Result<Self, Error>
     where
@@ -110,7 +123,7 @@ impl ChunkStore {
 
         let default_options = CreateOptions::new();
 
-        match create_path(&base, Some(default_options), Some(options.clone())) {
+        match create_path(&base, Some(default_options), Some(options)) {
             Err(err) => bail!("unable to create chunk store '{name}' at {base:?} - {err}"),
             Ok(res) => {
                 if !res {
@@ -119,21 +132,21 @@ impl ChunkStore {
             }
         }
 
-        if let Err(err) = create_dir(&chunk_dir, options.clone()) {
+        if let Err(err) = create_dir(&chunk_dir, options) {
             bail!("unable to create chunk store '{name}' subdir {chunk_dir:?} - {err}");
         }
 
         // create lock file with correct owner/group
         let lockfile_path = Self::lockfile_path(&base);
-        proxmox_sys::fs::replace_file(lockfile_path, b"", options.clone(), false)?;
+        proxmox_sys::fs::replace_file(lockfile_path, b"", options, false)?;
 
         // create 64*1024 subdirs
         let mut last_percentage = 0;
 
         for i in 0..64 * 1024 {
             let mut l1path = chunk_dir.clone();
-            l1path.push(format!("{:04x}", i));
-            if let Err(err) = create_dir(&l1path, options.clone()) {
+            l1path.push(format!("{i:04x}"));
+            if let Err(err) = create_dir(&l1path, options) {
                 bail!(
                     "unable to create chunk store '{}' subdir {:?} - {}",
                     name,
@@ -143,9 +156,7 @@ impl ChunkStore {
             }
             let percentage = (i * 100) / (64 * 1024);
             if percentage != last_percentage {
-                if let Some(worker) = worker {
-                    task_log!(worker, "Chunkstore create: {}%", percentage)
-                }
+                info!("Chunkstore create: {percentage}%");
                 last_percentage = percentage;
             }
         }
@@ -159,27 +170,35 @@ impl ChunkStore {
         lockfile_path
     }
 
+    /// Check if the chunkstore path is absolute and that we can
+    /// access it. Returns the absolute '.chunks' path on success.
+    fn chunk_dir_accessible(base: &Path) -> Result<PathBuf, Error> {
+        if !base.is_absolute() {
+            bail!("expected absolute path - got {:?}", base);
+        }
+
+        let chunk_dir = Self::chunk_dir(base);
+
+        if let Err(err) = std::fs::metadata(&chunk_dir) {
+            bail!("unable to open chunk store at {chunk_dir:?} - {err}");
+        }
+
+        Ok(chunk_dir)
+    }
+
     /// Opens the chunk store with a new process locker.
     ///
     /// Note that this must be used with care, as it's dangerous to create two instances on the
     /// same base path, as closing the underlying ProcessLocker drops all locks from this process
     /// on the lockfile (even if separate FDs)
-    pub(crate) fn open<P: Into<PathBuf>>(
+    pub fn open<P: Into<PathBuf>>(
         name: &str,
         base: P,
         sync_level: DatastoreFSyncLevel,
     ) -> Result<Self, Error> {
         let base: PathBuf = base.into();
 
-        if !base.is_absolute() {
-            bail!("expected absolute path - got {:?}", base);
-        }
-
-        let chunk_dir = Self::chunk_dir(&base);
-
-        if let Err(err) = std::fs::metadata(&chunk_dir) {
-            bail!("unable to open chunk store '{name}' at {chunk_dir:?} - {err}");
-        }
+        let chunk_dir = ChunkStore::chunk_dir_accessible(&base)?;
 
         let lockfile_path = Self::lockfile_path(&base);
 
@@ -190,20 +209,41 @@ impl ChunkStore {
             base,
             chunk_dir,
             locker: Some(locker),
-            mutex: Mutex::new(()),
-            sync_level,
+            mutex: Mutex::new(ChunkStoreProperties { sync_level }),
         })
     }
 
-    pub fn touch_chunk(&self, digest: &[u8; 32]) -> Result<(), Error> {
+    fn touch_chunk_no_lock(
+        &self,
+        digest: &[u8; 32],
+        mutex_guard: &MutexGuard<ChunkStoreProperties>,
+    ) -> Result<(), Error> {
         // unwrap: only `None` in unit tests
         assert!(self.locker.is_some());
 
-        self.cond_touch_chunk(digest, true)?;
+        self.cond_touch_chunk_no_lock(digest, true, mutex_guard)?;
         Ok(())
     }
 
-    pub fn cond_touch_chunk(&self, digest: &[u8; 32], assert_exists: bool) -> Result<bool, Error> {
+    /// Update the chunk files atime if it exists.
+    ///
+    /// If the chunk file does not exist, return with error if assert_exists is true, with
+    /// Ok(false) otherwise.
+    pub(super) fn cond_touch_chunk(
+        &self,
+        digest: &[u8; 32],
+        assert_exists: bool,
+    ) -> Result<bool, Error> {
+        let lock = self.mutex.lock().unwrap();
+        self.cond_touch_chunk_no_lock(digest, assert_exists, &lock)
+    }
+
+    fn cond_touch_chunk_no_lock(
+        &self,
+        digest: &[u8; 32],
+        assert_exists: bool,
+        _mutex_guard: &MutexGuard<ChunkStoreProperties>,
+    ) -> Result<bool, Error> {
         // unwrap: only `None` in unit tests
         assert!(self.locker.is_some());
 
@@ -211,23 +251,20 @@ impl ChunkStore {
         self.cond_touch_path(&chunk_path, assert_exists)
     }
 
-    pub fn cond_touch_path(&self, path: &Path, assert_exists: bool) -> Result<bool, Error> {
+    fn cond_touch_path(&self, path: &Path, assert_exists: bool) -> Result<bool, Error> {
         // unwrap: only `None` in unit tests
         assert!(self.locker.is_some());
-
-        const UTIME_NOW: i64 = (1 << 30) - 1;
-        const UTIME_OMIT: i64 = (1 << 30) - 2;
 
         let times: [libc::timespec; 2] = [
             // access time -> update to now
             libc::timespec {
                 tv_sec: 0,
-                tv_nsec: UTIME_NOW,
+                tv_nsec: libc::UTIME_NOW,
             },
             // modification time -> keep as is
             libc::timespec {
                 tv_sec: 0,
-                tv_nsec: UTIME_OMIT,
+                tv_nsec: libc::UTIME_OMIT,
             },
         ];
 
@@ -248,11 +285,33 @@ impl ChunkStore {
         Ok(true)
     }
 
-    pub fn get_chunk_iterator(
+    /// Update access timestamp on all bad chunks for given digest
+    ///
+    /// Gets exclusive access by acquiring the chunk store mutex guard.
+    pub(super) fn cond_touch_bad_chunks(&self, digest: &[u8; 32]) -> Result<bool, Error> {
+        let _lock = self.mutex.lock();
+
+        let (mut chunk_path, digest_str) = self.chunk_path(digest);
+        let mut is_bad = false;
+        for i in 0..=9 {
+            chunk_path.set_file_name(ChunkExt::bad_chunk_filename(&digest_str, i));
+            if self.cond_touch_path(&chunk_path, false)? {
+                is_bad = true;
+            }
+        }
+        Ok(is_bad)
+    }
+
+    fn get_chunk_store_iterator(
         &self,
     ) -> Result<
-        impl Iterator<Item = (Result<proxmox_sys::fs::ReadDirEntry, Error>, usize, bool)>
-            + std::iter::FusedIterator,
+        impl std::iter::FusedIterator<
+            Item = (
+                Result<proxmox_sys::fs::ReadDirEntry, Error>,
+                usize,
+                ChunkExt,
+            ),
+        >,
         Error,
     > {
         // unwrap: only `None` in unit tests
@@ -286,21 +345,41 @@ impl ChunkStore {
                         Some(Ok(entry)) => {
                             // skip files if they're not a hash
                             let bytes = entry.file_name().to_bytes();
-                            if bytes.len() != 64 && bytes.len() != 64 + ".0.bad".len() {
+
+                            if bytes.len() < 64 {
                                 continue;
                             }
+
                             if !bytes.iter().take(64).all(u8::is_ascii_hexdigit) {
                                 continue;
                             }
 
-                            let bad = bytes.ends_with(b".bad");
-                            return Some((Ok(entry), percentage, bad));
+                            // regular chunk
+                            if bytes.len() == 64 {
+                                return Some((Ok(entry), percentage, ChunkExt::None));
+                            }
+
+                            // i-th bad chunk
+                            if is_bad_chunk_suffix(&bytes[64..]) {
+                                return Some((Ok(entry), percentage, ChunkExt::Bad));
+                            }
+
+                            // chunk marker file
+                            let marker_ext_bytes = USING_MARKER_FILENAME_EXT.as_bytes();
+                            if bytes.len() == 64 + 1 + marker_ext_bytes.len()
+                                && bytes[64] == b'.'
+                                && bytes.ends_with(marker_ext_bytes)
+                            {
+                                return Some((Ok(entry), percentage, ChunkExt::UsedMarker));
+                            }
+
+                            continue;
                         }
                         Some(Err(err)) => {
                             // stop after first error
                             done = true;
                             // and pass the error through:
-                            return Some((Err(err), percentage, false));
+                            return Some((Err(err), percentage, ChunkExt::None));
                         }
                         None => (), // open next directory
                     }
@@ -313,7 +392,7 @@ impl ChunkStore {
                     return None;
                 }
 
-                let subdir: &str = &format!("{:04x}", at);
+                let subdir: &str = &format!("{at:04x}");
                 percentage = (at * 100) / 0x10000;
                 at += 1;
                 match proxmox_sys::fs::read_subdir(base_handle.as_raw_fd(), subdir) {
@@ -333,7 +412,7 @@ impl ChunkStore {
                         return Some((
                             Err(format_err!("unable to read subdir '{subdir}' - {err}")),
                             percentage,
-                            false,
+                            ChunkExt::None,
                         ));
                     }
                 }
@@ -347,34 +426,36 @@ impl ChunkStore {
         ProcessLocker::oldest_shared_lock(self.locker.clone().unwrap())
     }
 
+    /// Mutex to lock chunk store for exclusive access.
+    ///
+    /// Must be held when modifying chunk store contents and allows to update
+    /// chunk store runtime properties.
+    pub(crate) fn mutex(&self) -> &Mutex<ChunkStoreProperties> {
+        &self.mutex
+    }
+
     pub fn sweep_unused_chunks(
         &self,
         oldest_writer: i64,
-        phase1_start_time: i64,
+        min_atime: i64,
         status: &mut GarbageCollectionStatus,
         worker: &dyn WorkerTaskContext,
+        cache: Option<&LocalDatastoreLruCache>,
     ) -> Result<(), Error> {
         // unwrap: only `None` in unit tests
         assert!(self.locker.is_some());
 
         use nix::sys::stat::fstatat;
-        use nix::unistd::{unlinkat, UnlinkatFlags};
-
-        let mut min_atime = phase1_start_time - 3600 * 24; // at least 24h (see mount option relatime)
-
-        if oldest_writer < min_atime {
-            min_atime = oldest_writer;
-        }
-
-        min_atime -= 300; // add 5 mins gap for safety
+        use nix::unistd::{UnlinkatFlags, unlinkat};
 
         let mut last_percentage = 0;
         let mut chunk_count = 0;
 
-        for (entry, percentage, bad) in self.get_chunk_iterator()? {
+        for (entry, percentage, chunk_ext) in self.get_chunk_store_iterator()? {
+            let bad = chunk_ext == ChunkExt::Bad;
             if last_percentage != percentage {
                 last_percentage = percentage;
-                task_log!(worker, "processed {}% ({} chunks)", percentage, chunk_count,);
+                info!("processed {percentage}% ({chunk_count} chunks)");
             }
 
             worker.check_abort()?;
@@ -392,48 +473,194 @@ impl ChunkStore {
 
             let lock = self.mutex.lock();
 
-            if let Ok(stat) = fstatat(dirfd, filename, nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW) {
+            if let Ok(stat) = fstatat(
+                Some(dirfd),
+                filename,
+                nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW,
+            ) {
                 let file_type = file_type_from_file_stat(&stat);
                 if file_type != Some(nix::dir::Type::File) {
+                    drop(lock);
+                    continue;
+                }
+                if chunk_ext == ChunkExt::UsedMarker {
+                    unlinkat(Some(dirfd), filename, UnlinkatFlags::NoRemoveDir).map_err(|err| {
+                        format_err!("unlinking chunk using marker {filename:?} failed - {err}")
+                    })?;
                     drop(lock);
                     continue;
                 }
 
                 chunk_count += 1;
 
-                if stat.st_atime < min_atime {
-                    //let age = now - stat.st_atime;
-                    //println!("UNLINK {}  {:?}", age/(3600*24), filename);
-                    if let Err(err) = unlinkat(Some(dirfd), filename, UnlinkatFlags::NoRemoveDir) {
-                        if bad {
-                            status.still_bad += 1;
-                        }
-                        bail!(
-                            "unlinking chunk {filename:?} failed on store '{}' - {err}",
-                            self.name,
-                        );
-                    }
-                    if bad {
-                        status.removed_bad += 1;
-                    } else {
-                        status.removed_chunks += 1;
-                    }
-                    status.removed_bytes += stat.st_size as u64;
-                } else if stat.st_atime < oldest_writer {
-                    if bad {
-                        status.still_bad += 1;
-                    } else {
-                        status.pending_chunks += 1;
-                    }
-                    status.pending_bytes += stat.st_size as u64;
-                } else {
-                    if !bad {
-                        status.disk_chunks += 1;
-                    }
-                    status.disk_bytes += stat.st_size as u64;
+                unsafe {
+                    self.cond_sweep_chunk(
+                        stat.st_atime,
+                        min_atime,
+                        oldest_writer,
+                        stat.st_size as u64,
+                        bad,
+                        status,
+                        || {
+                            // non-bad S3 chunks need to be removed via cache
+                            if let Some(cache) = cache {
+                                if !bad {
+                                    let digest = <[u8; 32]>::from_hex(filename.to_bytes())?;
+
+                                    // unless there is a concurrent upload pending,
+                                    // must never block due to required locking order
+                                    if let Ok(_guard) =
+                                        self.lock_chunk(&digest, Duration::from_secs(0))
+                                    {
+                                        cache.remove(&digest)?;
+                                    }
+
+                                    return Ok(());
+                                }
+                            }
+
+                            // bad or local chunks
+                            unlinkat(Some(dirfd), filename, UnlinkatFlags::NoRemoveDir).map_err(
+                                |err| {
+                                    format_err!(
+                                        "unlinking chunk {filename:?} failed on store '{}' - {err}",
+                                        self.name,
+                                    )
+                                },
+                            )
+                        },
+                    )?;
                 }
             }
             drop(lock);
+        }
+
+        Ok(())
+    }
+
+    /// Check within what range the provided chunks atime falls and update the garbage collection
+    /// status accordingly.
+    ///
+    /// If the chunk should be removed, the [`remove_callback`] is executed.
+    ///
+    /// Unsafe: requires locking and GC checks to be called
+    /// FIXME: make this internal with further refactoring
+    #[allow(clippy::too_many_arguments)]
+    pub(super) unsafe fn cond_sweep_chunk<T: FnOnce() -> Result<(), Error>>(
+        &self,
+        atime: i64,
+        min_atime: i64,
+        oldest_writer: i64,
+        size: u64,
+        bad: bool,
+        gc_status: &mut GarbageCollectionStatus,
+        remove_callback: T,
+    ) -> Result<(), Error> {
+        if atime < min_atime {
+            if let Err(err) = remove_callback() {
+                if bad {
+                    gc_status.still_bad += 1;
+                }
+                return Err(err);
+            }
+            if bad {
+                gc_status.removed_bad += 1;
+            } else {
+                gc_status.removed_chunks += 1;
+            }
+            gc_status.removed_bytes += size;
+        } else if atime < oldest_writer {
+            if bad {
+                gc_status.still_bad += 1;
+            } else {
+                gc_status.pending_chunks += 1;
+            }
+            gc_status.pending_bytes += size;
+        } else {
+            if !bad {
+                gc_status.disk_chunks += 1;
+            }
+            gc_status.disk_bytes += size;
+        }
+        Ok(())
+    }
+
+    /// Check if atime updates are honored by the filesystem backing the chunk store.
+    ///
+    /// Checks if the atime is always updated by utimensat taking into consideration the Linux
+    /// kernel timestamp granularity.
+    /// If `retry_on_file_changed` is set to true, the check is performed again on the changed file
+    /// if a file change while testing is detected by differences in bith time or inode number.
+    /// Uses a 4 MiB fixed size, compressed but unencrypted chunk to test. The chunk is inserted in
+    /// the chunk store if not yet present.
+    /// Returns with error if the check could not be performed.
+    pub fn check_fs_atime_updates(
+        &self,
+        retry_on_file_changed: bool,
+        s3_client: Option<Arc<S3Client>>,
+    ) -> Result<(), Error> {
+        let (zero_chunk, digest) = DataChunkBuilder::build_zero_chunk(None, 4096 * 1024, true)?;
+        let (path, _digest) = self.chunk_path(&digest);
+
+        if let Some(ref s3_client) = s3_client {
+            if let Err(err) = std::fs::metadata(&path) {
+                if err.kind() == std::io::ErrorKind::NotFound {
+                    let object_key = crate::s3::object_key_from_digest(&digest)?;
+                    proxmox_async::runtime::block_on(s3_client.upload_no_replace_with_retry(
+                        object_key,
+                        zero_chunk.raw_data().to_vec().into(),
+                    ))
+                    .context("failed to upload chunk to s3 backend")?;
+                }
+            }
+        }
+
+        let (pre_existing, _) = self.insert_chunk(&zero_chunk, &digest)?;
+
+        // Take into account timestamp update granularity in the kernel
+        // Blocking the thread is fine here since this runs in a worker.
+        std::thread::sleep(Duration::from_secs(1));
+
+        let metadata_before = std::fs::metadata(&path).context(format!(
+            "failed to get metadata for {path:?} before atime update"
+        ))?;
+
+        // Second atime update if chunk pre-existed, insert_chunk already updates pre-existing ones
+        self.cond_touch_path(&path, true)?;
+
+        let metadata_now = std::fs::metadata(&path).context(format!(
+            "failed to get metadata for {path:?} after atime update"
+        ))?;
+
+        // Check for the unlikely case that the file changed in-between the
+        // two metadata calls, try to check once again on changed file
+        if metadata_before.ino() != metadata_now.ino() {
+            if retry_on_file_changed {
+                return self.check_fs_atime_updates(false, s3_client);
+            }
+            bail!("chunk {path:?} changed twice during access time safety check, cannot proceed.");
+        }
+
+        if metadata_before.accessed()? >= metadata_now.accessed()? {
+            let chunk_info_str = if pre_existing {
+                "pre-existing"
+            } else {
+                "newly inserted"
+            };
+            warn!("Chunk metadata was not correctly updated during access time safety check:");
+            info!(
+                "Timestamps before update: accessed {:?}, modified {:?}, created {:?}",
+                metadata_before.accessed().ok(),
+                metadata_before.modified().ok(),
+                metadata_before.created().ok(),
+            );
+            info!(
+                "Timestamps after update: accessed {:?}, modified {:?}, created {:?}",
+                metadata_now.accessed().ok(),
+                metadata_now.modified().ok(),
+                metadata_now.created().ok(),
+            );
+            bail!("access time safety check using {chunk_info_str} chunk failed, aborting GC!");
         }
 
         Ok(())
@@ -445,9 +672,22 @@ impl ChunkStore {
 
         //println!("DIGEST {}", hex::encode(digest));
 
-        let (chunk_path, digest_str) = self.chunk_path(digest);
+        let lock = self.mutex.lock().unwrap();
 
-        let lock = self.mutex.lock();
+        self.insert_chunk_nolock(chunk, digest, true, &lock)
+    }
+
+    pub(crate) fn insert_chunk_nolock(
+        &self,
+        chunk: &DataBlob,
+        digest: &[u8; 32],
+        warn_on_overwrite_empty: bool,
+        mutex_guard: &MutexGuard<ChunkStoreProperties>,
+    ) -> Result<(bool, u64), Error> {
+        // unwrap: only `None` in unit tests
+        assert!(self.locker.is_some());
+
+        let (chunk_path, digest_str) = self.chunk_path(digest);
 
         let raw_data = chunk.raw_data();
         let encoded_size = raw_data.len() as u64;
@@ -460,39 +700,53 @@ impl ChunkStore {
             }
             let old_size = metadata.len();
             if encoded_size == old_size {
-                self.touch_chunk(digest)?;
+                self.touch_chunk_no_lock(digest, mutex_guard)?;
                 return Ok((true, old_size));
             } else if old_size == 0 {
-                log::warn!("found empty chunk '{digest_str}' in store {name}, overwriting");
+                if warn_on_overwrite_empty {
+                    log::warn!("found empty chunk '{digest_str}' in store {name}, overwriting");
+                }
             } else if chunk.is_encrypted() {
                 // incoming chunk is encrypted, possible attack or hash collision!
-                let mut existing_file = std::fs::File::open(&chunk_path)?;
-                let magic = existing_file.read_exact_allocated(8)?;
+
+                let mut magic = [0u8; 8];
+                std::fs::File::open(&chunk_path)
+                    .and_then(|mut f| f.read_exact(&mut magic))
+                    .map_err(|e| format_err!("Failed to read magic number from header of existing chunk '{digest_str}' on store '{name}: {e}"))?;
 
                 // going from unencrypted to encrypted can never be right, since the digest
                 // includes data derived from the encryption key
                 if magic == UNCOMPRESSED_BLOB_MAGIC_1_0 || magic == COMPRESSED_BLOB_MAGIC_1_0 {
-                    bail!("Overwriting unencrypted chunk '{digest_str}' on store '{name}' with encrypted chunk with same digest not allowed!");
+                    bail!(
+                        "Cannot overwrite existing unencrypted chunk '{digest_str}' on store '{name}' with encrypted chunk."
+                    );
                 }
 
                 // if both chunks are uncompressed and encrypted and have the same digest, but
                 // their sizes are different, one of them *must* be invalid
                 if magic == ENCRYPTED_BLOB_MAGIC_1_0 && !chunk.is_compressed() {
-                    bail!("Overwriting existing (encrypted) chunk '{digest_str}' on store '{name}' is not allowed!")
+                    // gc is also mentioned because verification doesn't check unreferenced chunks
+                    bail!(
+                        "Found existing encrypted chunk '{digest_str}' of different size on store '{name}'. Verify and garbage-collect the full datastore to clean up possibly corrupted chunks.",
+                    )
                 }
 
                 // we can't tell if either chunk is invalid if either or both of them are
                 // compressed, the size mismatch could be caused by different zstd versions
                 // so let's keep the one that was uploaded first, bit-rot is hopefully detected by
                 // verification at some point..
-                self.touch_chunk(digest)?;
+                self.touch_chunk_no_lock(digest, mutex_guard)?;
                 return Ok((true, old_size));
             } else if old_size < encoded_size {
-                log::debug!("Got another copy of chunk with digest '{digest_str}', existing chunk is smaller, discarding uploaded one.");
-                self.touch_chunk(digest)?;
+                log::debug!(
+                    "Got another copy of chunk with digest '{digest_str}', existing chunk is smaller, discarding uploaded one."
+                );
+                self.touch_chunk_no_lock(digest, mutex_guard)?;
                 return Ok((true, old_size));
             } else {
-                log::debug!("Got another copy of chunk with digest '{digest_str}', existing chunk is bigger, replacing with uploaded one.");
+                log::debug!(
+                    "Got another copy of chunk with digest '{digest_str}', existing chunk is bigger, replacing with uploaded one."
+                );
             }
         }
 
@@ -500,24 +754,30 @@ impl ChunkStore {
             .parent()
             .ok_or_else(|| format_err!("unable to get chunk dir"))?;
 
+        let create_options = if nix::unistd::Uid::effective().is_root() {
+            // Overwrite the mode default for backwards compatibility
+            proxmox_product_config::default_create_options()
+                .perm(nix::sys::stat::Mode::from_bits_truncate(0o644))
+        } else {
+            CreateOptions::new()
+        };
+
         proxmox_sys::fs::replace_file(
             &chunk_path,
             raw_data,
-            CreateOptions::new(),
-            self.sync_level == DatastoreFSyncLevel::File,
+            create_options,
+            mutex_guard.sync_level == DatastoreFSyncLevel::File,
         )
         .map_err(|err| {
             format_err!("inserting chunk on store '{name}' failed for {digest_str} - {err}")
         })?;
 
-        if self.sync_level == DatastoreFSyncLevel::File {
+        if mutex_guard.sync_level == DatastoreFSyncLevel::File {
             // fsync dir handle to persist the tmp rename
             let dir = std::fs::File::open(chunk_dir_path)?;
             nix::unistd::fsync(dir.as_raw_fd())
                 .map_err(|err| format_err!("fsync failed: {err}"))?;
         }
-
-        drop(lock);
 
         Ok((false, encoded_size))
     }
@@ -532,6 +792,83 @@ impl ChunkStore {
         let digest_str = hex::encode(digest);
         chunk_path.push(&digest_str);
         (chunk_path, digest_str)
+    }
+
+    /// Replace a chunk file with a zero size file in the chunk store.
+    ///
+    /// Used to evict chunks from the local datastore cache, while keeping them as in-use markers
+    /// for garbage collection. Returns with success also if chunk file is not pre-existing,
+    /// also creating the marker file in that case.
+    ///
+    /// Safety: chunk store mutex must be held!
+    pub(crate) unsafe fn replace_chunk_with_marker_or_create_marker(
+        &self,
+        digest: &[u8; 32],
+    ) -> Result<(), Error> {
+        let (chunk_path, digest_str) = self.chunk_path(digest);
+        Self::create_marker_file(&chunk_path)
+            .map_err(|err| format_err!("clear chunk failed for {digest_str} - {err}"))?;
+        Ok(())
+    }
+
+    /// Helper to generate new empty marker file
+    fn create_marker_file(path: &Path) -> Result<(), Error> {
+        let create_options = if nix::unistd::Uid::effective().is_root() {
+            // Overwrite the mode default for backwards compatibility
+            proxmox_product_config::default_create_options()
+                .perm(nix::sys::stat::Mode::from_bits_truncate(0o644))
+        } else {
+            CreateOptions::new()
+        };
+        proxmox_sys::fs::replace_file(path, &[], create_options, false)
+    }
+
+    /// Mark chunk as expected to be present by writing a file the chunk store.
+    ///
+    /// Used to mark chunks which are found in index files during phase 1 of garbage collection
+    /// for s3 datastores, but the marker file is not present and it is seemingly not a bad chunk.
+    /// This might happen if the local store cache is empty after datastore re-creation.
+    pub(crate) fn mark_chunk_as_expected(&self, digest: &[u8; 32]) -> Result<(), Error> {
+        let marker_path = self.chunk_expected_marker_path(digest);
+        Self::create_marker_file(&marker_path)
+            .map_err(|err| format_err!("mark chunk failed for {} - {err}", hex::encode(digest)))?;
+        Ok(())
+    }
+
+    /// Remove the chunk-expected marker file from the chunk store.
+    ///
+    /// Used to remove the chunk-expected marker file during phase 2 of garbage collection. This
+    /// marker file is created during phase 1 of garbage collection in case the chunk or its zero
+    /// size marker file is not found in the chunk store, but still referenced by an index file,
+    /// flagging it as still required.
+    ///
+    /// Returns true if the file was present and removed, false if the file did not exist.
+    pub(crate) fn clear_chunk_expected_mark(&self, digest: &[u8; 32]) -> Result<bool, Error> {
+        let marker_path = self.chunk_expected_marker_path(digest);
+        if let Err(err) = std::fs::remove_file(marker_path) {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                return Err(err.into());
+            } else {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Helper to generate marker file path for expected chunks
+    fn chunk_expected_marker_path(&self, digest: &[u8; 32]) -> PathBuf {
+        let (mut path, _digest_str) = self.chunk_path(digest);
+        path.set_extension(USING_MARKER_FILENAME_EXT);
+        path
+    }
+
+    /// Removes a chunk marker file from the `LocalDatastoreLruCache`s chunk store.
+    ///
+    /// Callers must hold the per-chunk file lock in order to avoid races with renaming of corrupt
+    /// chunks by verifications and chunk inserts by backups.
+    pub(crate) fn remove_chunk_marker(&self, digest: &[u8; 32]) -> Result<(), Error> {
+        let (chunk_path, _digest_str) = self.chunk_path(digest);
+        std::fs::remove_file(chunk_path).map_err(Error::from)
     }
 
     pub fn relative_path(&self, path: &Path) -> PathBuf {
@@ -563,30 +900,170 @@ impl ChunkStore {
         // unwrap: only `None` in unit tests
         ProcessLocker::try_exclusive_lock(self.locker.clone().unwrap())
     }
+
+    /// Checks permissions and owner of passed path.
+    fn check_permissions<T: AsRef<Path>>(path: T, file_mode: u32) -> Result<(), Error> {
+        match nix::sys::stat::stat(path.as_ref()) {
+            Ok(stat) => {
+                let backup_user = proxmox_product_config::get_api_user();
+                if stat.st_uid != u32::from(backup_user.uid)
+                    || stat.st_gid != u32::from(backup_user.gid)
+                    || u32::from(stat.st_mode) & 0o777 != file_mode
+                {
+                    bail!(
+                        "unable to open existing chunk store path {:?} - permissions or owner not correct",
+                        path.as_ref(),
+                    );
+                }
+            }
+            Err(err) => {
+                bail!(
+                    "unable to open existing chunk store path {:?} - {err}",
+                    path.as_ref(),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Verify vital files in datastore. Checks the owner and permissions of: the chunkstore, it's
+    /// subdirectories and the lock file.
+    pub fn verify_chunkstore<T: AsRef<Path>>(path: T) -> Result<(), Error> {
+        // Check datastore root path perm/owner
+        ChunkStore::check_permissions(path.as_ref(), 0o755)?;
+
+        let chunk_dir = Self::chunk_dir(path.as_ref());
+        // Check datastore .chunks path perm/owner
+        ChunkStore::check_permissions(&chunk_dir, 0o750)?;
+
+        // Check all .chunks subdirectories
+        for i in 0..64 * 1024 {
+            let mut l1path = chunk_dir.clone();
+            l1path.push(format!("{i:04x}"));
+            ChunkStore::check_permissions(&l1path, 0o750)?;
+        }
+
+        // Check .lock file
+        let lockfile_path = Self::lockfile_path(path.as_ref());
+        ChunkStore::check_permissions(lockfile_path, 0o644)?;
+        Ok(())
+    }
+
+    /// Generates the path to the chunks lock file
+    pub(crate) fn chunk_lock_path(&self, digest: &[u8]) -> PathBuf {
+        let mut lock_path = Path::new(DATASTORE_LOCKS_DIR).join(self.name.clone());
+        let digest_str = hex::encode(digest);
+        lock_path.push(".chunks");
+        let prefix = digest_to_prefix(digest);
+        lock_path.push(&prefix);
+        lock_path.push(&digest_str);
+        lock_path
+    }
+
+    /// Get an exclusive lock on the chunks lock file
+    pub(crate) fn lock_chunk(
+        &self,
+        digest: &[u8],
+        timeout: Duration,
+    ) -> Result<BackupLockGuard, Error> {
+        let lock_path = self.chunk_lock_path(digest);
+        let guard = crate::backup_info::lock_helper(self.name(), &lock_path, |path| {
+            pbs_config::open_backup_lockfile(path, Some(timeout), true)
+        })?;
+        Ok(guard)
+    }
+
+    /// Generate the next bad chunk file path for given digest. Returns the path as well as the bad
+    /// chunk counter.
+    pub(crate) fn next_bad_chunk_path(&self, digest: &[u8; 32]) -> (PathBuf, usize) {
+        let (mut chunk_path, digest_str) = self.chunk_path(digest);
+        let mut counter = 0;
+        loop {
+            chunk_path.set_file_name(ChunkExt::bad_chunk_filename(&digest_str, counter));
+            if chunk_path.exists() && counter < 9 {
+                counter += 1;
+            } else {
+                break;
+            }
+        }
+        (chunk_path, counter)
+    }
+
+    pub(super) fn try_ensure_sync_level_with_update(
+        &self,
+        mut mutex_guard: MutexGuard<ChunkStoreProperties>,
+        update_sync_level: Option<DatastoreFSyncLevel>,
+    ) -> Result<(), Error> {
+        let assure_sync_level = mutex_guard.sync_level;
+        if let Some(sync_level) = update_sync_level {
+            mutex_guard.sync_level = sync_level;
+        }
+
+        drop(mutex_guard); // never hold during syncfs
+
+        if assure_sync_level != DatastoreFSyncLevel::Filesystem {
+            return Ok(());
+        }
+
+        let base_path = self.base_path();
+        let file = std::fs::File::open(&base_path)?;
+        let fd = file.as_raw_fd();
+        info!("syncing filesystem for backing path '{base_path:?}'");
+        #[cfg(target_os = "linux")]
+        if unsafe { libc::syncfs(fd) } < 0 {
+            bail!("error during syncfs: {}", std::io::Error::last_os_error());
+        }
+        // no syncfs(2) elsewhere, sync all file systems instead
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = fd;
+            unsafe { libc::sync() };
+        }
+        Ok(())
+    }
+}
+
+#[derive(PartialEq)]
+/// Chunk iterator directory entry filename extension
+enum ChunkExt {
+    None,
+    Bad,
+    UsedMarker,
+}
+
+impl ChunkExt {
+    fn bad_chunk_filename(digest_str: &str, counter: usize) -> String {
+        format!("{digest_str}.{counter}.bad")
+    }
+}
+
+pub(crate) fn is_bad_chunk_suffix(s: &[u8]) -> bool {
+    s.len() == ".i.bad".len() && s[0] == b'.' && s[1].is_ascii_digit() && &s[2..] == b".bad"
+}
+
+#[test]
+fn test_is_bad_chunk_suffix() {
+    assert!(is_bad_chunk_suffix(".0.bad".as_bytes()));
+    assert!(is_bad_chunk_suffix(".9.bad".as_bytes()));
+    for s in [".10.bad", ".a.bad", ".bad", "0.bad", ""] {
+        assert!(!is_bad_chunk_suffix(s.as_bytes()));
+    }
 }
 
 #[test]
 fn test_chunk_store1() {
-    let mut path = std::fs::canonicalize(".").unwrap(); // we need absolute path
-    path.push(".testdir");
+    use tempfile::TempDir;
+    let temp_dir = TempDir::new().unwrap();
+    let path = temp_dir.path();
 
-    if let Err(_e) = std::fs::remove_dir_all(".testdir") { /* ignore */ }
-
-    let chunk_store = ChunkStore::open("test", &path, DatastoreFSyncLevel::None);
+    let chunk_store = ChunkStore::open("test", path, DatastoreFSyncLevel::None);
     assert!(chunk_store.is_err());
 
     let user = nix::unistd::User::from_uid(nix::unistd::Uid::current())
         .unwrap()
         .unwrap();
-    let chunk_store = ChunkStore::create(
-        "test",
-        &path,
-        user.uid,
-        user.gid,
-        None,
-        DatastoreFSyncLevel::None,
-    )
-    .unwrap();
+    let chunk_store =
+        ChunkStore::create("test", path, user.uid, user.gid, DatastoreFSyncLevel::None).unwrap();
 
     let (chunk, digest) = crate::data_blob::DataChunkBuilder::new(&[0u8, 1u8])
         .build()
@@ -598,15 +1075,9 @@ fn test_chunk_store1() {
     let (exists, _) = chunk_store.insert_chunk(&chunk, &digest).unwrap();
     assert!(exists);
 
-    let chunk_store = ChunkStore::create(
-        "test",
-        &path,
-        user.uid,
-        user.gid,
-        None,
-        DatastoreFSyncLevel::None,
-    );
+    let chunk_store =
+        ChunkStore::create("test", path, user.uid, user.gid, DatastoreFSyncLevel::None);
     assert!(chunk_store.is_err());
 
-    if let Err(_e) = std::fs::remove_dir_all(".testdir") { /* ignore */ }
+    temp_dir.close().unwrap();
 }

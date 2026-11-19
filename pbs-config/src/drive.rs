@@ -6,27 +6,26 @@
 //!
 //! Drive type [`VirtualTapeDrive`] is only useful for debugging.
 //!
-//! [LtoTapeDrive]: crate::api2::types::LtoTapeDrive
-//! [VirtualTapeDrive]: crate::api2::types::VirtualTapeDrive
-//! [ScsiTapeChanger]: crate::api2::types::ScsiTapeChanger
-//! [SectionConfig]: proxmox::api::section_config::SectionConfig
+//! [LtoTapeDrive]: pbs_api_types::LtoTapeDrive
+//! [VirtualTapeDrive]: pbs_api_types::VirtualTapeDrive
+//! [ScsiTapeChanger]: pbs_api_types::ScsiTapeChanger
+//! [SectionConfig]: proxmox_section_config::SectionConfig
 
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
-use anyhow::{bail, Error};
-use lazy_static::lazy_static;
+use anyhow::{Error, bail};
 
+use proxmox_product_config::replace_privileged_config;
 use proxmox_schema::*;
 use proxmox_section_config::{SectionConfig, SectionConfigData, SectionConfigPlugin};
 
-use crate::{open_backup_lockfile, replace_backup_config, BackupLockGuard};
+use crate::{BackupLockGuard, open_backup_lockfile};
 
-use pbs_api_types::{LtoTapeDrive, ScsiTapeChanger, VirtualTapeDrive, DRIVE_NAME_SCHEMA};
+use pbs_api_types::{DRIVE_NAME_SCHEMA, LtoTapeDrive, ScsiTapeChanger, VirtualTapeDrive};
 
-lazy_static! {
-    /// Static [`SectionConfig`] to access parser/writer functions.
-    pub static ref CONFIG: SectionConfig = init();
-}
+/// Static [`SectionConfig`] to access parser/writer functions.
+pub static CONFIG: LazyLock<SectionConfig> = LazyLock::new(init);
 
 fn init() -> SectionConfig {
     let mut config = SectionConfig::new(&DRIVE_NAME_SCHEMA);
@@ -79,7 +78,7 @@ pub fn config() -> Result<(SectionConfigData, [u8; 32]), Error> {
 /// Save the configuration file
 pub fn save_config(config: &SectionConfigData) -> Result<(), Error> {
     let raw = CONFIG.write(DRIVE_CFG_FILENAME, config)?;
-    replace_backup_config(DRIVE_CFG_FILENAME, raw.as_bytes())
+    replace_privileged_config(DRIVE_CFG_FILENAME, raw.as_bytes())
 }
 
 /// Check if the specified drive name exists in the config.

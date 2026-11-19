@@ -4,15 +4,15 @@ use std::borrow::Cow;
 
 use serde::de;
 
-use super::cow3::Cow3;
 use super::Error;
+use super::cow3::Cow3;
 
 /// This can only deserialize strings and lists of strings and has no schema.
 pub struct NoSchemaDeserializer<'de, 'i> {
     input: Cow3<'de, 'i, str>,
 }
 
-impl<'de, 'i> NoSchemaDeserializer<'de, 'i> {
+impl<'de> NoSchemaDeserializer<'de, '_> {
     pub fn new<T>(input: T) -> Self
     where
         T: Into<Cow<'de, str>>,
@@ -35,7 +35,7 @@ macro_rules! deserialize_num {
     )*}
 }
 
-impl<'de, 'i> de::Deserializer<'de> for NoSchemaDeserializer<'de, 'i> {
+impl<'de> de::Deserializer<'de> for NoSchemaDeserializer<'de, '_> {
     type Error = Error;
 
     fn deserialize_any<V>(self, visitor: V) -> Result<V::Value, Error>
@@ -264,7 +264,7 @@ impl<'de, 'i> SimpleSeqAccess<'de, 'i> {
     }
 }
 
-impl<'de, 'i> de::SeqAccess<'de> for SimpleSeqAccess<'de, 'i> {
+impl<'de> de::SeqAccess<'de> for SimpleSeqAccess<'de, '_> {
     type Error = Error;
 
     fn next_element_seed<T>(&mut self, seed: T) -> Result<Option<T::Value>, Error>

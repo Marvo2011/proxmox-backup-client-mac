@@ -17,46 +17,15 @@
 //!
 //! Examples:
 //! ```no_run
-//! use proxmox_io::vec::{self, ByteVecExt};
+//! use proxmox_io::vec;
 //!
 //! # let size = 64usize;
 //! # let more = 64usize;
-//! let mut buffer = vec::undefined(size); // A zero-initialized buffer with valgrind support
+//! let mut buffer = vec::undefined(size); // A zero-initialized buffer
 //!
-//! let mut buffer = unsafe { vec::uninitialized(size) }; // an actually uninitialized buffer
+//! let mut buffer = [1, 2, 3];
 //! vec::clear(&mut buffer); // zero out an &mut [u8]
-//!
-//! vec::clear(unsafe {
-//!     buffer.grow_uninitialized(more) // grow the buffer with uninitialized bytes
-//! });
 //! ```
-
-mod byte_vec;
-pub use byte_vec::ByteVecExt;
-
-/// Create an uninitialized byte vector of a specific size.
-///
-/// This is just a shortcut for:
-/// ```no_run
-/// # let len = 64usize;
-/// let mut v = Vec::<u8>::with_capacity(len);
-/// unsafe {
-///     v.set_len(len);
-/// }
-/// ```
-///
-/// # Safety
-///
-/// It's generally not unsafe to use this method, but the contents are uninitialized, and since
-/// this does not return a `MaybeUninit` type to track the initialization state, this is simply
-/// marked as unsafe for good measure.
-#[inline]
-pub unsafe fn uninitialized(len: usize) -> Vec<u8> {
-    unsafe {
-        let data = std::alloc::alloc(std::alloc::Layout::array::<u8>(len).unwrap());
-        Vec::from_raw_parts(data, len, len)
-    }
-}
 
 /// Shortcut to zero out a slice of bytes.
 #[inline]
@@ -69,63 +38,14 @@ pub fn clear(data: &mut [u8]) {
 /// Create a newly allocated, zero initialized byte vector.
 #[inline]
 pub fn zeroed(len: usize) -> Vec<u8> {
-    unsafe {
-        let mut out = uninitialized(len);
-        clear(&mut out);
-        out
-    }
+    vec![0; len]
 }
 
 /// Create a newly allocated byte vector of a specific size with "undefined" content.
 ///
-/// The data will be zero initialized, but, if the `valgrind` feature is activated, it will be
-/// marked as uninitialized for debugging.
+/// The data will be zero initialized, but this function is meant to at some point gain support for
+/// marking the data as uninitialized for tools such as `valgrind` at some point.
 #[inline]
 pub fn undefined(len: usize) -> Vec<u8> {
-    undefined_impl(len)
-}
-
-#[cfg(not(feature = "valgrind"))]
-fn undefined_impl(len: usize) -> Vec<u8> {
     zeroed(len)
-}
-
-#[cfg(feature = "valgrind")]
-fn undefined_impl(len: usize) -> Vec<u8> {
-    let out = zeroed(len);
-    vg::make_slice_undefined(&out[..]);
-    out
-}
-
-#[cfg(feature = "valgrind")]
-mod vg {
-    type ValgrindValue = valgrind_request::Value;
-
-    /// Mark a memory region as undefined when using valgrind, causing it to treat read access to
-    /// it as error.
-    #[inline]
-    pub(crate) fn make_mem_undefined(addr: *const u8, len: usize) -> ValgrindValue {
-        const MAKE_MEM_UNDEFINED: ValgrindValue =
-            (((b'M' as ValgrindValue) << 24) | ((b'C' as ValgrindValue) << 16)) + 1;
-        unsafe {
-            valgrind_request::do_client_request(
-                0,
-                &[
-                    MAKE_MEM_UNDEFINED,
-                    addr as usize as ValgrindValue,
-                    len as ValgrindValue,
-                    0,
-                    0,
-                    0,
-                ],
-            )
-        }
-    }
-
-    /// Mark a slice of bytes as undefined when using valgrind, causing it to treat read access to
-    /// it as error.
-    #[inline]
-    pub(crate) fn make_slice_undefined(data: &[u8]) -> ValgrindValue {
-        make_mem_undefined(data.as_ptr(), data.len())
-    }
 }

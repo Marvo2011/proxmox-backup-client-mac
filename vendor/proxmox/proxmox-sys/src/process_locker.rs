@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::os::unix::io::AsRawFd;
 use std::sync::{Arc, Mutex};
 
-use anyhow::{bail, Error};
+use anyhow::{Error, bail};
 
 // fixme: use F_OFD_ locks when implemented with nix::fcntl
 
@@ -56,7 +56,7 @@ impl Drop for ProcessLockSharedGuard {
             if let Err(err) =
                 nix::fcntl::fcntl(data.file.as_raw_fd(), nix::fcntl::FcntlArg::F_SETLKW(&op))
             {
-                panic!("unable to drop writer lock - {}", err);
+                panic!("unable to drop writer lock - {err}");
             }
         }
         if data.writers > 0 {
@@ -96,7 +96,7 @@ impl Drop for ProcessLockExclusiveGuard {
         if let Err(err) =
             nix::fcntl::fcntl(data.file.as_raw_fd(), nix::fcntl::FcntlArg::F_SETLKW(&op))
         {
-            panic!("unable to drop exclusive lock - {}", err);
+            panic!("unable to drop exclusive lock - {err}");
         }
 
         data.exclusive = false;
@@ -112,6 +112,7 @@ impl ProcessLocker {
             .create(true)
             .read(true)
             .write(true)
+            .truncate(false)
             .open(lockfile)?;
 
         Ok(Arc::new(Mutex::new(Self {

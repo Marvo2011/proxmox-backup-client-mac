@@ -1,0 +1,21 @@
+[package]
+name = "proxmox-apt-api-types"
+description = "APT API type definitions."
+version = "3.0.0"
+
+authors.workspace = true
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+repository.workspace = true
+exclude.workspace = true
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+proxmox-schema = { workspace = true, features = ["api-macro"] }
+proxmox-serde = { workspace = true, features = ["perl"] }
+proxmox-config-digest.workspace = true
+regex = { workspace = true }
+
+[dev-dependencies]
+serde_json.workspace = true

@@ -1,13 +1,14 @@
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
     Arc,
+    atomic::{AtomicUsize, Ordering},
 };
 
-use anyhow::{bail, Error};
+use anyhow::{Error, bail};
 use futures::*;
-use serde_json::{json, Value};
-use tokio::signal::unix::{signal, SignalKind};
+use serde_json::{Value, json};
+use tokio::signal::unix::{SignalKind, signal};
 
+use proxmox_log::info;
 use proxmox_router::cli::format_and_print_result;
 
 use pbs_api_types::percent_encoding::percent_encode_component;
@@ -32,10 +33,10 @@ pub async fn display_task_log(
 
     let abort_future = async move {
         while signal_stream.recv().await.is_some() {
-            log::info!("got shutdown request (SIGINT)");
+            info!("got shutdown request (SIGINT)");
             let prev_count = abort_count2.fetch_add(1, Ordering::SeqCst);
             if prev_count >= 1 {
-                log::info!("forced exit (task still running)");
+                info!("forced exit (task still running)");
                 break;
             }
         }

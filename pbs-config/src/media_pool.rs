@@ -3,25 +3,24 @@
 //! This configuration module is based on [`SectionConfig`], and
 //! provides a type safe interface to store [`MediaPoolConfig`],
 //!
-//! [MediaPoolConfig]: crate::api2::types::MediaPoolConfig
+//! [MediaPoolConfig]: pbs_api_types::MediaPoolConfig
 //! [SectionConfig]: proxmox_section_config::SectionConfig
 
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
 use anyhow::Error;
-use lazy_static::lazy_static;
 
+use proxmox_product_config::replace_privileged_config;
 use proxmox_schema::*;
 use proxmox_section_config::{SectionConfig, SectionConfigData, SectionConfigPlugin};
 
-use pbs_api_types::{MediaPoolConfig, MEDIA_POOL_NAME_SCHEMA};
+use pbs_api_types::{MEDIA_POOL_NAME_SCHEMA, MediaPoolConfig};
 
-use crate::{open_backup_lockfile, replace_backup_config, BackupLockGuard};
+use crate::{BackupLockGuard, open_backup_lockfile};
 
-lazy_static! {
-    /// Static [`SectionConfig`] to access parser/writer functions.
-    pub static ref CONFIG: SectionConfig = init();
-}
+/// Static [`SectionConfig`] to access parser/writer functions.
+pub static CONFIG: LazyLock<SectionConfig> = LazyLock::new(init);
 
 fn init() -> SectionConfig {
     let mut config = SectionConfig::new(&MEDIA_POOL_NAME_SCHEMA);
@@ -59,7 +58,7 @@ pub fn config() -> Result<(SectionConfigData, [u8; 32]), Error> {
 /// Save the configuration file
 pub fn save_config(config: &SectionConfigData) -> Result<(), Error> {
     let raw = CONFIG.write(MEDIA_POOL_CFG_FILENAME, config)?;
-    replace_backup_config(MEDIA_POOL_CFG_FILENAME, raw.as_bytes())
+    replace_privileged_config(MEDIA_POOL_CFG_FILENAME, raw.as_bytes())
 }
 
 // shell completion helper

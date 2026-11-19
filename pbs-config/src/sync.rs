@@ -1,18 +1,17 @@
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
 use anyhow::Error;
-use lazy_static::lazy_static;
 
+use proxmox_product_config::replace_privileged_config;
 use proxmox_schema::{ApiType, Schema};
 use proxmox_section_config::{SectionConfig, SectionConfigData, SectionConfigPlugin};
 
-use pbs_api_types::{SyncJobConfig, JOB_ID_SCHEMA};
+use pbs_api_types::{JOB_ID_SCHEMA, SyncJobConfig};
 
-use crate::{open_backup_lockfile, replace_backup_config, BackupLockGuard};
+use crate::{BackupLockGuard, open_backup_lockfile};
 
-lazy_static! {
-    pub static ref CONFIG: SectionConfig = init();
-}
+pub static CONFIG: LazyLock<SectionConfig> = LazyLock::new(init);
 
 fn init() -> SectionConfig {
     let obj_schema = match SyncJobConfig::API_SCHEMA {
@@ -20,9 +19,10 @@ fn init() -> SectionConfig {
         _ => unreachable!(),
     };
 
-    let plugin = SectionConfigPlugin::new("sync".to_string(), Some(String::from("id")), obj_schema);
+    let sync_plugin =
+        SectionConfigPlugin::new("sync".to_string(), Some(String::from("id")), obj_schema);
     let mut config = SectionConfig::new(&JOB_ID_SCHEMA);
-    config.register_plugin(plugin);
+    config.register_plugin(sync_plugin);
 
     config
 }
@@ -46,7 +46,7 @@ pub fn config() -> Result<(SectionConfigData, [u8; 32]), Error> {
 
 pub fn save_config(config: &SectionConfigData) -> Result<(), Error> {
     let raw = CONFIG.write(SYNC_CFG_FILENAME, config)?;
-    replace_backup_config(SYNC_CFG_FILENAME, raw.as_bytes())
+    replace_privileged_config(SYNC_CFG_FILENAME, raw.as_bytes())
 }
 
 // shell completion helper

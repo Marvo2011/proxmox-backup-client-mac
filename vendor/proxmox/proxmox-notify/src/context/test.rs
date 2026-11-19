@@ -1,12 +1,19 @@
-use crate::context::Context;
 use crate::Error;
+use crate::context::Context;
+use crate::renderer::TemplateSource;
 
 #[derive(Debug)]
 pub struct TestContext;
 
 impl Context for TestContext {
-    fn lookup_email_for_user(&self, _user: &str) -> Option<String> {
-        Some("test@example.com".into())
+    fn lookup_email_for_user(&self, user: &str) -> Option<String> {
+        user.split_once('@').and_then(|(user, realm)| {
+            if realm == "pve" {
+                Some(format!("{user}@example.com"))
+            } else {
+                None
+            }
+        })
     }
 
     fn default_sendmail_author(&self) -> String {
@@ -29,6 +36,7 @@ impl Context for TestContext {
         &self,
         _filename: &str,
         _namespace: Option<&str>,
+        _source: TemplateSource,
     ) -> Result<Option<String>, Error> {
         Ok(Some(String::new()))
     }

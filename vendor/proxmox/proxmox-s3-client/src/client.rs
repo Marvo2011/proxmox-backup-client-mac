@@ -1,0 +1,1095 @@
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Error, bail, format_err};
+use hyper::body::{Bytes, Incoming};
+use hyper::http::method::Method;
+use hyper::http::uri::{Authority, Parts, PathAndQuery, Scheme};
+use hyper::http::{HeaderValue, StatusCode, Uri, header};
+use hyper::{Request, Response};
+use hyper_util::client::legacy::Client;
+use hyper_util::client::legacy::connect::HttpConnector;
+use hyper_util::rt::TokioExecutor;
+use nix::unistd::User;
+use openssl::hash::MessageDigest;
+use openssl::sha::Sha256;
+use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
+use openssl::x509::X509StoreContextRef;
+use tracing::error;
+
+use proxmox_http::client::HttpsConnector;
+use proxmox_http::{Body, ProxyConfig};
+use proxmox_rate_limiter::{RateLimit, RateLimiter, ShareableRateLimit, SharedRateLimiter};
+use proxmox_schema::api_types::CERT_FINGERPRINT_SHA256_SCHEMA;
+
+use crate::api_types::{ProviderQuirks, S3ClientConfig};
+use crate::aws_sign_v4::AWS_SIGN_V4_DATETIME_FORMAT;
+use crate::aws_sign_v4::{aws_sign_v4_signature, aws_sign_v4_uri_encode};
+use crate::object_key::S3ObjectKey;
+use crate::response_reader::{
+    CopyObjectResponse, DeleteError, DeleteObjectError, DeleteObjectsResponse, DeletedObject,
+    GetObjectResponse, HeadObjectResponse, ListBucketsResponse, ListObjectsV2Response,
+    PutObjectResponse, ResponseReader,
+};
+use crate::shared_request_counters::{
+    MmapFlusher, SharedRequestCounters, ThresholdExceededCallback,
+};
+
+/// Default timeout for s3 api requests.
+pub const S3_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+const S3_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const S3_TCP_KEEPIDLE_TIME: u32 = 120;
+const MAX_S3_UPLOAD_RETRY: usize = 3;
+// Assumed minimum upload rate of 1 KiB/s for dynamic put object request timeout calculation.
+const S3_MIN_ASSUMED_UPLOAD_RATE: u64 = 1024;
+const MAX_S3_HTTP_REQUEST_RETRY: usize = 3;
+const S3_HTTP_REQUEST_RETRY_BACKOFF_DEFAULT: Duration = Duration::from_secs(1);
+
+static SHARED_COUNTER_FLUSHER: LazyLock<RwLock<MmapFlusher>> =
+    LazyLock::new(|| RwLock::new(MmapFlusher::new()));
+
+/// S3 object key path prefix without the context prefix as defined by the client options.
+///
+/// The client option's context prefix will be prepended by the various client methods before
+/// sending api requests.
+pub enum S3PathPrefix {
+    /// Path prefix relative to client's context prefix
+    Some(String),
+    /// No prefix
+    None,
+}
+
+/// Options for the https connector's rate limiter
+pub struct S3RateLimiterOptions {
+    /// ID for the shared rate limiter.
+    pub id: String,
+    /// Base path for the shared memory mapped file
+    pub base_path: PathBuf,
+    /// User for the to be created shared memory mapped file and folders
+    pub user: User,
+}
+
+/// Configuration  for the https connector's rate limiter
+pub struct S3RateLimiterConfig {
+    options: S3RateLimiterOptions,
+    // bandwidth limits
+    rate_in: Option<u64>,
+    burst_in: Option<u64>,
+    rate_out: Option<u64>,
+    burst_out: Option<u64>,
+    // request rate limits
+    active: Option<u64>,
+    passive: Option<u64>,
+}
+
+/// Configuration for the s3 client's shared request counters
+pub struct S3RequestCounterConfig {
+    /// ID for the memory mapped file
+    pub id: String,
+    /// Base path for the shared memory mapped file
+    pub base_path: PathBuf,
+    /// User for the to be created shared memory mapped file and folders
+    pub user: User,
+}
+
+/// Configuration options for client
+pub struct S3ClientOptions {
+    /// Endpoint to access S3 object store.
+    pub endpoint: String,
+    /// Port to access S3 object store.
+    pub port: Option<u16>,
+    /// Bucket to access S3 object store.
+    pub bucket: Option<String>,
+    /// Common prefix within bucket to use for objects keys for this client instance.
+    pub common_prefix: String,
+    /// Use path style bucket addressing over vhost style.
+    pub path_style: bool,
+    /// Secret key for S3 object store.
+    pub secret_key: String,
+    /// Access key for S3 object store.
+    pub access_key: String,
+    /// Region to access S3 object store.
+    pub region: String,
+    /// API certificate fingerprint for self signed certificates.
+    pub fingerprint: Option<String>,
+    /// Rate limit for put requests given as #request/s.
+    pub put_rate_limit: Option<u64>,
+    /// Provider implementation specific features and limitations
+    pub provider_quirks: Vec<ProviderQuirks>,
+    /// Configuration options for the shared rate limiter.
+    pub rate_limiter_config: Option<S3RateLimiterConfig>,
+    /// Proxy configuration to be used by the client.
+    pub proxy_config: Option<ProxyConfig>,
+    /// Configuration options for the client's shared request counters.
+    pub request_counter_config: Option<S3RequestCounterConfig>,
+    /// Optional callback invoked when a request counter exceeds its threshold.
+    pub threshold_callback: Option<ThresholdExceededCallback>,
+}
+
+impl S3ClientOptions {
+    /// Construct options for the S3 client give the provided configuration parameters.
+    pub fn from_config(
+        config: S3ClientConfig,
+        secret_key: String,
+        bucket: Option<String>,
+        common_prefix: String,
+        rate_limiter_options: Option<S3RateLimiterOptions>,
+        proxy_config: Option<ProxyConfig>,
+        request_counter_config: Option<S3RequestCounterConfig>,
+    ) -> Self {
+        let rate_limiter_config = rate_limiter_options.map(|options| S3RateLimiterConfig {
+            options,
+            rate_in: config.rate_in.map(|human_bytes| human_bytes.as_u64()),
+            burst_in: config.burst_in.map(|human_bytes| human_bytes.as_u64()),
+            rate_out: config.rate_out.map(|human_bytes| human_bytes.as_u64()),
+            burst_out: config.burst_out.map(|human_bytes| human_bytes.as_u64()),
+            active: config.limit_active_requests,
+            passive: config.limit_passive_requests,
+        });
+        Self {
+            endpoint: config.endpoint,
+            port: config.port,
+            bucket,
+            common_prefix,
+            path_style: config.path_style.unwrap_or_default(),
+            region: config.region.unwrap_or("us-west-1".to_string()),
+            fingerprint: config.fingerprint,
+            access_key: config.access_key,
+            secret_key,
+            put_rate_limit: config.put_rate_limit,
+            provider_quirks: config.provider_quirks.unwrap_or_default(),
+            rate_limiter_config,
+            proxy_config,
+            request_counter_config,
+            threshold_callback: None,
+        }
+    }
+}
+
+/// S3 client for object stores compatible with the AWS S3 API
+pub struct S3Client {
+    client: Client<HttpsConnector, Body>,
+    options: S3ClientOptions,
+    authority: Authority,
+    active_request_rate_limiter: Option<Arc<SharedRateLimiter>>,
+    passive_request_rate_limiter: Option<Arc<SharedRateLimiter>>,
+    // TODO: Drop for PBS 5.
+    put_rate_limiter: Option<Arc<Mutex<RateLimiter>>>,
+    request_counters: Option<Arc<SharedRequestCounters>>,
+}
+
+impl Drop for S3Client {
+    fn drop(&mut self) {
+        if let Some(counters) = &self.request_counters {
+            SHARED_COUNTER_FLUSHER
+                .write()
+                .unwrap()
+                .remove_counter(&counters.path_buf());
+
+            if let Err(err) = counters.flush() {
+                tracing::error!("flushing s3 request counters failed: {err:?}");
+            }
+        }
+    }
+}
+
+impl S3Client {
+    /// Creates a new S3 client instance, connecting to the provided endpoint using https given the
+    /// provided options.
+    pub fn new(mut options: S3ClientOptions) -> Result<Self, Error> {
+        let expected_fingerprint = if let Some(ref fingerprint) = options.fingerprint {
+            CERT_FINGERPRINT_SHA256_SCHEMA
+                .unwrap_string_schema()
+                .check_constraints(fingerprint)
+                .context("invalid fingerprint provided")?;
+            Some(fingerprint.to_lowercase())
+        } else {
+            None
+        };
+        let verified_fingerprint = Arc::new(Mutex::new(None));
+        let trust_openssl_valid = Arc::new(Mutex::new(true));
+        let mut ssl_connector_builder = SslConnector::builder(SslMethod::tls())?;
+        ssl_connector_builder.set_verify_callback(
+            SslVerifyMode::PEER,
+            move |openssl_valid, context| match Self::verify_certificate_fingerprint(
+                openssl_valid,
+                context,
+                expected_fingerprint.clone(),
+                trust_openssl_valid.clone(),
+            ) {
+                Ok(None) => true,
+                Ok(Some(fingerprint)) => {
+                    *verified_fingerprint.lock().unwrap() = Some(fingerprint);
+                    true
+                }
+                Err(err) => {
+                    error!("certificate validation failed {err:#}");
+                    false
+                }
+            },
+        );
+
+        let mut http_connector = HttpConnector::new();
+        // want communication to object store backend api to always use https
+        http_connector.enforce_http(false);
+        http_connector.set_connect_timeout(Some(S3_HTTP_CONNECT_TIMEOUT));
+        let mut https_connector = HttpsConnector::with_connector(
+            http_connector,
+            ssl_connector_builder.build(),
+            S3_TCP_KEEPIDLE_TIME,
+        );
+
+        let (mut passive_request_rate_limiter, mut active_request_rate_limiter) = (None, None);
+        if let Some(limiter_config) = &options.rate_limiter_config {
+            if let Some(limit) = limiter_config.rate_in {
+                let limiter = SharedRateLimiter::mmap_shmem(
+                    &format!("{}.in", limiter_config.options.id),
+                    limit,
+                    limiter_config.burst_in.unwrap_or(limit),
+                    limiter_config.options.user.clone(),
+                    limiter_config.options.base_path.clone(),
+                )?;
+                https_connector.set_read_limiter(Some(Arc::new(limiter)));
+            }
+
+            if let Some(limit) = limiter_config.rate_out {
+                let limiter = SharedRateLimiter::mmap_shmem(
+                    &format!("{}.out", limiter_config.options.id),
+                    limit,
+                    limiter_config.burst_out.unwrap_or(limit),
+                    limiter_config.options.user.clone(),
+                    limiter_config.options.base_path.clone(),
+                )?;
+                https_connector.set_write_limiter(Some(Arc::new(limiter)));
+            }
+
+            if let Some(limit) = limiter_config.active {
+                let limiter = SharedRateLimiter::mmap_shmem(
+                    &format!("{}.active-requests", limiter_config.options.id),
+                    limit,
+                    limit,
+                    limiter_config.options.user.clone(),
+                    limiter_config.options.base_path.clone(),
+                )?;
+                active_request_rate_limiter = Some(Arc::new(limiter));
+            }
+
+            if let Some(limit) = limiter_config.passive {
+                let limiter = SharedRateLimiter::mmap_shmem(
+                    &format!("{}.passive-requests", limiter_config.options.id),
+                    limit,
+                    limit,
+                    limiter_config.options.user.clone(),
+                    limiter_config.options.base_path.clone(),
+                )?;
+                passive_request_rate_limiter = Some(Arc::new(limiter));
+            }
+        }
+
+        if let Some(proxy_config) = &options.proxy_config {
+            https_connector.set_proxy(proxy_config.clone());
+        }
+
+        let request_counters = if let Some(config) = options.request_counter_config.as_ref() {
+            let path = config.base_path.join(format!("{}.shmem", config.id));
+            let mut request_counters =
+                SharedRequestCounters::open_shared_memory_mapped(&path, config.user.clone())
+                    .context("failed to mmap shared S3 request counters")?;
+            if let Some(callback) = options.threshold_callback.take() {
+                request_counters.set_threshold_callback(callback);
+            }
+            let request_counters = Arc::new(request_counters);
+
+            SHARED_COUNTER_FLUSHER
+                .write()
+                .unwrap()
+                .register_counter(Arc::clone(&request_counters));
+
+            Some(request_counters)
+        } else {
+            None
+        };
+
+        let client = Client::builder(TokioExecutor::new()).build::<_, Body>(https_connector);
+
+        let authority_template = if let Some(port) = options.port {
+            format!("{}:{port}", options.endpoint)
+        } else {
+            options.endpoint.clone()
+        };
+
+        let authority = authority_template.replace("{{region}}", &options.region);
+
+        let authority = if let Some(bucket) = &options.bucket {
+            authority.replace("{{bucket}}", bucket)
+        } else {
+            authority.replace("{{bucket}}.", "")
+        };
+
+        let authority = Authority::try_from(authority)?;
+
+        let put_rate_limiter = if active_request_rate_limiter.is_none() {
+            options.put_rate_limit.map(|limit| {
+                let limiter = RateLimiter::new(limit, limit);
+                Arc::new(Mutex::new(limiter))
+            })
+        } else {
+            None
+        };
+
+        Ok(Self {
+            client,
+            options,
+            authority,
+            active_request_rate_limiter,
+            passive_request_rate_limiter,
+            put_rate_limiter,
+            request_counters,
+        })
+    }
+
+    // TODO: replace with our shared TLS cert verification once available
+    fn verify_certificate_fingerprint(
+        openssl_valid: bool,
+        context: &mut X509StoreContextRef,
+        expected_fingerprint: Option<String>,
+        trust_openssl: Arc<Mutex<bool>>,
+    ) -> Result<Option<String>, Error> {
+        let mut trust_openssl_valid = trust_openssl.lock().unwrap();
+
+        // only rely on openssl prevalidation if was not forced earlier
+        if openssl_valid && *trust_openssl_valid {
+            return Ok(None);
+        }
+
+        let certificate = match context.current_cert() {
+            Some(certificate) => certificate,
+            None => bail!("context lacks current certificate."),
+        };
+
+        // force trust in case of a chain, but set flag to no longer trust prevalidation by openssl
+        // see https://bugzilla.proxmox.com/show_bug.cgi?id=5248
+        if context.error_depth() > 0 {
+            *trust_openssl_valid = false;
+            return Ok(None);
+        }
+
+        let certificate_digest = certificate
+            .digest(MessageDigest::sha256())
+            .context("failed to calculate certificate digest")?;
+        let certificate_fingerprint = certificate_digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<Vec<String>>()
+            .join(":");
+
+        if let Some(expected_fingerprint) = expected_fingerprint {
+            if expected_fingerprint == certificate_fingerprint {
+                return Ok(Some(certificate_fingerprint));
+            }
+        }
+
+        Err(format_err!(
+            "unexpected certificate fingerprint {certificate_fingerprint}"
+        ))
+    }
+
+    /// Prepare API request by adding commonly required headers and perform request signing
+    async fn prepare(&self, mut request: Request<Body>) -> Result<Request<Body>, Error> {
+        let host_header = request
+            .uri()
+            .authority()
+            .ok_or_else(|| format_err!("request missing authority"))?
+            .to_string();
+
+        // Content verification for aws s3 signature
+        let mut hasher = Sha256::new();
+        let contents = request
+            .body()
+            .as_bytes()
+            .ok_or_else(|| format_err!("cannot prepare request with streaming body"))?;
+        hasher.update(contents);
+        // Use MD5 as upload integrity check, as other methods are not supported by all S3 object
+        // store providers and might be ignored and this is recommended by AWS as described in
+        // https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutObject.html#API_PutObject_RequestSyntax
+        let payload_md5 = md5::compute(contents);
+        let payload_digest = hex::encode(hasher.finish());
+        let payload_len = contents.len();
+
+        let epoch = proxmox_time::epoch_i64();
+        let datetime = proxmox_time::strftime_utc(AWS_SIGN_V4_DATETIME_FORMAT, epoch)?;
+
+        request
+            .headers_mut()
+            .insert("x-amz-date", HeaderValue::from_str(&datetime)?);
+        request
+            .headers_mut()
+            .insert("host", HeaderValue::from_str(&host_header)?);
+        request.headers_mut().insert(
+            "x-amz-content-sha256",
+            HeaderValue::from_str(&payload_digest)?,
+        );
+
+        let set_content_length_header = match request.method() {
+            &Method::PUT | &Method::POST => true,
+            &Method::DELETE if payload_len > 0 => true,
+            _ => false,
+        };
+        if set_content_length_header {
+            request.headers_mut().insert(
+                header::CONTENT_LENGTH,
+                HeaderValue::from_str(&payload_len.to_string())?,
+            );
+        }
+        if payload_len > 0 {
+            let md5_digest = proxmox_base64::encode(*payload_md5);
+            request
+                .headers_mut()
+                .insert("Content-MD5", HeaderValue::from_str(&md5_digest)?);
+        }
+
+        let signature = aws_sign_v4_signature(&request, &self.options, epoch, &payload_digest)?;
+
+        request
+            .headers_mut()
+            .insert(header::AUTHORIZATION, HeaderValue::from_str(&signature)?);
+
+        Ok(request)
+    }
+
+    /// Send API request to the configured endpoint using the inner https client.
+    async fn send(
+        &self,
+        request: Request<Body>,
+        timeout: Option<Duration>,
+    ) -> Result<Response<Incoming>, Error> {
+        let request = self.prepare(request).await?;
+
+        let (parts, body) = request.into_parts();
+        let body_bytes = body
+            .bytes()
+            .ok_or_else(|| format_err!("cannot prepare request with streaming body"))?;
+
+        let deadline = timeout.map(|timeout| tokio::time::Instant::now() + timeout);
+
+        for retry in 0..MAX_S3_HTTP_REQUEST_RETRY {
+            let request = Request::from_parts(parts.clone(), Body::from(body_bytes.clone()));
+            if let Some(limiter) = &self.active_request_rate_limiter {
+                if matches!(parts.method, Method::PUT | Method::POST | Method::DELETE) {
+                    let sleep = limiter.register_traffic(Instant::now(), 1);
+                    tokio::time::sleep(sleep).await;
+                }
+            } else if let Some(limiter) = &self.put_rate_limiter {
+                //TODO: Drop with PBS 5
+                if parts.method == Method::PUT {
+                    let sleep = {
+                        let mut limiter = limiter.lock().unwrap();
+                        limiter.register_traffic(Instant::now(), 1)
+                    };
+                    tokio::time::sleep(sleep).await;
+                }
+            }
+
+            if let Some(limiter) = &self.passive_request_rate_limiter {
+                if matches!(parts.method, Method::GET | Method::HEAD) {
+                    let sleep = limiter.register_traffic(Instant::now(), 1);
+                    tokio::time::sleep(sleep).await;
+                }
+            }
+
+            let response = if let Some(deadline) = deadline {
+                tokio::time::timeout_at(deadline, self.client.request(request))
+                    .await
+                    .context("request timeout reached")?
+            } else {
+                self.client.request(request).await
+            };
+
+            let do_retry = match &response {
+                Ok(response) => matches!(
+                    response.status(),
+                    StatusCode::INTERNAL_SERVER_ERROR
+                        | StatusCode::SERVICE_UNAVAILABLE
+                        | StatusCode::GATEWAY_TIMEOUT
+                        | StatusCode::TOO_MANY_REQUESTS
+                ),
+                Err(_) => true,
+            };
+
+            if !do_retry || retry >= MAX_S3_HTTP_REQUEST_RETRY - 1 {
+                if let Some(counters) = self.request_counters.as_ref()
+                    && response.is_ok()
+                {
+                    let _prev = counters.increment(parts.method.clone(), Ordering::AcqRel);
+                    let transferred: u64 = body_bytes
+                        .len()
+                        .try_into()
+                        .context("failed to account for upload traffic")?;
+                    let _prev_uploaded = counters.add_upload_traffic(transferred, Ordering::AcqRel);
+
+                    // okay in async context since request_flush() is non-blocking
+                    let _ = SHARED_COUNTER_FLUSHER.read().unwrap().request_flush();
+                }
+                return Ok(response?);
+            }
+
+            let backoff_secs = S3_HTTP_REQUEST_RETRY_BACKOFF_DEFAULT * 3_u32.pow(retry as u32);
+            tokio::time::sleep(backoff_secs).await;
+        }
+
+        bail!("failed to send request exceeding retries");
+    }
+
+    /// Check if bucket exists and got permissions to access it.
+    /// See reference docs: https://docs.aws.amazon.com/AmazonS3/latest/API/API_HeadBucket.html
+    pub async fn head_bucket(&self) -> Result<(), Error> {
+        let request = Request::builder()
+            .method(Method::HEAD)
+            .uri(self.build_uri("/", &[])?)
+            .body(Body::empty())?;
+        let response = self.send(request, Some(S3_HTTP_REQUEST_TIMEOUT)).await?;
+        let (parts, _body) = response.into_parts();
+
+        match parts.status {
+            StatusCode::OK => (),
+            StatusCode::BAD_REQUEST | StatusCode::FORBIDDEN | StatusCode::NOT_FOUND => {
+                bail!("bucket does not exist or no permission to access it")
+            }
+            status_code => bail!("unexpected status code {status_code}"),
+        }
+
+        Ok(())
+    }
+
+    /// List all buckets owned by the user authenticated via the access key.
+    /// See reference docs: https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListBuckets.html
+    pub async fn list_buckets(&self) -> Result<ListBucketsResponse, Error> {
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri(self.build_uri("/", &[])?)
+            .body(Body::empty())?;
+        let response = self.send(request, Some(S3_HTTP_REQUEST_TIMEOUT)).await?;
+        let response_reader = ResponseReader::new(response, self.request_counters.clone());
+        response_reader.list_buckets_response().await
+    }
+
+    /// Fetch metadata from an object without returning the object itself.
+    /// See reference docs: https://docs.aws.amazon.com/AmazonS3/latest/API/API_HeadObject.html
+    pub async fn head_object(
+        &self,
+        object_key: S3ObjectKey,
+    ) -> Result<Option<HeadObjectResponse>, Error> {
+        let object_key = object_key.to_full_key(&self.options.common_prefix);
+        let request = Request::builder()
+            .method(Method::HEAD)
+            .uri(self.build_uri(&object_key, &[])?)
+            .body(Body::empty())?;
+        let response = self.send(request, Some(S3_HTTP_REQUEST_TIMEOUT)).await?;
+        let response_reader = ResponseReader::new(response, self.request_counters.clone());
+        response_reader.head_object_response().await
+    }
+
+    /// Fetch an object from object store.
+    /// See reference docs: https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetObject.html
+    pub async fn get_object(
+        &self,
+        object_key: S3ObjectKey,
+    ) -> Result<Option<GetObjectResponse>, Error> {
+        let object_key = object_key.to_full_key(&self.options.common_prefix);
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri(self.build_uri(&object_key, &[])?)
+            .body(Body::empty())?;
+
+        let response = self.send(request, Some(S3_HTTP_REQUEST_TIMEOUT)).await?;
+        let response_reader = ResponseReader::new(response, self.request_counters.clone());
+        response_reader.get_object_response().await
+    }
+
+    /// Returns some or all (up to 1,000) of the objects in a bucket with each request.
+    /// See reference docs: https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetObjectTagging.html
+    pub async fn list_objects_v2(
+        &self,
+        prefix: &S3PathPrefix,
+        continuation_token: Option<&str>,
+    ) -> Result<ListObjectsV2Response, Error> {
+        let mut query = vec![("list-type", "2")];
+        let abs_prefix: String;
+        if let S3PathPrefix::Some(prefix) = prefix {
+            abs_prefix = if prefix.starts_with("/") {
+                format!("{}{prefix}", self.options.common_prefix)
+            } else {
+                format!("{}/{prefix}", self.options.common_prefix)
+            };
+            query.push(("prefix", &abs_prefix));
+        }
+        if let Some(token) = continuation_token {
+            query.push(("continuation-token", token));
+        }
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri(self.build_uri("/", &query)?)
+            .body(Body::empty())?;
+
+        let response = self.send(request, Some(S3_HTTP_REQUEST_TIMEOUT)).await?;
+        let response_reader = ResponseReader::new(response, self.request_counters.clone());
+        response_reader.list_objects_v2_response().await
+    }
+
+    /// Add a new object to a bucket.
+    ///
+    /// Do not reupload if an object with matching key already exists in the bucket if the replace
+    /// flag is not set.
+    /// See reference docs: https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutObject.html
+    pub async fn put_object(
+        &self,
+        object_key: S3ObjectKey,
+        object_data: Body,
+        timeout: Option<Duration>,
+        replace: bool,
+    ) -> Result<PutObjectResponse, Error> {
+        let object_key = object_key.to_full_key(&self.options.common_prefix);
+        let mut request = Request::builder()
+            .method(Method::PUT)
+            .uri(self.build_uri(&object_key, &[])?)
+            .header(header::CONTENT_TYPE, "application/octet-stream");
+
+        if !replace {
+            // Some providers not implement this and fails with error if the header is set,
+            // see https://forum.proxmox.com/threads/168834/post-786278
+            if !self
+                .options
+                .provider_quirks
+                .contains(&ProviderQuirks::SkipIfNoneMatchHeader)
+            {
+                request = request.header(header::IF_NONE_MATCH, "*");
+            }
+        }
+
+        let request = request.body(object_data)?;
+
+        let response = self.send(request, timeout).await?;
+        let response_reader = ResponseReader::new(response, self.request_counters.clone());
+        response_reader.put_object_response().await
+    }
+
+    /// Removes an object from a bucket.
+    /// See reference docs: https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteObject.html
+    pub async fn delete_object(&self, object_key: S3ObjectKey) -> Result<DeletedObject, Error> {
+        self.delete_object_impl(object_key)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn delete_object_impl(
+        &self,
+        object_key: S3ObjectKey,
+    ) -> Result<DeletedObject, DeleteError> {
+        let object_key = object_key.to_full_key(&self.options.common_prefix);
+        let request = Request::builder()
+            .method(Method::DELETE)
+            .uri(
+                self.build_uri(&object_key, &[])
+                    .map_err(DeleteError::Parsing)?,
+            )
+            .body(Body::empty())
+            .map_err(|err| DeleteError::Parsing(err.into()))?;
+
+        let response = self
+            .send(request, None)
+            .await
+            .map_err(DeleteError::Parsing)?;
+        let response_reader = ResponseReader::new(response, self.request_counters.clone());
+        response_reader.delete_object_response(object_key).await
+    }
+
+    /// Delete multiple objects from a bucket using a single HTTP request.
+    /// See reference docs: https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteObjects.html
+    pub async fn delete_objects(
+        &self,
+        object_keys: &[S3ObjectKey],
+    ) -> Result<DeleteObjectsResponse, Error> {
+        if object_keys.is_empty() {
+            return Ok(DeleteObjectsResponse::default());
+        }
+
+        if self
+            .options
+            .provider_quirks
+            .contains(&ProviderQuirks::DeleteObjectsViaDeleteObject)
+        {
+            let mut response = DeleteObjectsResponse::default();
+            response.deleted = Some(Vec::with_capacity(object_keys.len()));
+
+            for object_key in object_keys {
+                match self.delete_object_impl(object_key.clone()).await {
+                    Ok(deleted_object) => {
+                        let deleted = response.deleted.get_or_insert(Vec::new());
+                        deleted.push(deleted_object);
+                    }
+                    Err(err) => {
+                        let errors = response.error.get_or_insert(Vec::new());
+                        let err = match err {
+                            DeleteError::Response(err) => err,
+                            DeleteError::Parsing(err) => DeleteObjectError {
+                                code: None,
+                                key: Some(object_key.clone()),
+                                message: Some(format!("{err}")),
+                                version_id: None,
+                            },
+                        };
+                        errors.push(err);
+                    }
+                }
+            }
+
+            return Ok(response);
+        }
+
+        let mut body = String::from(r#"<Delete xmlns="http://s3.amazonaws.com/doc/2006-03-01/">"#);
+        for object_key in object_keys {
+            body.push_str("<Object><Key>");
+            body.push_str(object_key);
+            body.push_str("</Key></Object>");
+        }
+        body.push_str("</Delete>");
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(self.build_uri("/", &[("delete", "")])?)
+            .body(Body::from(body))?;
+
+        let response = self.send(request, Some(S3_HTTP_REQUEST_TIMEOUT)).await?;
+        let response_reader = ResponseReader::new(response, self.request_counters.clone());
+        response_reader.delete_objects_response().await
+    }
+
+    /// Creates a copy of an object that is already stored in Amazon S3.
+    /// Uses the `x-amz-metadata-directive` set to `REPLACE`, therefore resulting in updated metadata.
+    /// See reference docs: https://docs.aws.amazon.com/AmazonS3/latest/API/API_CopyObject.html
+    pub async fn copy_object(
+        &self,
+        source_key: S3ObjectKey,
+        destination_key: S3ObjectKey,
+    ) -> Result<CopyObjectResponse, Error> {
+        let bucket = match &self.options.bucket {
+            Some(bucket) => bucket,
+            None => bail!("missing bucket name for copy source"),
+        };
+        let copy_source = source_key.to_copy_source_key(bucket, &self.options.common_prefix);
+        let copy_source = aws_sign_v4_uri_encode(&copy_source, true);
+        let destination_key = destination_key.to_full_key(&self.options.common_prefix);
+        let request = Request::builder()
+            .method(Method::PUT)
+            .uri(self.build_uri(&destination_key, &[])?)
+            .header("x-amz-copy-source", HeaderValue::from_str(&copy_source)?)
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .header(
+                "x-amz-metadata-directive",
+                HeaderValue::from_str("REPLACE")?,
+            )
+            .body(Body::empty())?;
+
+        let response = self.send(request, Some(S3_HTTP_REQUEST_TIMEOUT)).await?;
+        let response_reader = ResponseReader::new(response, self.request_counters.clone());
+        response_reader.copy_object_response().await
+    }
+
+    /// Delete objects by given key prefix.
+    /// Requires at least 2 api calls.
+    pub async fn delete_objects_by_prefix(
+        &self,
+        prefix: &S3PathPrefix,
+    ) -> Result<Vec<DeleteObjectError>, Error> {
+        // S3 API does not provide a convenient way to delete objects by key prefix.
+        // List all objects with given group prefix and delete all objects found, so this
+        // requires at least 2 API calls.
+        let mut next_continuation_token: Option<String> = None;
+        let mut delete_errors = Vec::new();
+        loop {
+            let list_objects_result = self
+                .list_objects_v2(prefix, next_continuation_token.as_deref())
+                .await?;
+
+            let objects_to_delete: Vec<S3ObjectKey> = list_objects_result
+                .contents
+                .into_iter()
+                .map(|item| item.key)
+                .collect();
+
+            let response = self.delete_objects(&objects_to_delete).await?;
+            if let Some(mut errors) = response.error {
+                delete_errors.append(&mut errors);
+            }
+
+            if list_objects_result.is_truncated {
+                next_continuation_token = list_objects_result
+                    .next_continuation_token
+                    .as_ref()
+                    .cloned();
+                continue;
+            }
+            break;
+        }
+        Ok(delete_errors)
+    }
+
+    /// Delete objects by given key prefix, but exclude items pre-filter based on suffix
+    /// (including the parent component of the matched suffix). E.g. do not remove items in a
+    /// snapshot directory, by matching based on the protected file marker (given as suffix).
+    /// Items matching the suffix provided as `ignore` will be excluded in the parent of a matching
+    /// suffix entry. E.g. owner and notes for a group, if a group snapshots was matched by a
+    /// protected marker.
+    ///
+    /// Requires at least 2 api calls.
+    pub async fn delete_objects_by_prefix_with_suffix_filter(
+        &self,
+        prefix: &S3PathPrefix,
+        suffix: &str,
+        excldue_from_parent: &[&str],
+    ) -> Result<Vec<DeleteObjectError>, Error> {
+        // S3 API does not provide a convenient way to delete objects by key prefix.
+        // List all objects with given group prefix and delete all objects found, so this
+        // requires at least 2 API calls.
+        let mut next_continuation_token: Option<String> = None;
+        let mut delete_errors = Vec::new();
+        let mut prefix_filters = Vec::new();
+        let mut list_objects = Vec::new();
+        loop {
+            let list_objects_result = self
+                .list_objects_v2(prefix, next_continuation_token.as_deref())
+                .await?;
+
+            let mut prefixes: Vec<String> = list_objects_result
+                .contents
+                .iter()
+                .filter_map(|item| {
+                    let prefix_filter = item.key.strip_suffix(suffix).map(|prefix| {
+                        let path = Path::new(prefix);
+                        if let Some(parent) = path.parent() {
+                            for filter in excldue_from_parent {
+                                let filter = parent.join(filter);
+                                // valid utf-8 as combined from `str` values
+                                prefix_filters.push(filter.to_string_lossy().to_string());
+                            }
+                        }
+                        prefix.to_string()
+                    });
+                    if prefix_filter.is_none() {
+                        list_objects.push(item.key.clone());
+                    }
+                    prefix_filter
+                })
+                .collect();
+            prefix_filters.append(&mut prefixes);
+
+            if list_objects_result.is_truncated {
+                next_continuation_token = list_objects_result
+                    .next_continuation_token
+                    .as_ref()
+                    .cloned();
+                continue;
+            }
+            break;
+        }
+
+        let objects_to_delete: Vec<S3ObjectKey> = list_objects
+            .into_iter()
+            .filter_map(|item| {
+                for prefix in &prefix_filters {
+                    if item.strip_prefix(prefix).is_some() {
+                        return None;
+                    }
+                }
+                Some(item)
+            })
+            .collect();
+
+        for objects in objects_to_delete.chunks(1000) {
+            let response = self.delete_objects(objects).await?;
+            if let Some(mut errors) = response.error {
+                delete_errors.append(&mut errors);
+            }
+        }
+
+        Ok(delete_errors)
+    }
+
+    /// Upload the given object via the S3 api, not replacing it if already present in the object
+    /// store.
+    /// Retrying up to 3 times in case of error.
+    #[inline(always)]
+    pub async fn upload_no_replace_with_retry(
+        &self,
+        object_key: S3ObjectKey,
+        object_data: Bytes,
+    ) -> Result<bool, Error> {
+        let replace = false;
+        self.do_upload_with_retry(object_key, object_data, replace)
+            .await
+    }
+
+    /// Upload the given object via the S3 api, replacing it if already present in the object store.
+    /// Retrying up to 3 times in case of error.
+    #[inline(always)]
+    pub async fn upload_replace_with_retry(
+        &self,
+        object_key: S3ObjectKey,
+        object_data: Bytes,
+    ) -> Result<bool, Error> {
+        let replace = true;
+        self.do_upload_with_retry(object_key, object_data, replace)
+            .await
+    }
+
+    /// Helper to perform the object upload and retry, wrapped by the corresponding methods
+    /// to mask the `replace` flag.
+    async fn do_upload_with_retry(
+        &self,
+        object_key: S3ObjectKey,
+        object_data: Bytes,
+        replace: bool,
+    ) -> Result<bool, Error> {
+        let content_size = object_data.len() as u64;
+        let timeout_secs = content_size
+            .div_ceil(S3_MIN_ASSUMED_UPLOAD_RATE)
+            .max(S3_HTTP_REQUEST_TIMEOUT.as_secs());
+        let timeout = Some(Duration::from_secs(timeout_secs));
+        for retry in 0..MAX_S3_UPLOAD_RETRY {
+            let body = Body::from(object_data.clone());
+            match self
+                .put_object(object_key.clone(), body, timeout, replace)
+                .await
+            {
+                Ok(PutObjectResponse::Success(_response_body)) => return Ok(false),
+                Ok(PutObjectResponse::PreconditionFailed) => return Ok(true),
+                Ok(PutObjectResponse::NeedsRetry) => {
+                    if retry >= MAX_S3_UPLOAD_RETRY - 1 {
+                        bail!("concurrent operation, upload failed");
+                    }
+                }
+                Err(err) => {
+                    if retry >= MAX_S3_UPLOAD_RETRY - 1 {
+                        return Err(err.context("upload failed"));
+                    }
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    #[inline(always)]
+    /// Helper to generate [`Uri`] instance with common properties based on given path and query.
+    fn build_uri(&self, mut path: &str, query: &[(&str, &str)]) -> Result<Uri, Error> {
+        if path.starts_with('/') {
+            path = &path[1..];
+        }
+        let path = aws_sign_v4_uri_encode(path, true);
+        let mut path_and_query = if self.options.path_style {
+            if let Some(bucket) = &self.options.bucket {
+                format!("/{bucket}/{path}")
+            } else {
+                format!("/{path}")
+            }
+        } else {
+            format!("/{path}")
+        };
+
+        if !query.is_empty() {
+            path_and_query.push('?');
+            // No further input validation as http::uri::Builder will check path and query
+            let mut query_iter = query.iter().peekable();
+            while let Some((key, value)) = query_iter.next() {
+                let key = aws_sign_v4_uri_encode(key, false);
+                path_and_query.push_str(&key);
+                if !value.is_empty() {
+                    let value = aws_sign_v4_uri_encode(value, false);
+                    path_and_query.push('=');
+                    path_and_query.push_str(&value);
+                }
+                if query_iter.peek().is_some() {
+                    path_and_query.push('&');
+                }
+            }
+        }
+
+        let path_and_query =
+            PathAndQuery::from_str(&path_and_query).context("failed to parse path and query")?;
+
+        let mut uri_parts = Parts::default();
+        uri_parts.scheme = Some(Scheme::HTTPS);
+        uri_parts.authority = Some(self.authority.clone());
+        uri_parts.path_and_query = Some(path_and_query);
+
+        Uri::from_parts(uri_parts).context("failed to build uri")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestDirectory(PathBuf);
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn active_and_passive_requests_use_separate_buckets() -> Result<(), Error> {
+        // The production mapping requires tmpfs; no S3 connection is made by the constructor.
+        let directory = TestDirectory(proxmox_sys::fs::make_tmp_dir("/dev/shm", None)?);
+        let user = User::from_uid(nix::unistd::Uid::current())?
+            .ok_or_else(|| format_err!("current user not found"))?;
+        let config = S3ClientConfig {
+            endpoint: "s3.example.invalid".to_string(),
+            access_key: "test".to_string(),
+            port: None,
+            region: None,
+            fingerprint: None,
+            path_style: None,
+            put_rate_limit: None,
+            provider_quirks: None,
+            rate_in: None,
+            burst_in: None,
+            rate_out: None,
+            burst_out: None,
+            limit_active_requests: Some(2),
+            limit_passive_requests: Some(10),
+            use_node_proxy: None,
+        };
+        let options = S3ClientOptions::from_config(
+            config,
+            "secret".to_string(),
+            None,
+            String::new(),
+            Some(S3RateLimiterOptions {
+                id: "test".to_string(),
+                base_path: directory.0.clone(),
+                user,
+            }),
+            None,
+            None,
+        );
+        let client = S3Client::new(options)?;
+        let active = client.active_request_rate_limiter.as_ref().unwrap();
+        let passive = client.passive_request_rate_limiter.as_ref().unwrap();
+
+        // Settle initialization at a single timestamp, then exhaust each bucket independently.
+        let now = Instant::now() + Duration::from_secs(2);
+        active.register_traffic(now, 0);
+        passive.register_traffic(now, 0);
+        assert_eq!(active.register_traffic(now, 2), Duration::ZERO);
+        assert_eq!(active.register_traffic(now, 1), Duration::from_millis(500));
+        assert_eq!(passive.traffic(), 0);
+        assert_eq!(passive.register_traffic(now, 10), Duration::ZERO);
+        assert_eq!(passive.register_traffic(now, 1), Duration::from_millis(100));
+        assert_eq!(active.traffic(), 3);
+        Ok(())
+    }
+}

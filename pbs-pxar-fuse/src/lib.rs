@@ -5,7 +5,6 @@ use std::ffi::{OsStr, OsString};
 use std::future::Future;
 use std::io;
 use std::mem;
-use std::ops::Range;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::pin::Pin;
@@ -13,17 +12,17 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll};
 
-use anyhow::{format_err, Error};
+use anyhow::{Error, format_err};
 use futures::channel::mpsc::UnboundedSender;
 use futures::select;
 use futures::sink::SinkExt;
 use futures::stream::{StreamExt, TryStreamExt};
 
 use proxmox_io::vec;
-use pxar::accessor::{self, EntryRangeInfo, ReadAt};
+use pxar::accessor::{self, ContentRange, EntryRangeInfo, ReadAt};
 
 use proxmox_fuse::requests::{self, FuseRequest};
-use proxmox_fuse::{EntryParam, Fuse, ReplyBufState, Request, ROOT_ID};
+use proxmox_fuse::{EntryParam, Fuse, ROOT_ID, ReplyBufState, Request};
 use proxmox_lang::io_format_err;
 use proxmox_sys::fs::xattr;
 
@@ -64,12 +63,24 @@ impl Session {
         options: &OsStr,
         verbose: bool,
         mountpoint: &Path,
+        payload_input_path: Option<&Path>,
     ) -> Result<Self, Error> {
         // TODO: Add a buffered/caching ReadAt layer?
         let file = std::fs::File::open(archive_path)?;
         let file_size = file.metadata()?.len();
         let reader: Reader = Arc::new(accessor::sync::FileReader::new(file));
-        let accessor = Accessor::new(reader, file_size).await?;
+        let accessor = if let Some(payload_input) = payload_input_path {
+            let payload_file = std::fs::File::open(payload_input)?;
+            let payload_size = payload_file.metadata()?.len();
+            let payload_reader: Reader = Arc::new(accessor::sync::FileReader::new(payload_file));
+            Accessor::new(
+                pxar::PxarVariant::Split(reader, (payload_reader, payload_size)),
+                file_size,
+            )
+            .await?
+        } else {
+            Accessor::new(pxar::PxarVariant::Unified(reader), file_size).await?
+        };
         Self::mount(accessor, options, verbose, mountpoint)
     }
 
@@ -121,7 +132,7 @@ struct Lookup {
     inode: u64,
     parent: u64,
     entry_range_info: EntryRangeInfo,
-    content_range: Option<Range<u64>>,
+    content_range: Option<ContentRange>,
 }
 
 impl Lookup {
@@ -129,7 +140,7 @@ impl Lookup {
         inode: u64,
         parent: u64,
         entry_range_info: EntryRangeInfo,
-        content_range: Option<Range<u64>>,
+        content_range: Option<ContentRange>,
     ) -> Box<Lookup> {
         Box::new(Self {
             refs: AtomicUsize::new(1),
@@ -179,16 +190,16 @@ struct LookupRef<'a> {
     lookup: *const Lookup,
 }
 
-unsafe impl<'a> Send for LookupRef<'a> {}
-unsafe impl<'a> Sync for LookupRef<'a> {}
+unsafe impl Send for LookupRef<'_> {}
+unsafe impl Sync for LookupRef<'_> {}
 
-impl<'a> Clone for LookupRef<'a> {
+impl Clone for LookupRef<'_> {
     fn clone(&self) -> Self {
         self.get_ref(self.session)
     }
 }
 
-impl<'a> std::ops::Deref for LookupRef<'a> {
+impl std::ops::Deref for LookupRef<'_> {
     type Target = Lookup;
 
     fn deref(&self) -> &Self::Target {
@@ -196,7 +207,7 @@ impl<'a> std::ops::Deref for LookupRef<'a> {
     }
 }
 
-impl<'a> Drop for LookupRef<'a> {
+impl Drop for LookupRef<'_> {
     fn drop(&mut self) {
         if self.lookup.is_null() {
             return;
@@ -398,7 +409,7 @@ impl SessionImpl {
         }
     }
 
-    fn get_lookup(&self, inode: u64) -> Result<LookupRef, Error> {
+    fn get_lookup(&'_ self, inode: u64) -> Result<LookupRef<'_>, Error> {
         let lookups = self.lookups.read().unwrap();
         if let Some(lookup) = lookups.get(&inode) {
             return Ok(lookup.get_ref(self));
@@ -424,18 +435,27 @@ impl SessionImpl {
         }
     }
 
-    fn open_content(&self, lookup: &LookupRef) -> Result<FileContents, Error> {
+    async fn open_content<'a>(&'a self, lookup: &'a LookupRef<'a>) -> Result<FileContents, Error> {
         if is_dir_inode(lookup.inode) {
             io_return!(libc::EISDIR);
         }
 
-        match lookup.content_range.clone() {
-            Some(range) => Ok(unsafe { self.accessor.open_contents_at_range(range) }),
+        match &lookup.content_range {
+            Some(range) => self
+                .accessor
+                .open_contents_at_range(range)
+                .await
+                .map_err(|err| err.into()),
             None => io_return!(libc::EBADF),
         }
     }
 
-    fn make_lookup(&self, parent: u64, inode: u64, entry: &FileEntry) -> Result<LookupRef, Error> {
+    fn make_lookup(
+        &'_ self,
+        parent: u64,
+        inode: u64,
+        entry: &FileEntry,
+    ) -> Result<LookupRef<'_>, Error> {
         let lookups = self.lookups.read().unwrap();
         if let Some(lookup) = lookups.get(&inode) {
             return Ok(lookup.get_ref(self));
@@ -603,7 +623,7 @@ impl SessionImpl {
 
     async fn read(&self, inode: u64, len: usize, offset: u64) -> Result<Vec<u8>, Error> {
         let file = self.get_lookup(inode)?;
-        let content = self.open_content(&file)?;
+        let content = self.open_content(&file).await?;
         let mut buf = vec::undefined(len);
         let mut pos = 0;
         // fuse' read is different from normal read - no short reads allowed except for EOF!
@@ -639,7 +659,7 @@ impl SessionImpl {
         use pxar::format::XAttr;
 
         if let Some(fcaps) = metadata.fcaps {
-            xattrs.push(XAttr::new(xattr::xattr_name_fcaps().to_bytes(), fcaps.data));
+            xattrs.push(XAttr::new(xattr::XATTR_NAME_FCAPS.to_bytes(), fcaps.data));
         }
 
         // TODO: Special cases:

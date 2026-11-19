@@ -1,17 +1,14 @@
-use std::path::Path;
-
-use anyhow::{bail, format_err, Error};
+use anyhow::{Error, bail, format_err};
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use pbs_api_types::{BackupType, CryptMode, Fingerprint};
+use pbs_api_types::{BackupArchiveName, BackupType, CryptMode, Fingerprint, SnapshotVerifyState};
 use pbs_tools::crypt_config::CryptConfig;
 
-pub const MANIFEST_BLOB_NAME: &str = "index.json.blob";
+use super::DataBlob;
+
 pub const MANIFEST_LOCK_NAME: &str = ".index.json.lck";
-pub const CLIENT_LOG_BLOB_NAME: &str = "client.log.blob";
-pub const ENCRYPTED_KEY_BLOB_NAME: &str = "rsa-encrypted.key.blob";
 
 fn crypt_mode_none() -> CryptMode {
     CryptMode::None
@@ -23,7 +20,8 @@ fn empty_value() -> Value {
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct FileInfo {
-    pub filename: String,
+    #[serde(deserialize_with = "pbs_api_types::BackupArchiveName::deserialize_strict")]
+    pub filename: BackupArchiveName,
     #[serde(default = "crypt_mode_none")] // to be compatible with < 0.8.0 backups
     pub crypt_mode: CryptMode,
     pub size: u64,
@@ -56,31 +54,6 @@ pub struct BackupManifest {
     pub signature: Option<String>,
 }
 
-#[derive(PartialEq, Eq)]
-pub enum ArchiveType {
-    FixedIndex,
-    DynamicIndex,
-    Blob,
-}
-
-impl ArchiveType {
-    pub fn from_path(archive_name: impl AsRef<Path>) -> Result<Self, Error> {
-        let archive_name = archive_name.as_ref();
-        let archive_type = match archive_name.extension().and_then(|ext| ext.to_str()) {
-            Some("didx") => ArchiveType::DynamicIndex,
-            Some("fidx") => ArchiveType::FixedIndex,
-            Some("blob") => ArchiveType::Blob,
-            _ => bail!("unknown archive type: {:?}", archive_name),
-        };
-        Ok(archive_type)
-    }
-}
-
-//#[deprecated(note = "use ArchivType::from_path instead")] later...
-pub fn archive_type<P: AsRef<Path>>(archive_name: P) -> Result<ArchiveType, Error> {
-    ArchiveType::from_path(archive_name)
-}
-
 impl BackupManifest {
     pub fn new(snapshot: pbs_api_types::BackupDir) -> Self {
         Self {
@@ -95,14 +68,13 @@ impl BackupManifest {
 
     pub fn add_file(
         &mut self,
-        filename: String,
+        filename: &BackupArchiveName,
         size: u64,
         csum: [u8; 32],
         crypt_mode: CryptMode,
     ) -> Result<(), Error> {
-        let _archive_type = ArchiveType::from_path(&filename)?; // check type
         self.files.push(FileInfo {
-            filename,
+            filename: filename.clone(),
             size,
             csum,
             crypt_mode,
@@ -114,8 +86,8 @@ impl BackupManifest {
         &self.files[..]
     }
 
-    pub fn lookup_file_info(&self, name: &str) -> Result<&FileInfo, Error> {
-        let info = self.files.iter().find(|item| item.filename == name);
+    pub fn lookup_file_info(&self, name: &BackupArchiveName) -> Result<&FileInfo, Error> {
+        let info = self.files.iter().find(|item| item.filename == *name);
 
         match info {
             None => bail!("manifest does not contain file '{}'", name),
@@ -123,7 +95,12 @@ impl BackupManifest {
         }
     }
 
-    pub fn verify_file(&self, name: &str, csum: &[u8; 32], size: u64) -> Result<(), Error> {
+    pub fn verify_file(
+        &self,
+        name: &BackupArchiveName,
+        csum: &[u8; 32],
+        size: u64,
+    ) -> Result<(), Error> {
         let info = self.lookup_file_info(name)?;
 
         if size != info.size {
@@ -178,6 +155,13 @@ impl BackupManifest {
         Ok(manifest)
     }
 
+    /// Encodes the manifest as pretty printed json inside a data blob.
+    pub fn to_data_blob(&self, crypt_config: Option<&CryptConfig>) -> Result<DataBlob, Error> {
+        // serialize with crypt_config to create signature
+        // but encode without since manifests are never encrypted
+        DataBlob::encode(self.to_string(crypt_config)?.as_bytes(), None, true)
+    }
+
     pub fn fingerprint(&self) -> Result<Option<Fingerprint>, Error> {
         match &self.unprotected["key-fingerprint"] {
             Value::Null => Ok(None),
@@ -213,46 +197,110 @@ impl BackupManifest {
     }
 
     /// Try to read the manifest. This verifies the signature if there is a crypt_config.
+    ///
+    /// With a crypt config set the manifest must carry a valid signature; see
+    /// [`Self::check_signature`] for the meaning of `ignore_missing_signature`.
     pub fn from_data(
         data: &[u8],
         crypt_config: Option<&CryptConfig>,
+        ignore_missing_signature: bool,
     ) -> Result<BackupManifest, Error> {
         let json: Value = serde_json::from_slice(data)?;
-        let signature = json["signature"].as_str().map(String::from);
+        let manifest: BackupManifest = serde_json::from_value(json)?;
 
         if let Some(crypt_config) = crypt_config {
-            if let Some(signature) = signature {
-                let expected_signature = hex::encode(Self::json_signature(&json, crypt_config)?);
-
-                let fingerprint = &json["unprotected"]["key-fingerprint"];
-                if fingerprint != &Value::Null {
-                    let fingerprint = Fingerprint::deserialize(fingerprint)?;
-                    let config_fp = Fingerprint::new(crypt_config.fingerprint());
-                    if config_fp != fingerprint {
-                        bail!(
-                            "wrong key - unable to verify signature since manifest's key {} does not match provided key {}",
-                            fingerprint,
-                            config_fp
-                        );
-                    }
-                }
-                if signature != expected_signature {
-                    bail!("wrong signature in manifest");
-                }
-            } else {
-                // not signed: warn/fail?
-            }
+            manifest.check_signature(crypt_config, ignore_missing_signature)?;
         }
 
-        let manifest: BackupManifest = serde_json::from_value(json)?;
         Ok(manifest)
+    }
+
+    /// Verify the signature of the manifest by given crypt config.
+    ///
+    /// A manifest that carries no signature at all is rejected, since with a key set its integrity
+    /// cannot be verified and an attacker with write access to the backend could strip the
+    /// signature to tamper with the backup. Set `ignore_missing_signature` to accept an unsigned
+    /// manifest anyway, for example to read a genuinely unencrypted backup while an encryption key
+    /// is configured; callers that do so should warn the user, as the integrity is then unverified.
+    pub fn check_signature(
+        &self,
+        crypt_config: &CryptConfig,
+        ignore_missing_signature: bool,
+    ) -> Result<(), Error> {
+        if let Some(signature) = &self.signature {
+            let expected_signature = hex::encode(self.signature(crypt_config)?);
+
+            let fingerprint = &self.unprotected["key-fingerprint"];
+            if fingerprint != &Value::Null {
+                let fingerprint = Fingerprint::deserialize(fingerprint)?;
+                let config_fp = Fingerprint::new(crypt_config.fingerprint());
+                if config_fp != fingerprint {
+                    bail!(
+                        "wrong key - unable to verify signature since manifest's key {} does not match provided key {}",
+                        fingerprint,
+                        config_fp
+                    );
+                }
+            }
+            if *signature != expected_signature {
+                bail!("wrong signature in manifest");
+            }
+        } else if !ignore_missing_signature {
+            bail!(
+                "manifest has no signature, but an encryption key is set - refusing to trust a \
+                 potentially tampered, unsigned backup"
+            );
+        }
+        Ok(())
+    }
+
+    /// Get the verify state of the snapshot
+    ///
+    /// Note: New snapshots, which have not been verified yet, do not have a status and this
+    /// function will return `Ok(None)`.
+    pub fn verify_state(&self) -> Result<Option<SnapshotVerifyState>, anyhow::Error> {
+        let verify = self.unprotected["verify_state"].clone();
+        if verify.is_null() {
+            return Ok(None);
+        }
+        Ok(Some(serde_json::from_value::<SnapshotVerifyState>(verify)?))
+    }
+
+    /// Set the sync-source-signature used to detect snapshot changes across encrypted/decrypted
+    /// sync flows.
+    ///
+    /// Always an HMAC-SHA256 like [`Self::signature`]; the input is the source's plain manifest for
+    /// encrypt-push, or the source's `signature` field (HMAC over its encrypted manifest) for
+    /// decrypt-pull from a regular encrypted backup. Not interchangeable across flows.
+    pub fn set_sync_source_signature(&mut self, signature: &[u8; 32]) -> Result<(), Error> {
+        let fingerprint = Fingerprint::new(*signature);
+        self.unprotected["sync-source-signature"] = serde_json::to_value(fingerprint)?;
+        Ok(())
+    }
+
+    /// Get the sync-source-signature used to detect snapshot changes across encrypted/decrypted
+    /// sync flows.
+    ///
+    /// See [`Self::set_sync_source_signature`] for the two distinct flows that set this field
+    /// with different interpretations.
+    pub fn get_sync_source_signature(&self) -> Result<Option<Fingerprint>, Error> {
+        let value = if !self.unprotected["sync-source-signature"].is_null() {
+            &self.unprotected["sync-source-signature"]
+        } else if !self.unprotected["change-detection-fingerprint"].is_null() {
+            // fallback to legacy field for sync-source-signature
+            &self.unprotected["change-detection-fingerprint"]
+        } else {
+            return Ok(None);
+        };
+
+        Ok(Some(Deserialize::deserialize(value)?))
     }
 }
 
-impl TryFrom<super::DataBlob> for BackupManifest {
+impl TryFrom<DataBlob> for BackupManifest {
     type Error = Error;
 
-    fn try_from(blob: super::DataBlob) -> Result<Self, Error> {
+    fn try_from(blob: DataBlob) -> Result<Self, Error> {
         // no expected digest available
         let data = blob
             .decode(None, None)
@@ -283,8 +331,13 @@ fn test_manifest_signature() -> Result<(), Error> {
 
     let mut manifest = BackupManifest::new("host/elsa/2020-06-26T13:56:05Z".parse()?);
 
-    manifest.add_file("test1.img.fidx".into(), 200, [1u8; 32], CryptMode::Encrypt)?;
-    manifest.add_file("abc.blob".into(), 200, [2u8; 32], CryptMode::None)?;
+    manifest.add_file(
+        &"test1.img.fidx".try_into()?,
+        200,
+        [1u8; 32],
+        CryptMode::Encrypt,
+    )?;
+    manifest.add_file(&"abc.blob".try_into()?, 200, [2u8; 32], CryptMode::None)?;
 
     manifest.unprotected["note"] = "This is not protected by the signature.".into();
 
@@ -302,6 +355,177 @@ fn test_manifest_signature() -> Result<(), Error> {
     let expected_signature = hex::encode(manifest.signature(&crypt_config)?);
 
     assert_eq!(signature, expected_signature);
+
+    Ok(())
+}
+
+#[test]
+fn test_valid_manifest_archive_name_parsing() {
+    let manifest = r#"{
+        "backup-id": "106",
+        "backup-time": 1784959639,
+        "backup-type": "ct",
+        "files": [
+            {
+                "crypt-mode": "none",
+                "csum": "dfd15388c674e215e8c1d615aabb1c1a080f8354950d8c88b6892a665b9f3c94",
+                "filename": "pct.conf.blob",
+                "size": 265
+            },
+            {
+                "crypt-mode": "none",
+                "csum": "47205270a0df24cb62793a0e405879cb509593874f09475c8695ccf52666f953",
+                "filename": "root.ppxar.didx",
+                "size": 48945669473
+            },
+            {
+                "crypt-mode": "none",
+                "csum": "e50c7ef54384cbe6dd79cbeef05d0a2f0978fe3182cb65235a8e83756bc1884d",
+                "filename": "root.mpxar.didx",
+                "size": 34225163
+            }
+        ]
+    }"#;
+
+    let json: Value = serde_json::from_slice(manifest.as_bytes()).unwrap();
+    assert!(serde_json::from_value::<BackupManifest>(json).is_ok());
+}
+
+#[test]
+fn test_invalid_manifest_archive_name_parsing() {
+    let invalid_manifests = [
+        r#"{
+        "backup-id": "106",
+        "backup-time": 1784959639,
+        "backup-type": "ct",
+        "files": [
+            {
+                "crypt-mode": "none",
+                "csum": "dfd15388c674e215e8c1d615aabb1c1a080f8354950d8c88b6892a665b9f3c94",
+                "filename": "../../pct.conf.blob",
+                "size": 265
+            }
+        ]
+    }"#,
+        r#"{
+        "backup-id": "106",
+        "backup-time": 1784959639,
+        "backup-type": "ct",
+        "files": [
+            {
+                "crypt-mode": "none",
+                "csum": "47205270a0df24cb62793a0e405879cb509593874f09475c8695ccf52666f953",
+                "filename": "root.pxar",
+                "size": 48945669473
+            }
+        ]
+    }"#,
+    ];
+
+    for invalid_manifest in invalid_manifests {
+        let json: Value = serde_json::from_slice(invalid_manifest.as_bytes()).unwrap();
+        assert!(serde_json::from_value::<BackupManifest>(json).is_err());
+    }
+}
+
+#[test]
+fn test_manifest_missing_signature() -> Result<(), Error> {
+    let crypt_config = CryptConfig::new([7; 32])?;
+    let manifest = BackupManifest::new("host/elsa/2020-06-26T13:56:05Z".parse()?);
+    assert!(manifest.check_signature(&crypt_config, false).is_err());
+    manifest.check_signature(&crypt_config, true)?;
+
+    let signed: Value = serde_json::from_str(&manifest.to_string(Some(&crypt_config))?)?;
+    for remove_fingerprint in [false, true] {
+        for omit_signature in [false, true] {
+            let mut json = signed.clone();
+            if remove_fingerprint {
+                json["unprotected"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("key-fingerprint");
+            }
+            if omit_signature {
+                json.as_object_mut().unwrap().remove("signature");
+            } else {
+                json["signature"] = Value::Null;
+            }
+            let data = serde_json::to_vec(&json)?;
+            for ignore_missing_signature in [false, true] {
+                BackupManifest::from_data(&data, None, ignore_missing_signature)?;
+                assert_eq!(
+                    BackupManifest::from_data(&data, Some(&crypt_config), ignore_missing_signature)
+                        .is_ok(),
+                    ignore_missing_signature,
+                    "remove fingerprint: {remove_fingerprint}, omit signature: {omit_signature}",
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_manifest_present_signature() -> Result<(), Error> {
+    let crypt_config = CryptConfig::new([7; 32])?;
+    let other_config = CryptConfig::new([8; 32])?;
+    let mut manifest = BackupManifest::new("host/elsa/2020-06-26T13:56:05Z".parse()?);
+    manifest.add_file(
+        &"test1.img.fidx".try_into()?,
+        200,
+        [1; 32],
+        CryptMode::Encrypt,
+    )?;
+    let signed: Value = serde_json::from_str(&manifest.to_string(Some(&crypt_config))?)?;
+
+    for remove_fingerprint in [false, true] {
+        let mut json = signed.clone();
+        if remove_fingerprint {
+            json["unprotected"]
+                .as_object_mut()
+                .unwrap()
+                .remove("key-fingerprint");
+        }
+        for ignore_missing_signature in [false, true] {
+            let data = serde_json::to_vec(&json)?;
+            BackupManifest::from_data(&data, Some(&crypt_config), ignore_missing_signature)?;
+            assert!(
+                BackupManifest::from_data(&data, Some(&other_config), ignore_missing_signature)
+                    .is_err()
+            );
+
+            let mut tampered = json.clone();
+            tampered["files"][0]["size"] = 201.into();
+            assert!(
+                BackupManifest::from_data(
+                    &serde_json::to_vec(&tampered)?,
+                    Some(&crypt_config),
+                    ignore_missing_signature,
+                )
+                .is_err()
+            );
+
+            for signature in [
+                json!(""),
+                json!("invalid"),
+                json!(false),
+                json!(42),
+                json!({}),
+            ] {
+                let mut tampered = json.clone();
+                tampered["signature"] = signature;
+                assert!(
+                    BackupManifest::from_data(
+                        &serde_json::to_vec(&tampered)?,
+                        Some(&crypt_config),
+                        ignore_missing_signature,
+                    )
+                    .is_err()
+                );
+            }
+        }
+    }
 
     Ok(())
 }

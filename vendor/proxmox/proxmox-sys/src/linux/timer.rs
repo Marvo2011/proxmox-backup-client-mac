@@ -70,7 +70,7 @@ type TimerT = *mut InternalTimerT;
 
 // These wrappers are defined in -lrt.
 #[link(name = "rt")]
-extern "C" {
+unsafe extern "C" {
     fn timer_create(clockid: clockid_t, evp: *mut libc::sigevent, timer: *mut TimerT) -> c_int;
     fn timer_delete(timer: TimerT) -> c_int;
     fn timer_settime(
@@ -232,7 +232,7 @@ pub const SIGTIMEOUT: Signal = Signal(32 + 4);
 
 // Our timeout handler does exactly nothing. We only need it to interrupt
 // system calls.
-extern "C" fn sig_timeout_handler(_: c_int) {}
+unsafe extern "C" fn sig_timeout_handler(_: c_int) {}
 
 // See setup_timeout_handler().
 fn do_setup_timeout_handler() -> io::Result<()> {
@@ -271,7 +271,7 @@ fn do_setup_timeout_handler() -> io::Result<()> {
     Ok(())
 }
 
-// The first time we unblock SIGTIMEOUT should cause approprate initialization:
+// The first time we unblock SIGTIMEOUT should cause appropriate initialization:
 static SETUP_TIMEOUT_HANDLER: std::sync::Once = std::sync::Once::new();
 
 /// Setup our timeout-signal workflow. This establishes the signal handler for
@@ -314,7 +314,7 @@ impl TimeoutBlockGuard {
 }
 
 /// Unblock the timeout signal for the current thread. By default we block the
-/// signal this behavior should be restored when done using timeouts, therefor this
+/// signal this behavior should be restored when done using timeouts, therefore this
 /// returns a guard:
 #[inline(always)]
 pub fn unblock_timeout_signal() -> TimeoutBlockGuard {

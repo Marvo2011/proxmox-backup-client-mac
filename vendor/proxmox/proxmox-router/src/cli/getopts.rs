@@ -74,9 +74,21 @@ pub(crate) fn parse_argument_list<T: AsRef<str>>(
                 None => {
                     let mut want_bool = false;
                     let mut can_default = false;
-                    if let Some((_opt, Schema::Boolean(boolean_schema))) = schema.lookup(&name) {
-                        want_bool = true;
-                        can_default = matches!(boolean_schema.default, Some(false) | None);
+
+                    let mut properties = schema.lookup_all(&name).peekable();
+                    if properties.peek().is_some() {
+                        can_default = true;
+
+                        for property in properties {
+                            if let Schema::Boolean(schema) = property.schema() {
+                                want_bool = true;
+                                can_default = can_default && schema.default != Some(true);
+                            } else {
+                                want_bool = false;
+                                can_default = false;
+                                break;
+                            }
+                        }
                     }
 
                     let mut next_is_argument = false;
@@ -147,17 +159,19 @@ pub fn parse_arguments<T: AsRef<str>>(
 
     for i in 0..arg_param.len() {
         let name = arg_param[i];
-        if let Some((optional, param_schema)) = schema.lookup(name) {
+        // NOTE: we assume `arg_param` cannot point to clashing oneOf variants
+        if let Some(property) = schema.lookup_all(name).next() {
+            let optional = property.optional();
             if i == arg_param.len() - 1 {
                 last_arg_param_is_optional = optional;
-                if let Schema::Array(_) = param_schema {
+                if let Schema::Array(_) = property.schema() {
                     last_arg_param_is_array = true;
                 }
             } else if optional {
-                panic!("positional argument '{}' may not be optional", name);
+                panic!("positional argument '{name}' may not be optional");
             }
         } else {
-            panic!("no such property '{}' in schema", name);
+            panic!("no such property '{name}' in schema");
         }
     }
 
@@ -192,6 +206,69 @@ pub fn parse_arguments<T: AsRef<str>>(
     let options = schema.parse_parameter_strings(&data, true)?;
 
     Ok((options, remaining))
+}
+
+#[test]
+fn test_property_alias() {
+    const PARAMETERS: ObjectSchema = ObjectSchema::new(
+        "Parameters:",
+        &[("mode", false, &StringSchema::new("Mode.").schema())],
+    )
+    .property_aliases(&[("deprecated-mode", "mode"), ("legacy-mode", "mode")]);
+
+    let res = parse_arguments(
+        &["--legacy-mode", "fast"],
+        &[],
+        &HashMap::new(),
+        ParameterSchema::from(&PARAMETERS),
+    )
+    .expect("alias should be accepted");
+    assert_eq!(res.0["mode"], "fast");
+    assert!(res.0.get("legacy-mode").is_none());
+
+    let err = parse_arguments(
+        &["--mode", "fast", "--legacy-mode", "slow"],
+        &[],
+        &HashMap::new(),
+        ParameterSchema::from(&PARAMETERS),
+    )
+    .expect_err("specifying both canonical and alias should fail");
+    assert!(
+        format!("{err}").contains("cannot set both"),
+        "canonical-first conflict text: {err}"
+    );
+
+    // Reverse order: alias first, canonical second. Must still report `cannot set both`,
+    // not the generic `duplicate parameter` message.
+    let err = parse_arguments(
+        &["--legacy-mode", "fast", "--mode", "slow"],
+        &[],
+        &HashMap::new(),
+        ParameterSchema::from(&PARAMETERS),
+    )
+    .expect_err("reverse-order should also fail");
+    let err_text = format!("{err}");
+    assert!(
+        err_text.contains("cannot set both"),
+        "reverse-order conflict text: {err_text}"
+    );
+    assert!(
+        !err_text.contains("duplicate parameter"),
+        "reverse-order must not regress to `duplicate parameter`: {err_text}"
+    );
+
+    // Two distinct aliases of the same canonical also conflict.
+    let err = parse_arguments(
+        &["--deprecated-mode", "fast", "--legacy-mode", "slow"],
+        &[],
+        &HashMap::new(),
+        ParameterSchema::from(&PARAMETERS),
+    )
+    .expect_err("two aliases of same canonical should fail");
+    assert!(
+        format!("{err}").contains("cannot set both"),
+        "two-alias conflict text: {err}"
+    );
 }
 
 #[test]
@@ -231,7 +308,7 @@ fn test_boolean_arg() {
 }
 
 #[test]
-fn test_argument_paramenter() {
+fn test_argument_parameter() {
     use proxmox_schema::*;
 
     const PARAMETERS: ObjectSchema = ObjectSchema::new(
@@ -254,5 +331,304 @@ fn test_argument_paramenter() {
         assert!(options["enable"] == true);
         assert!(options["storage"] == "local");
         assert!(remaining.is_empty());
+    }
+}
+
+pub(crate) struct ParseOptions<'t, 'o> {
+    target: &'t mut Vec<(String, String)>,
+    option_schemas: &'o HashMap<&'o str, &'static Schema>,
+    stop_at_positional: bool,
+    stop_at_unknown: bool,
+    deny_unknown: bool,
+    retain_unknown: bool,
+    retain_separator: bool,
+}
+
+impl<'t, 'o> ParseOptions<'t, 'o> {
+    /// Create a new option parser.
+    pub fn new(
+        target: &'t mut Vec<(String, String)>,
+        option_schemas: &'o HashMap<&'o str, &'static Schema>,
+    ) -> Self {
+        Self {
+            target,
+            option_schemas,
+            stop_at_positional: false,
+            stop_at_unknown: false,
+            deny_unknown: false,
+            retain_unknown: false,
+            retain_separator: false,
+        }
+    }
+
+    /// Builder style option to deny unknown parameters.
+    pub fn deny_unknown(mut self, deny: bool) -> Self {
+        self.deny_unknown = deny;
+        self
+    }
+
+    /// Builder style option to retain unknown parameters in the returned argument array.
+    pub fn retain_unknown(mut self, deny: bool) -> Self {
+        self.retain_unknown = deny;
+        self
+    }
+
+    /// Builder style option to stop parsing on unknown parameters.
+    /// This implies deny_unknown`.
+    /// Useful for bash completion.
+    pub fn stop_at_unknown(mut self, stop: bool) -> Self {
+        self.deny_unknown = stop;
+        self.stop_at_unknown = stop;
+        self
+    }
+
+    /// Builder style option to retain a `--` in the returned argument array.
+    pub fn retain_separator(mut self, stop: bool) -> Self {
+        self.retain_separator = stop;
+        self
+    }
+
+    /// Builder style option to set whether to stop at positional parameters.
+    /// The `parse()` method will return the rest of the parameters including the first positional one.
+    pub fn stop_at_positional(mut self, stop: bool) -> Self {
+        self.stop_at_positional = stop;
+        self
+    }
+
+    /// Parse arguments with the current configuration.
+    /// Returns the positional parameters.
+    /// If `stop_at_positional` is set, non-positional parameters after the first positional one
+    /// are also included in the returned list.
+    pub fn parse<A, AI>(self, args: A) -> Result<Vec<AI>, ParameterError>
+    where
+        A: IntoIterator<Item = AI>,
+        AI: AsRef<str>,
+    {
+        let mut errors = ParameterError::new();
+        let mut positional = Vec::new();
+
+        let mut args = args.into_iter().peekable();
+        while let Some(orig_arg) = args.next() {
+            let arg = orig_arg.as_ref();
+
+            if arg == "--" {
+                if self.retain_separator {
+                    positional.push(orig_arg);
+                }
+                break;
+            }
+
+            let option = match arg.strip_prefix("--") {
+                Some(opt) => opt,
+                None => {
+                    positional.push(orig_arg);
+                    if self.stop_at_positional {
+                        break;
+                    }
+                    continue;
+                }
+            };
+
+            let (option, value) = match option.split_once('=') {
+                None => (option, None),
+                Some((option, arg)) => (option, Some(arg)),
+            };
+
+            let opt_schema = self.option_schemas.get(option).copied();
+
+            if opt_schema.is_none() {
+                if self.retain_unknown {
+                    positional.push(orig_arg);
+                    continue;
+                }
+
+                if self.deny_unknown {
+                    if self.stop_at_unknown {
+                        positional.push(orig_arg);
+                        break;
+                    }
+                    errors.push(option.to_string(), format_err!("unknown option {option:?}"));
+                }
+            }
+
+            if let Some(value) = value {
+                self.target.push((option.to_string(), value.to_string()));
+                continue;
+            }
+
+            match opt_schema {
+                Some(Schema::Boolean(schema)) => {
+                    if let Some(value) = args.next_if(|v| parse_boolean(v.as_ref()).is_ok()) {
+                        self.target
+                            .push((option.to_string(), value.as_ref().to_string()));
+                    } else {
+                        // next parameter is not a boolean value
+                        if schema.default == Some(true) {
+                            // default-true booleans cannot be passed without values:
+                            errors.push(option.to_string(), format_err!("missing boolean value."));
+                        }
+                        self.target.push((option.to_string(), "true".to_string()))
+                    }
+                }
+                _ => {
+                    // no schema, assume `--key value`.
+                    let next = match args.next() {
+                        Some(next) => next.as_ref().to_string(),
+                        None => {
+                            errors
+                                .push(option.to_string(), format_err!("missing parameter value."));
+                            break;
+                        }
+                    };
+                    self.target.push((option.to_string(), next.to_string()));
+                    continue;
+                }
+            }
+        }
+
+        if !errors.is_empty() {
+            return Err(errors);
+        }
+
+        positional.extend(args);
+        Ok(positional)
+    }
+}
+
+#[test]
+fn test_parse_options() {
+    const ARG_ENUM: Schema = StringSchema::new("An enum option.")
+        .format(&ApiStringFormat::Enum(&[
+            EnumEntry::new("one", "Option one."),
+            EnumEntry::new("two", "Option two."),
+        ]))
+        .schema();
+
+    const ARG_STR1: Schema = StringSchema::new("A string option.")
+        .min_length(2)
+        .max_length(16)
+        .schema();
+
+    const ARG_INT1: Schema = IntegerSchema::new("An integer option.").schema();
+    const ARG_INT2: Schema = IntegerSchema::new("Another integer option.")
+        .minimum(42)
+        .schema();
+
+    const ARG_BOOL1: Schema = BooleanSchema::new("A boolean option.").schema();
+    const ARG_BOOL2: Schema = BooleanSchema::new("Another boolean option.").schema();
+
+    let mut schema = HashMap::<&'static str, &'static Schema>::new();
+    schema.insert("enum", &ARG_ENUM);
+    schema.insert("str1", &ARG_STR1);
+    schema.insert("int1", &ARG_INT1);
+    schema.insert("int2", &ARG_INT2);
+    schema.insert("bool1", &ARG_BOOL1);
+    schema.insert("bool2", &ARG_BOOL2);
+
+    let base_args = [
+        "--enum=one",
+        "--str1",
+        "string 1",
+        "--bool1",
+        "positional",
+        "--int1",
+        "3",
+        "--bool2",
+        "true",
+    ];
+
+    let base_args_no_positional = [
+        "--enum=one",
+        "--str1",
+        "string 1",
+        "--bool1",
+        "--int1",
+        "3",
+        "--bool2",
+        "true",
+    ];
+
+    let base_result = [
+        ("enum", "one"),
+        ("str1", "string 1"),
+        ("bool1", "true"),
+        ("int1", "3"),
+        ("bool2", "true"),
+    ];
+
+    let mut result = Vec::new();
+    let rest = ParseOptions::new(&mut result, &schema)
+        .parse(base_args.iter())
+        .expect("failed 1");
+    assert_eq!(rest, [&"positional"], "failed to retain positional arg");
+    for ((a1, a2), b) in result.into_iter().zip(base_result.iter().copied()) {
+        assert_eq!((a1.as_str(), a2.as_str()), b);
+    }
+
+    let mut result = Vec::new();
+    let rest = ParseOptions::new(&mut result, &schema)
+        .parse(base_args.iter().chain([&"--", &"--more"]))
+        .expect("failed 2");
+    assert_eq!(
+        rest,
+        [&"positional", &"--more"],
+        "failed to retain positional or trailing args"
+    );
+    for ((a1, a2), b) in result.into_iter().zip(base_result.iter().copied()) {
+        assert_eq!((a1.as_str(), a2.as_str()), b);
+    }
+
+    let mut result = Vec::new();
+    let rest = ParseOptions::new(&mut result, &schema)
+        .retain_separator(true)
+        .parse(base_args_no_positional.iter().chain([&"--", &"--more"]))
+        .expect("failed 3");
+    assert_eq!(rest, [&"--", &"--more"], "failed to retain separator");
+    for ((a1, a2), b) in result.into_iter().zip(base_result.iter().copied()) {
+        assert_eq!((a1.as_str(), a2.as_str()), b);
+    }
+
+    let mut result = Vec::new();
+    let rest = ParseOptions::new(&mut result, &schema)
+        .retain_separator(true)
+        .deny_unknown(true)
+        .parse(base_args.iter().chain([&"--", &"--more"]))
+        .expect("failed 4");
+    assert_eq!(
+        rest,
+        [&"positional", &"--", &"--more"],
+        "deny_unknown misbehved"
+    );
+    for ((a1, a2), b) in result.into_iter().zip(base_result.iter().copied()) {
+        assert_eq!((a1.as_str(), a2.as_str()), b);
+    }
+
+    let mut result = Vec::new();
+    ParseOptions::new(&mut result, &schema)
+        .retain_separator(true)
+        .deny_unknown(true)
+        .parse(
+            base_args
+                .iter()
+                .chain([&"--unknown", &"value", &"--", &"--more"]),
+        )
+        .expect_err("deny_unknown failed");
+
+    let mut result = Vec::new();
+    let rest = ParseOptions::new(&mut result, &schema)
+        .retain_separator(true)
+        .stop_at_unknown(true)
+        .parse(
+            base_args
+                .iter()
+                .chain([&"--unknown", &"value", &"--", &"--more"]),
+        )
+        .expect("failed 5");
+    assert_eq!(
+        rest,
+        [&"positional", &"--unknown", &"value", &"--", &"--more"]
+    );
+    for ((a1, a2), b) in result.into_iter().zip(base_result.iter().copied()) {
+        assert_eq!((a1.as_str(), a2.as_str()), b);
     }
 }

@@ -7,23 +7,18 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::Context;
 
-use anyhow::{bail, format_err, Error};
+use anyhow::{Error, bail, format_err};
 
 use proxmox_io::ReadExt;
 use proxmox_sys::mmap::Mmap;
-use proxmox_sys::process_locker::ProcessLockSharedGuard;
 use proxmox_uuid::Uuid;
 use pxar::accessor::{MaybeReady, ReadAt, ReadAtOperation};
 
 use pbs_tools::lru_cache::LruCache;
 
-use crate::chunk_stat::ChunkStat;
-use crate::chunk_store::ChunkStore;
-use crate::data_blob::{DataBlob, DataChunkBuilder};
 use crate::file_formats;
 use crate::index::{ChunkReadInfo, IndexFile};
 use crate::read_chunk::ReadChunk;
-use crate::Chunker;
 
 /// Header format definition for dynamic index files (`.dixd`)
 #[repr(C)]
@@ -124,8 +119,6 @@ impl DynamicIndexReader {
             bail!("got unknown magic number");
         }
 
-        let ctime = proxmox_time::epoch_i64();
-
         let index_size = stat.st_size as usize - header_size;
         let index_count = index_size / 40;
         if index_count * 40 != index_size {
@@ -134,7 +127,7 @@ impl DynamicIndexReader {
 
         let index = unsafe {
             Mmap::map_fd(
-                rawfd,
+                &file,
                 header_size as u64,
                 index_count,
                 nix::sys::mman::ProtFlags::PROT_READ,
@@ -146,14 +139,13 @@ impl DynamicIndexReader {
             _file: file,
             size,
             index,
-            ctime,
+            ctime: i64::from_le(header.ctime),
             uuid: header.uuid,
             index_csum: header.index_csum,
         })
     }
 
     #[inline]
-    #[allow(clippy::cast_ptr_alignment)]
     pub fn chunk_end(&self, pos: usize) -> u64 {
         if pos >= self.index.len() {
             panic!("chunk index out of range");
@@ -204,7 +196,7 @@ impl IndexFile for DynamicIndexReader {
         if pos >= self.index.len() {
             None
         } else {
-            Some(unsafe { &*(self.chunk_digest(pos).as_ptr() as *const [u8; 32]) })
+            Some(self.chunk_digest(pos))
         }
     }
 
@@ -276,8 +268,6 @@ impl IndexFile for DynamicIndexReader {
 
 /// Create dynamic index files (`.dixd`)
 pub struct DynamicIndexWriter {
-    store: Arc<ChunkStore>,
-    _lock: ProcessLockSharedGuard,
     writer: BufWriter<File>,
     closed: bool,
     filename: PathBuf,
@@ -294,10 +284,9 @@ impl Drop for DynamicIndexWriter {
 }
 
 impl DynamicIndexWriter {
-    pub fn create(store: Arc<ChunkStore>, path: &Path) -> Result<Self, Error> {
-        let shared_lock = store.try_shared_lock()?;
-
-        let full_path = store.relative_path(path);
+    // Requires obtaining a shared chunk store lock beforehand
+    pub fn create(full_path: impl Into<PathBuf>) -> Result<Self, Error> {
+        let full_path = full_path.into();
         let mut tmp_path = full_path.clone();
         tmp_path.set_extension("tmp_didx");
 
@@ -324,8 +313,6 @@ impl DynamicIndexWriter {
         let csum = Some(openssl::sha::Sha256::new());
 
         Ok(Self {
-            store,
-            _lock: shared_lock,
             writer,
             closed: false,
             filename: full_path,
@@ -334,11 +321,6 @@ impl DynamicIndexWriter {
             uuid: *uuid.as_bytes(),
             csum,
         })
-    }
-
-    // fixme: use add_chunk instead?
-    pub fn insert_chunk(&self, chunk: &DataBlob, digest: &[u8; 32]) -> Result<(bool, u64), Error> {
-        self.store.insert_chunk(chunk, digest)
     }
 
     pub fn close(&mut self) -> Result<[u8; 32], Error> {
@@ -353,7 +335,7 @@ impl DynamicIndexWriter {
 
         self.writer.flush()?;
 
-        let csum_offset = proxmox_lang::offsetof!(DynamicIndexHeader, index_csum);
+        let csum_offset = std::mem::offset_of!(DynamicIndexHeader, index_csum);
         self.writer.seek(SeekFrom::Start(csum_offset as u64))?;
 
         let csum = self.csum.take().unwrap();
@@ -388,137 +370,6 @@ impl DynamicIndexWriter {
         self.writer.write_all(&offset_le)?;
         self.writer.write_all(digest)?;
         Ok(())
-    }
-}
-
-/// Writer which splits a binary stream into dynamic sized chunks
-///
-/// And store the resulting chunk list into the index file.
-pub struct DynamicChunkWriter {
-    index: DynamicIndexWriter,
-    closed: bool,
-    chunker: Chunker,
-    stat: ChunkStat,
-    chunk_offset: usize,
-    last_chunk: usize,
-    chunk_buffer: Vec<u8>,
-}
-
-impl DynamicChunkWriter {
-    pub fn new(index: DynamicIndexWriter, chunk_size: usize) -> Self {
-        Self {
-            index,
-            closed: false,
-            chunker: Chunker::new(chunk_size),
-            stat: ChunkStat::new(0),
-            chunk_offset: 0,
-            last_chunk: 0,
-            chunk_buffer: Vec::with_capacity(chunk_size * 4),
-        }
-    }
-
-    pub fn stat(&self) -> &ChunkStat {
-        &self.stat
-    }
-
-    pub fn close(&mut self) -> Result<(), Error> {
-        if self.closed {
-            return Ok(());
-        }
-
-        self.closed = true;
-
-        self.write_chunk_buffer()?;
-
-        self.index.close()?;
-
-        self.stat.size = self.chunk_offset as u64;
-
-        // add size of index file
-        self.stat.size +=
-            (self.stat.chunk_count * 40 + std::mem::size_of::<DynamicIndexHeader>()) as u64;
-
-        Ok(())
-    }
-
-    fn write_chunk_buffer(&mut self) -> Result<(), Error> {
-        let chunk_size = self.chunk_buffer.len();
-
-        if chunk_size == 0 {
-            return Ok(());
-        }
-
-        let expected_chunk_size = self.chunk_offset - self.last_chunk;
-        if expected_chunk_size != self.chunk_buffer.len() {
-            bail!("wrong chunk size {} != {}", expected_chunk_size, chunk_size);
-        }
-
-        self.stat.chunk_count += 1;
-
-        self.last_chunk = self.chunk_offset;
-
-        let (chunk, digest) = DataChunkBuilder::new(&self.chunk_buffer)
-            .compress(true)
-            .build()?;
-
-        match self.index.insert_chunk(&chunk, &digest) {
-            Ok((is_duplicate, compressed_size)) => {
-                self.stat.compressed_size += compressed_size;
-                if is_duplicate {
-                    self.stat.duplicate_chunks += 1;
-                } else {
-                    self.stat.disk_size += compressed_size;
-                }
-
-                log::info!(
-                    "ADD CHUNK {:016x} {} {}% {} {}",
-                    self.chunk_offset,
-                    chunk_size,
-                    (compressed_size * 100) / (chunk_size as u64),
-                    is_duplicate,
-                    hex::encode(digest)
-                );
-                self.index.add_chunk(self.chunk_offset as u64, &digest)?;
-                self.chunk_buffer.truncate(0);
-                Ok(())
-            }
-            Err(err) => {
-                self.chunk_buffer.truncate(0);
-                Err(err)
-            }
-        }
-    }
-}
-
-impl Write for DynamicChunkWriter {
-    fn write(&mut self, data: &[u8]) -> std::result::Result<usize, std::io::Error> {
-        let chunker = &mut self.chunker;
-
-        let pos = chunker.scan(data);
-
-        if pos > 0 {
-            self.chunk_buffer.extend_from_slice(&data[0..pos]);
-            self.chunk_offset += pos;
-
-            if let Err(err) = self.write_chunk_buffer() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    err.to_string(),
-                ));
-            }
-            Ok(pos)
-        } else {
-            self.chunk_offset += data.len();
-            self.chunk_buffer.extend_from_slice(data);
-            Ok(data.len())
-        }
-    }
-
-    fn flush(&mut self) -> std::result::Result<(), std::io::Error> {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "please use close() instead of flush()",
-        ))
     }
 }
 
@@ -557,7 +408,7 @@ struct ChunkCacher<'a, S> {
     index: &'a DynamicIndexReader,
 }
 
-impl<'a, S: ReadChunk> pbs_tools::lru_cache::Cacher<usize, CachedChunk> for ChunkCacher<'a, S> {
+impl<S: ReadChunk> pbs_tools::lru_cache::Cacher<usize, CachedChunk> for ChunkCacher<'_, S> {
     fn fetch(&mut self, index: usize) -> Result<Option<CachedChunk>, Error> {
         let info = match self.index.chunk_info(index) {
             Some(info) => info,
@@ -598,6 +449,7 @@ impl<S: ReadChunk> BufferedDynamicReader<S> {
                     store: &mut self.store,
                     index: &self.index,
                 },
+                |_| Ok(()),
             )?
             .ok_or_else(|| format_err!("chunk not found by cacher"))?;
 
@@ -651,11 +503,11 @@ impl<S: ReadChunk> BufferedDynamicReader<S> {
 
 impl<S: ReadChunk> std::io::Read for BufferedDynamicReader<S> {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, std::io::Error> {
-        use std::io::{Error, ErrorKind};
+        use std::io::Error;
 
         let data = match self.buffered_read(self.read_offset) {
             Ok(v) => v,
-            Err(err) => return Err(Error::new(ErrorKind::Other, err.to_string())),
+            Err(err) => return Err(Error::other(err.to_string())),
         };
 
         let n = if data.len() > buf.len() {
@@ -680,15 +532,12 @@ impl<S: ReadChunk> std::io::Seek for BufferedDynamicReader<S> {
             SeekFrom::Current(offset) => (self.read_offset as i64) + offset,
         };
 
-        use std::io::{Error, ErrorKind};
+        use std::io::Error;
         if (new_offset < 0) || (new_offset > (self.archive_size as i64)) {
-            return Err(Error::new(
-                ErrorKind::Other,
-                format!(
-                    "seek is out of range {} ([0..{}])",
-                    new_offset, self.archive_size
-                ),
-            ));
+            return Err(Error::other(format!(
+                "seek is out of range {} ([0..{}])",
+                new_offset, self.archive_size
+            )));
         }
         self.read_offset = new_offset as u64;
 

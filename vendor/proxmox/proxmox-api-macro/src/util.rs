@@ -4,10 +4,10 @@ use std::convert::TryFrom;
 
 use proc_macro2::{Ident, Span, TokenStream, TokenTree};
 use quote::ToTokens;
+use syn::Token;
 use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
-use syn::Token;
 
 use anyhow::Error;
 
@@ -30,7 +30,7 @@ pub struct FieldName {
 
 impl FieldName {
     pub fn new(name: String, span: Span) -> Self {
-        let mut ident_str = name.replace(['-', '.', '+'].as_ref(), "_");
+        let mut ident_str = name.replace(['-', '.', '+', '$'].as_ref(), "_");
 
         if ident_str.chars().next().unwrap().is_numeric() {
             ident_str.insert(0, '_');
@@ -137,12 +137,13 @@ impl Parse for FieldName {
 }
 
 /// Most of our schema definition consists of a json-like notation.
-/// For parsing we mostly just need to destinguish between objects and non-objects.
+/// For parsing we mostly just need to distinguish between objects and non-objects.
 /// For specific expression types we match on the contained expression later on.
 // FIXME: Expr(Box<syn::Expr>)
 #[allow(clippy::large_enum_variant)]
 pub enum JSONValue {
     Object(JSONObject),
+    Array(JSONArray),
     Expr(syn::Expr),
 }
 
@@ -153,6 +154,15 @@ impl JSONValue {
         match self {
             JSONValue::Object(s) => Ok(s),
             JSONValue::Expr(e) => bail!(e => "expected {}", expected),
+            JSONValue::Array(e) => bail!(e.span(), "expected {}", expected),
+        }
+    }
+
+    pub fn into_array(self, expected: &str) -> Result<JSONArray, syn::Error> {
+        match self {
+            JSONValue::Array(s) => Ok(s),
+            JSONValue::Expr(e) => bail!(e => "expected {}", expected),
+            JSONValue::Object(e) => bail!(e.span(), "expected {}", expected),
         }
     }
 
@@ -185,6 +195,7 @@ impl JSONValue {
         match self {
             JSONValue::Object(obj) => obj.span(),
             JSONValue::Expr(expr) => expr.span(),
+            JSONValue::Array(arr) => arr.span(),
         }
     }
 }
@@ -195,6 +206,7 @@ impl TryFrom<JSONValue> for syn::Expr {
     fn try_from(value: JSONValue) -> Result<Self, syn::Error> {
         match value {
             JSONValue::Object(s) => bail!(s.span(), "unexpected object"),
+            JSONValue::Array(s) => bail!(s.span(), "unexpected array"),
             JSONValue::Expr(e) => Ok(e),
         }
     }
@@ -290,9 +302,71 @@ impl Parse for JSONValue {
         let lookahead = input.lookahead1();
         Ok(if lookahead.peek(syn::token::Brace) {
             JSONValue::Object(input.parse()?)
+        } else if lookahead.peek(syn::token::Bracket) {
+            JSONValue::Array(input.parse()?)
         } else {
             JSONValue::Expr(input.parse()?)
         })
+    }
+}
+
+/// For `allOf` and `oneOf` schemas we need an array of schema entries.
+pub struct JSONArray {
+    pub bracket_token: Option<syn::token::Bracket>,
+    pub elements: Vec<JSONValue>,
+}
+impl JSONArray {
+    pub fn is_empty(&self) -> bool {
+        self.elements.is_empty()
+    }
+
+    fn parse_elements(input: ParseStream) -> syn::Result<Vec<JSONValue>> {
+        Ok(input
+            .parse_terminated(JSONValue::parse, Token![,])?
+            .into_iter()
+            .collect())
+    }
+}
+
+impl Parse for JSONArray {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let content;
+        Ok(Self {
+            bracket_token: Some(syn::bracketed!(content in input)),
+            elements: Self::parse_elements(&content)?,
+        })
+    }
+}
+
+impl std::ops::Deref for JSONArray {
+    type Target = Vec<JSONValue>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.elements
+    }
+}
+
+impl std::ops::DerefMut for JSONArray {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.elements
+    }
+}
+
+impl JSONArray {
+    pub fn span(&self) -> Span {
+        match &self.bracket_token {
+            Some(brace) => brace.span.join(),
+            None => Span::call_site(),
+        }
+    }
+}
+
+impl IntoIterator for JSONArray {
+    type Item = <Vec<JSONValue> as IntoIterator>::Item;
+    type IntoIter = <Vec<JSONValue> as IntoIterator>::IntoIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.elements.into_iter()
     }
 }
 
@@ -390,21 +464,6 @@ impl Parse for JSONMapEntry {
     }
 }
 
-/// We get macro attributes like `#[doc = "TEXT"]` with the `=` included.
-pub struct BareAssignment<T: Parse> {
-    pub token: Token![=],
-    pub content: T,
-}
-
-impl<T: Parse> Parse for BareAssignment<T> {
-    fn parse(input: ParseStream) -> syn::Result<Self> {
-        Ok(Self {
-            token: input.parse()?,
-            content: input.parse()?,
-        })
-    }
-}
-
 pub fn get_doc_comments(attributes: &[syn::Attribute]) -> Result<(String, Span), syn::Error> {
     let mut doc_comment = String::new();
     let doc_span = Span::call_site(); // FIXME: set to first doc comment
@@ -449,18 +508,17 @@ pub fn derive_descriptions(
 
     let mut parts = doc_comment.split("\nReturns:");
 
-    if let Some(first) = parts.next() {
-        if input_schema.description.is_none() {
-            input_schema.description = Maybe::Derived(syn::LitStr::new(first.trim(), doc_span));
-        }
+    if let Some(first) = parts.next()
+        && input_schema.description.is_none()
+    {
+        input_schema.description = Maybe::Derived(syn::LitStr::new(first.trim(), doc_span));
     }
 
     if let Some(second) = parts.next() {
-        if let Some(returns_schema) = returns_schema {
-            if returns_schema.description.is_none() {
-                returns_schema.description =
-                    Maybe::Derived(syn::LitStr::new(second.trim(), doc_span));
-            }
+        if let Some(returns_schema) = returns_schema
+            && returns_schema.description.is_none()
+        {
+            returns_schema.description = Maybe::Derived(syn::LitStr::new(second.trim(), doc_span));
         }
 
         if parts.next().is_some() {
@@ -527,19 +585,22 @@ pub fn is_option_type(ty: &syn::Type) -> Option<&syn::Type> {
         let segs = &p.path.segments;
         let is_option = match segs.len() {
             1 => segs.last().unwrap().ident == "Option",
-            2 => segs.first().unwrap().ident == "std" && segs.last().unwrap().ident == "Option",
+            3 => {
+                (segs[0].ident == "std" || segs[0].ident == "core")
+                    && segs[1].ident == "option"
+                    && segs[2].ident == "Option"
+            }
             _ => false,
         };
         if !is_option {
             return None;
         }
 
-        if let syn::PathArguments::AngleBracketed(generic) = &segs.last().unwrap().arguments {
-            if generic.args.len() == 1 {
-                if let syn::GenericArgument::Type(ty) = generic.args.first().unwrap() {
-                    return Some(ty);
-                }
-            }
+        if let syn::PathArguments::AngleBracketed(generic) = &segs.last().unwrap().arguments
+            && generic.args.len() == 1
+            && let syn::GenericArgument::Type(ty) = generic.args.first().unwrap()
+        {
+            return Some(ty);
         }
     }
     None
@@ -586,7 +647,7 @@ where
     let mut text = String::new();
     let mut sep = "";
     for i in iter {
-        text = format!("{}{}{}", text, sep, i);
+        text = format!("{text}{sep}{i}");
         sep = separator;
     }
     text
@@ -600,7 +661,7 @@ where
     let mut text = String::new();
     let mut sep = "";
     for i in iter {
-        text = format!("{}{}{:?}", text, sep, i);
+        text = format!("{text}{sep}{i:?}");
         sep = separator;
     }
     text
@@ -671,7 +732,7 @@ impl<T> From<Maybe<T>> for Option<T> {
 }
 
 /// Helper to iterate over all the `#[derive(...)]` types found in an attribute list.
-pub fn derived_items(attributes: &[syn::Attribute]) -> DerivedItems {
+pub fn derived_items(attributes: &[syn::Attribute]) -> DerivedItems<'_> {
     DerivedItems {
         attributes: attributes.iter(),
         current: None,
@@ -689,7 +750,7 @@ pub struct DerivedItems<'a> {
     attributes: std::slice::Iter<'a, syn::Attribute>,
 }
 
-impl<'a> Iterator for DerivedItems<'a> {
+impl Iterator for DerivedItems<'_> {
     type Item = syn::Path;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -762,19 +823,19 @@ where
         for arg in std::mem::take(&mut args).into_pairs() {
             match arg {
                 Pair::Punctuated(item, punct) => {
-                    if let syn::Meta::Path(path) = &item {
-                        if !func(path) {
-                            continue;
-                        }
+                    if let syn::Meta::Path(path) = &item
+                        && !func(path)
+                    {
+                        continue;
                     }
                     args.push_value(item);
                     args.push_punct(punct);
                 }
                 Pair::End(item) => {
-                    if let syn::Meta::Path(path) = &item {
-                        if !func(path) {
-                            continue;
-                        }
+                    if let syn::Meta::Path(path) = &item
+                        && !func(path)
+                    {
+                        continue;
                     }
                     args.push_value(item);
                 }

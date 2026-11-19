@@ -1,0 +1,14 @@
+[package]
+name = "proxmox-worker-task"
+description = "Worker task functionality"
+version = "1.0.0"
+
+authors.workspace = true
+edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true

@@ -1,10 +1,10 @@
 use proxmox_http_error::HttpError;
 
+use crate::Config;
 use crate::api::http_err;
 use crate::matcher::{
-    DeleteableMatcherProperty, MatcherConfig, MatcherConfigUpdater, MATCHER_TYPENAME,
+    DeleteableMatcherProperty, MATCHER_TYPENAME, MatcherConfig, MatcherConfigUpdater,
 };
-use crate::Config;
 
 /// Get a list of all matchers
 ///
@@ -29,6 +29,38 @@ pub fn get_matcher(config: &Config, name: &str) -> Result<MatcherConfig, HttpErr
         .map_err(|_| http_err!(NOT_FOUND, "matcher '{name}' not found"))
 }
 
+/// Get matcher with given `name`, translating any existing 'match-*' keys into an
+/// equivalent 'expression'.
+///
+/// The caller is responsible for any needed permission checks.
+/// Returns the endpoint or a `HttpError` if the matcher was not found (`404 Not found`).
+#[cfg(feature = "legacy-matchers")]
+pub fn get_matcher_as_expression(config: &Config, name: &str) -> Result<MatcherConfig, HttpError> {
+    let mut matcher: MatcherConfig = config
+        .config
+        .lookup(MATCHER_TYPENAME, name)
+        .map_err(|_| http_err!(NOT_FOUND, "matcher '{name}' not found"))?;
+
+    if matcher.expression.is_none() {
+        let expression = matcher.generate_expression_from_legacy_config();
+        let expression_json = serde_json::to_string(&expression).map_err(|err| {
+            http_err!(
+                INTERNAL_SERVER_ERROR,
+                "could not serialize matcher expression: {err}"
+            )
+        })?;
+        matcher.expression = Some(expression_json);
+    }
+
+    matcher.match_calendar.clear();
+    matcher.match_severity.clear();
+    matcher.match_field.clear();
+    matcher.mode = None;
+    matcher.invert_match = None;
+
+    Ok(matcher)
+}
+
 /// Add new notification matcher.
 ///
 /// The caller is responsible for any needed permission checks.
@@ -36,9 +68,16 @@ pub fn get_matcher(config: &Config, name: &str) -> Result<MatcherConfig, HttpErr
 /// Returns a `HttpError` if:
 ///   - an entity with the same name already exists (`400 Bad request`)
 ///   - the configuration could not be saved (`500 Internal server error`)
-pub fn add_matcher(config: &mut Config, matcher_config: MatcherConfig) -> Result<(), HttpError> {
+pub fn add_matcher(
+    config: &mut Config,
+    mut matcher_config: MatcherConfig,
+) -> Result<(), HttpError> {
     super::ensure_unique(config, &matcher_config.name)?;
     super::ensure_endpoints_exist(config, &matcher_config.target)?;
+
+    matcher_config
+        .ensure_valid()
+        .map_err(|err| http_err!(BAD_REQUEST, "invalid matcher config: {err}"))?;
 
     config
         .config
@@ -73,38 +112,51 @@ pub fn update_matcher(
     let mut matcher = get_matcher(config, name)?;
 
     if let Some(delete) = delete {
-        for deleteable_property in delete {
-            match deleteable_property {
+        for deletable_property in delete {
+            match deletable_property {
+                #[cfg(feature = "legacy-matchers")]
                 DeleteableMatcherProperty::MatchSeverity => matcher.match_severity.clear(),
+                #[cfg(feature = "legacy-matchers")]
                 DeleteableMatcherProperty::MatchField => matcher.match_field.clear(),
+                #[cfg(feature = "legacy-matchers")]
                 DeleteableMatcherProperty::MatchCalendar => matcher.match_calendar.clear(),
-                DeleteableMatcherProperty::Target => matcher.target.clear(),
-                DeleteableMatcherProperty::Mode => matcher.mode = None,
+                #[cfg(feature = "legacy-matchers")]
                 DeleteableMatcherProperty::InvertMatch => matcher.invert_match = None,
+                #[cfg(feature = "legacy-matchers")]
+                DeleteableMatcherProperty::Mode => matcher.mode = None,
+                DeleteableMatcherProperty::Expression => matcher.expression = None,
                 DeleteableMatcherProperty::Comment => matcher.comment = None,
+                DeleteableMatcherProperty::Target => matcher.target.clear(),
                 DeleteableMatcherProperty::Disable => matcher.disable = None,
             }
         }
     }
 
-    if let Some(match_severity) = matcher_updater.match_severity {
-        matcher.match_severity = match_severity;
+    #[cfg(feature = "legacy-matchers")]
+    {
+        if let Some(match_severity) = matcher_updater.match_severity {
+            matcher.match_severity = match_severity;
+        }
+
+        if let Some(match_field) = matcher_updater.match_field {
+            matcher.match_field = match_field;
+        }
+
+        if let Some(match_calendar) = matcher_updater.match_calendar {
+            matcher.match_calendar = match_calendar;
+        }
+
+        if let Some(mode) = matcher_updater.mode {
+            matcher.mode = Some(mode);
+        }
+
+        if let Some(invert_match) = matcher_updater.invert_match {
+            matcher.invert_match = Some(invert_match);
+        }
     }
 
-    if let Some(match_field) = matcher_updater.match_field {
-        matcher.match_field = match_field;
-    }
-
-    if let Some(match_calendar) = matcher_updater.match_calendar {
-        matcher.match_calendar = match_calendar;
-    }
-
-    if let Some(mode) = matcher_updater.mode {
-        matcher.mode = Some(mode);
-    }
-
-    if let Some(invert_match) = matcher_updater.invert_match {
-        matcher.invert_match = Some(invert_match);
+    if let Some(expression) = matcher_updater.expression {
+        matcher.expression = Some(expression);
     }
 
     if let Some(comment) = matcher_updater.comment {
@@ -114,11 +166,14 @@ pub fn update_matcher(
     if let Some(disable) = matcher_updater.disable {
         matcher.disable = Some(disable);
     }
-
     if let Some(target) = matcher_updater.target {
         super::ensure_endpoints_exist(config, target.as_slice())?;
         matcher.target = target;
     }
+
+    matcher
+        .ensure_valid()
+        .map_err(|err| http_err!(BAD_REQUEST, "invalid matcher config: {err}"))?;
 
     config
         .config
@@ -150,8 +205,11 @@ pub fn delete_matcher(config: &mut Config, name: &str) -> Result<(), HttpError> 
 
 #[cfg(all(test, feature = "sendmail"))]
 mod tests {
+    use proxmox_match_expression::Expression;
+
     use super::*;
-    use crate::matcher::MatchModeOperator;
+
+    use crate::matcher::expression::NotificationMatcher;
 
     fn empty_config() -> Config {
         Config::new("", "").unwrap()
@@ -172,6 +230,11 @@ matcher: matcher2
         .unwrap()
     }
 
+    fn valid_expression_string() -> String {
+        let expr = Expression::<NotificationMatcher>::Constant(true);
+        serde_json::to_string(&expr).unwrap()
+    }
+
     #[test]
     fn test_update_not_existing_returns_error() -> Result<(), HttpError> {
         let mut config = empty_config();
@@ -182,20 +245,25 @@ matcher: matcher2
     #[test]
     fn test_update_invalid_digest_returns_error() -> Result<(), HttpError> {
         let mut config = config_with_two_matchers();
-        assert!(update_matcher(
-            &mut config,
-            "matcher1",
-            Default::default(),
-            None,
-            Some(&[0u8; 32])
-        )
-        .is_err());
+        assert!(
+            update_matcher(
+                &mut config,
+                "matcher1",
+                Default::default(),
+                None,
+                Some(&[0u8; 32])
+            )
+            .is_err()
+        );
 
         Ok(())
     }
 
     #[test]
+    #[cfg(feature = "legacy-matchers")]
     fn test_matcher_update() -> Result<(), HttpError> {
+        use crate::matcher::MatchModeOperator;
+
         let mut config = config_with_two_matchers();
 
         let digest = config.digest;
@@ -251,11 +319,231 @@ matcher: matcher2
     }
 
     #[test]
+    #[cfg(not(feature = "legacy-matchers"))]
+    fn test_matcher_update() -> Result<(), HttpError> {
+        let mut config = config_with_two_matchers();
+
+        let digest = config.digest;
+
+        update_matcher(
+            &mut config,
+            "matcher1",
+            MatcherConfigUpdater {
+                expression: Some(valid_expression_string()),
+                target: Some(vec!["foo".into()]),
+                comment: Some("new comment".into()),
+                ..Default::default()
+            },
+            None,
+            Some(&digest),
+        )?;
+
+        let matcher = get_matcher(&config, "matcher1")?;
+
+        assert_eq!(matcher.comment, Some("new comment".into()));
+
+        // Test property deletion
+        update_matcher(
+            &mut config,
+            "matcher1",
+            Default::default(),
+            Some(&[
+                DeleteableMatcherProperty::Target,
+                DeleteableMatcherProperty::Comment,
+                DeleteableMatcherProperty::Expression,
+            ]),
+            Some(&digest),
+        )?;
+
+        let matcher = get_matcher(&config, "matcher1")?;
+
+        assert!(matcher.target.is_empty());
+        assert!(matcher.expression.is_none());
+        assert_eq!(matcher.comment, None);
+
+        Ok(())
+    }
+
+    #[test]
     fn test_matcher_delete() -> Result<(), HttpError> {
         let mut config = config_with_two_matchers();
 
         delete_matcher(&mut config, "matcher1")?;
         assert!(delete_matcher(&mut config, "matcher1").is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "legacy-matchers")]
+    fn test_update_matcher_mutually_exclusive_with_expression() -> Result<(), HttpError> {
+        let mut config = config_with_two_matchers();
+        let digest = config.digest;
+
+        let proto = MatcherConfigUpdater {
+            expression: Some(valid_expression_string()),
+            ..Default::default()
+        };
+
+        let mut updater = proto.clone();
+        updater.match_field = Some(vec!["exact:foo=bar".parse().unwrap()]);
+
+        assert!(update_matcher(&mut config, "matcher1", updater, None, Some(&digest),).is_err());
+
+        let mut updater = proto.clone();
+        updater.match_calendar = Some(vec!["mon..sun 12-13".parse().unwrap()]);
+
+        assert!(update_matcher(&mut config, "matcher1", updater, None, Some(&digest),).is_err());
+
+        let mut updater = proto.clone();
+        updater.match_severity = Some(vec!["info,warning".parse().unwrap()]);
+
+        assert!(update_matcher(&mut config, "matcher1", updater, None, Some(&digest),).is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_update_invalid_expression() -> Result<(), HttpError> {
+        let mut config = config_with_two_matchers();
+        let digest = config.digest;
+
+        assert!(
+            update_matcher(
+                &mut config,
+                "matcher1",
+                MatcherConfigUpdater {
+                    expression: Some("invalid".into()),
+                    ..Default::default()
+                },
+                None,
+                Some(&digest),
+            )
+            .is_err()
+        );
+
+        Ok(())
+    }
+
+    fn nested_expression() -> Expression<NotificationMatcher> {
+        Expression::AllOf(vec![
+            Expression::Constant(true),
+            Expression::Not(Box::new(Expression::AnyOf(vec![Expression::Constant(
+                false,
+            )]))),
+        ])
+    }
+
+    #[test]
+    fn test_update_minifies_pretty_printed_expression() -> Result<(), HttpError> {
+        let mut config = config_with_two_matchers();
+        let digest = config.digest;
+
+        let expr = nested_expression();
+        let pretty = serde_json::to_string_pretty(&expr).unwrap();
+        assert!(pretty.contains('\n'));
+
+        update_matcher(
+            &mut config,
+            "matcher1",
+            MatcherConfigUpdater {
+                expression: Some(pretty),
+                ..Default::default()
+            },
+            None,
+            Some(&digest),
+        )?;
+
+        let matcher = get_matcher(&config, "matcher1")?;
+        let stored = matcher.expression.expect("expression should be set");
+
+        assert_eq!(stored, serde_json::to_string(&expr).unwrap());
+        assert!(!stored.contains(char::is_whitespace));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_update_normalizes_expression_with_extra_whitespace() -> Result<(), HttpError> {
+        let mut config = config_with_two_matchers();
+        let digest = config.digest;
+
+        // Same expression as `nested_expression`, but handwritten, with all sorts of
+        // odd whitespace characters.
+        let raw = "{\r\n\t\"all-of\" :\t[\r\n  {  \"constant\":true },\r\n\t{\"not\": \
+                   {\"any-of\": [ {\"constant\" : false} ] } }\r\n]\r\n}\r\n";
+
+        update_matcher(
+            &mut config,
+            "matcher1",
+            MatcherConfigUpdater {
+                expression: Some(raw.into()),
+                ..Default::default()
+            },
+            None,
+            Some(&digest),
+        )?;
+
+        let matcher = get_matcher(&config, "matcher1")?;
+        let stored = matcher.expression.expect("expression should be set");
+
+        assert_eq!(stored, serde_json::to_string(&nested_expression()).unwrap());
+
+        // The normalized expression should stay the same after
+        // a read/write cycle of the config
+        let (raw_config, raw_private_config) = config.write().unwrap();
+        let config = Config::new(&raw_config, &raw_private_config).unwrap();
+        let matcher = get_matcher(&config, "matcher1")?;
+
+        assert_eq!(matcher.expression, Some(stored));
+
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "legacy-matchers")]
+    fn test_add_mutually_exclusive_with_expression() -> Result<(), HttpError> {
+        let mut config = empty_config();
+
+        let proto = MatcherConfig {
+            name: "matcher3".into(),
+            expression: Some(valid_expression_string()),
+            ..Default::default()
+        };
+
+        let mut entity = proto.clone();
+        entity.match_field = vec!["exact:foo=bar".parse().unwrap()];
+
+        assert!(add_matcher(&mut config, entity).is_err());
+
+        let mut entity = proto.clone();
+        entity.match_severity = vec!["info,warning".parse().unwrap()];
+
+        assert!(add_matcher(&mut config, entity).is_err());
+
+        let mut entity = proto.clone();
+        entity.match_calendar = vec!["mon..sun 12-13".parse().unwrap()];
+
+        assert!(add_matcher(&mut config, entity).is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_invalid_expression() -> Result<(), HttpError> {
+        let mut config = empty_config();
+
+        assert!(
+            add_matcher(
+                &mut config,
+                MatcherConfig {
+                    name: "matcher2".into(),
+                    expression: Some("invalid".into()),
+                    ..Default::default()
+                }
+            )
+            .is_err()
+        );
 
         Ok(())
     }

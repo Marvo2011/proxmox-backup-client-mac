@@ -4,7 +4,7 @@ use std::io::{self, Read};
 
 use endian_trait::Endian;
 
-use pxar::{decoder, format, EntryKind};
+use pxar::{EntryKind, decoder, format};
 
 fn write_raw_struct<T: Endian, W: io::Write + ?Sized>(output: &mut W, data: T) -> io::Result<()> {
     let data = data.to_le();
@@ -94,7 +94,8 @@ fn create_archive() -> io::Result<Vec<u8>> {
 fn test_archive() {
     let archive = create_archive().expect("failed to create test archive");
     let mut input = &archive[..];
-    let mut decoder = decoder::Decoder::from_std(&mut input).expect("failed to create decoder");
+    let mut decoder = decoder::Decoder::from_std(pxar::PxarVariant::Unified(&mut input))
+        .expect("failed to create decoder");
 
     let item = decoder
         .next()
@@ -124,6 +125,7 @@ fn test_archive() {
     let mut content = Vec::new();
     decoder
         .contents()
+        .expect("failed to get contents from decoder")
         .expect("failed to get contents for file entry")
         .read_to_end(&mut content)
         .expect("failed to read test file contents");

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -6,12 +7,14 @@ use serde_json::json;
 use proxmox_http::client::sync::Client;
 use proxmox_http::{HttpClient, HttpOptions, ProxyConfig};
 use proxmox_schema::api_types::COMMENT_SCHEMA;
-use proxmox_schema::{api, Updater};
+use proxmox_schema::{Updater, api};
 
 use crate::context::context;
 use crate::renderer::TemplateType;
 use crate::schema::ENTITY_NAME_SCHEMA;
-use crate::{renderer, Content, Endpoint, Error, Notification, Origin, Severity};
+use crate::{Content, Endpoint, Error, Notification, Origin, Severity, renderer};
+
+const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn severity_to_priority(level: Severity) -> u32 {
     match level {
@@ -84,6 +87,7 @@ pub struct GotifyEndpoint {
 #[api]
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+/// The set of properties that can be deleted from a gotify endpoint configuration.
 pub enum DeleteableGotifyProperty {
     /// Delete `comment`
     Comment,
@@ -128,10 +132,14 @@ impl Endpoint for GotifyEndpoint {
             .map_err(|err| Error::NotifyFailed(self.name().to_string(), err.into()))?;
         let extra_headers = HashMap::from([
             (
-                "Authorization".into(),
+                http::header::AUTHORIZATION.to_string(),
                 format!("Bearer {}", self.private_config.token),
             ),
             ("X-Gotify-Key".into(), self.private_config.token.clone()),
+            (
+                http::header::CONTENT_LENGTH.to_string(),
+                body.len().to_string(),
+            ),
         ]);
 
         let proxy_config = context()
@@ -145,7 +153,7 @@ impl Endpoint for GotifyEndpoint {
             ..Default::default()
         };
 
-        let client = Client::new(options);
+        let client = Client::new_with_timeout(options, HTTP_TIMEOUT);
         let uri = format!("{}/message", self.config.server);
 
         client

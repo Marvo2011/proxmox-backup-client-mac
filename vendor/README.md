@@ -5,13 +5,17 @@ changes to build and work on macOS.
 
 | Directory | Upstream | Commit |
 |-----------|----------|--------|
-| `proxmox/` | https://git.proxmox.com/git/proxmox.git | `f7a22604ae259915a8d43e7c75843b4d46dce80f` (2024-06-06) |
-| `pxar/` | https://git.proxmox.com/git/pxar.git | `29cbeed3e1b52f5eef455cdfa8b5e93f4e3e88f5` (0.10.2) |
-| `pathpatterns/` | https://git.proxmox.com/git/pathpatterns.git | `281894a5b66099e919d167cd5f0644fff6aca234` |
-| `proxmox-fuse/` | https://git.proxmox.com/git/proxmox-fuse.git | `dc151753b3ef3661b171f0439aa60f59e3568395` |
+| `proxmox/` | https://git.proxmox.com/git/proxmox.git | `17d7f43dbca69d622bee07a93626ae1e741f7109` (2026-11-05) |
+| `pxar/` | https://git.proxmox.com/git/pxar.git | `091a8a382d0d6fc71025351fb35c51b1f3b0074d` (1.0.1) |
+| `pathpatterns/` | https://git.proxmox.com/git/pathpatterns.git | `5323cbe49ae5d592eb8a3fa2e215550e83dd7fba` (1.0.0) |
+| `proxmox-fuse/` | https://git.proxmox.com/git/proxmox-fuse.git | `ac99ac97f7c2eb7ab9ee6ec3b41034e68b1eca7d` (3.0.0) |
+
+The commits are the latest ones before the proxmox-backup release the client is
+based on (see the top level `README.md`).
 
 Only the crates of the `proxmox` workspace that this repository depends on are
 copied, and the `members` list of `proxmox/Cargo.toml` is reduced accordingly.
+`pbs-api-types` is one of them, it moved from proxmox-backup to proxmox.git.
 `debian/` directories are left out.
 
 ## Local changes
@@ -25,19 +29,18 @@ paths unchanged.
   - `fs_info`: `statfs` instead of `statfs64`
   - `atomic_open_or_create_file`: `renameatx_np(RENAME_EXCL)` instead of
     `renameat2(RENAME_NOREPLACE)`, `O_TMPFILE` check Linux only
+  - `make_tmp_file`: declares `mkostemp` itself on macOS, the libc crate has
+    no binding for it there
   - `lock_file` with timeout: polls a non-blocking `flock` instead of using a
     per-thread timer signal
   - `image_size`: block device size via `DKIOCGETBLOCKCOUNT` and
     `DKIOCGETBLOCKSIZE` instead of `BLKGETSIZE64`
-  - `pipe`, `fill_with_random_data`, `set_tcp_keepalive`, `process_locker`:
-    macOS equivalents
+  - `pipe` (no `pipe2`), `fill_with_random_data`, `set_tcp_keepalive`,
+    `process_locker`: macOS equivalents
   - Linux only: `linux::{pid, procfs, timer}`, `fs::fsx_attr` (Linux ioctls),
     `fs::acl` (libacl), `crypt` (libcrypt)
   - `Mmap::map_fd`: page aligns the mmap(2) offset, index files map their entries at offset
     4096, which fails with EINVAL where pages are larger (16 KiB on Apple Silicon)
-  - `create_path`: no longer wraps `AT_FDCWD` in an `OwnedFd`, dropping it
-    called `close(AT_FDCWD)` (aborts with debug builds of recent Rust
-    versions; not macOS specific)
 - `proxmox-fuse` (FUSE-T on macOS, which provides libfuse3)
   - reactor uses `kqueue` instead of `epoll`/`eventfd`, an unmount shows up
     as `EV_EOF` on FUSE-T's socket
@@ -52,14 +55,15 @@ paths unchanged.
 - `proxmox-time`: `tm_zone` pointer type, RFC3339 formatting without the
   glibc-only `%010F`, arithmetic `timegm` (the macOS one fails before 1900)
 - `proxmox-uuid`: no `libuuid` to link on macOS (part of libSystem)
-- `proxmox-lang`: `offsetof!` uses `std::mem::offset_of!`, the previous null
-  pointer dereference is undefined behavior (not macOS specific)
 - `proxmox-compression`: `major`/`minor` types
+- `proxmox-shared-memory`: only the server uses it (shared rate limiter of the
+  S3 client), it needs tmpfs, `O_TMPFILE` and robust mutexes. On macOS opening
+  shared memory fails with an error, the rest only compiles.
+- `proxmox-systemd`: libsystemd bindings (`journal`, `notify`, `sd_id128`) are
+  Linux only, the unit name escaping used by the client is available everywhere
 - `pxar`: `Device::{to,from}_dev_t` for the macOS `dev_t` layout, libc
   dependency on macOS
 - `pathpatterns`: `mode_t` is `u16` on macOS
-- `proxmox-uuid`, `pxar` decoder: explicit reborrow for the
-  `dangerous_implicit_autorefs` lint of newer Rust versions
 
 ## Updating
 

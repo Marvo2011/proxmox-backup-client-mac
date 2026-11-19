@@ -1,21 +1,26 @@
 use std::fs::File;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::Path;
+use std::rc::Rc;
 use std::sync::Arc;
 
-use anyhow::{bail, Error};
+use anyhow::{Context, Error, bail};
 use nix::dir::Dir;
+use nix::fcntl::OFlag;
+use nix::sys::stat::Mode;
+use pbs_config::BackupLockGuard;
 
-use proxmox_sys::fs::lock_dir_noblock_shared;
+use pbs_api_types::{
+    ArchiveType, BackupNamespace, CLIENT_LOG_BLOB_NAME, MANIFEST_BLOB_NAME, Operation,
+    print_store_and_ns,
+};
 
-use pbs_api_types::{print_store_and_ns, BackupNamespace, Operation};
-
+use crate::DataStore;
 use crate::backup_info::BackupDir;
+use crate::datastore::DataStoreLookup;
 use crate::dynamic_index::DynamicIndexReader;
 use crate::fixed_index::FixedIndexReader;
 use crate::index::IndexFile;
-use crate::manifest::{archive_type, ArchiveType, CLIENT_LOG_BLOB_NAME, MANIFEST_BLOB_NAME};
-use crate::DataStore;
 
 /// Helper to access the contents of a datastore backup snapshot
 ///
@@ -25,6 +30,10 @@ pub struct SnapshotReader {
     datastore_name: String,
     file_list: Vec<String>,
     locked_dir: Dir,
+
+    // while this is never read, the lock needs to be kept until the
+    // reader is dropped to ensure valid locking semantics
+    _lock: BackupLockGuard,
 }
 
 impl SnapshotReader {
@@ -45,8 +54,12 @@ impl SnapshotReader {
             bail!("snapshot {} does not exist!", snapshot.dir());
         }
 
-        let locked_dir =
-            lock_dir_noblock_shared(&snapshot_path, "snapshot", "locked by another operation")?;
+        let lock = snapshot
+            .lock_shared()
+            .with_context(|| format!("while trying to read snapshot '{snapshot:?}'"))?;
+
+        let locked_dir = Dir::open(&snapshot_path, OFlag::O_RDONLY, Mode::empty())
+            .with_context(|| format!("unable to open snapshot directory {snapshot_path:?}"))?;
 
         let datastore_name = datastore.name().to_string();
         let manifest = match snapshot.load_manifest() {
@@ -62,11 +75,11 @@ impl SnapshotReader {
         };
 
         let mut client_log_path = snapshot_path;
-        client_log_path.push(CLIENT_LOG_BLOB_NAME);
+        client_log_path.push(CLIENT_LOG_BLOB_NAME.as_ref());
 
         let mut file_list = vec![MANIFEST_BLOB_NAME.to_string()];
         for item in manifest.files() {
-            file_list.push(item.filename.clone());
+            file_list.push(item.filename.to_string());
         }
         if client_log_path.exists() {
             file_list.push(CLIENT_LOG_BLOB_NAME.to_string());
@@ -77,6 +90,7 @@ impl SnapshotReader {
             datastore_name,
             file_list,
             locked_dir,
+            _lock: lock,
         })
     }
 
@@ -98,9 +112,9 @@ impl SnapshotReader {
     /// Opens a file inside the snapshot (using openat) for reading
     pub fn open_file(&self, filename: &str) -> Result<File, Error> {
         let raw_fd = nix::fcntl::openat(
-            self.locked_dir.as_raw_fd(),
+            Some(self.locked_dir.as_raw_fd()),
             Path::new(filename),
-            nix::fcntl::OFlag::O_RDONLY,
+            nix::fcntl::OFlag::O_RDONLY | nix::fcntl::OFlag::O_CLOEXEC,
             nix::sys::stat::Mode::empty(),
         )?;
         let file = unsafe { File::from_raw_fd(raw_fd) };
@@ -109,9 +123,9 @@ impl SnapshotReader {
 
     /// Returns an iterator for all chunks not skipped by `skip_fn`.
     pub fn chunk_iterator<F: Fn(&[u8; 32]) -> bool>(
-        &self,
+        &'_ self,
         skip_fn: F,
-    ) -> Result<SnapshotChunkIterator<F>, Error> {
+    ) -> Result<SnapshotChunkIterator<'_, F>, Error> {
         SnapshotChunkIterator::new(self, skip_fn)
     }
 }
@@ -126,10 +140,10 @@ pub struct SnapshotChunkIterator<'a, F: Fn(&[u8; 32]) -> bool> {
     todo_list: Vec<String>,
     skip_fn: F,
     #[allow(clippy::type_complexity)]
-    current_index: Option<(Arc<Box<dyn IndexFile + Send>>, usize, Vec<(usize, u64)>)>,
+    current_index: Option<(Rc<Box<dyn IndexFile + Send>>, usize, Vec<(usize, u64)>)>,
 }
 
-impl<'a, F: Fn(&[u8; 32]) -> bool> Iterator for SnapshotChunkIterator<'a, F> {
+impl<F: Fn(&[u8; 32]) -> bool> Iterator for SnapshotChunkIterator<'_, F> {
     type Item = Result<[u8; 32], Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -138,22 +152,27 @@ impl<'a, F: Fn(&[u8; 32]) -> bool> Iterator for SnapshotChunkIterator<'a, F> {
                 if self.current_index.is_none() {
                     if let Some(filename) = self.todo_list.pop() {
                         let file = self.snapshot_reader.open_file(&filename)?;
-                        let index: Box<dyn IndexFile + Send> = match archive_type(&filename)? {
-                            ArchiveType::FixedIndex => Box::new(FixedIndexReader::new(file)?),
-                            ArchiveType::DynamicIndex => Box::new(DynamicIndexReader::new(file)?),
-                            _ => bail!(
-                                "SnapshotChunkIterator: got unknown file type - internal error"
-                            ),
-                        };
+                        let index: Box<dyn IndexFile + Send> =
+                            match ArchiveType::from_path(&filename)? {
+                                ArchiveType::FixedIndex => Box::new(FixedIndexReader::new(file)?),
+                                ArchiveType::DynamicIndex => {
+                                    Box::new(DynamicIndexReader::new(file)?)
+                                }
+                                _ => bail!(
+                                    "SnapshotChunkIterator: got unknown file type - internal error"
+                                ),
+                            };
 
-                        let datastore = DataStore::lookup_datastore(
+                        let lookup = DataStoreLookup::with(
                             self.snapshot_reader.datastore_name(),
-                            Some(Operation::Read),
-                        )?;
+                            Operation::Read,
+                            None,
+                        );
+                        let datastore = DataStore::lookup_datastore(lookup)?;
                         let order =
                             datastore.get_chunks_in_order(&*index, &self.skip_fn, |_| Ok(()))?;
 
-                        self.current_index = Some((Arc::new(index), 0, order));
+                        self.current_index = Some((Rc::new(index), 0, order));
                     } else {
                         return Ok(None);
                     }
@@ -178,7 +197,7 @@ impl<'a, F: Fn(&[u8; 32]) -> bool> SnapshotChunkIterator<'a, F> {
         let mut todo_list = Vec::new();
 
         for filename in snapshot_reader.file_list() {
-            match archive_type(filename)? {
+            match ArchiveType::from_path(filename)? {
                 ArchiveType::FixedIndex | ArchiveType::DynamicIndex => {
                     todo_list.push(filename.to_owned());
                 }

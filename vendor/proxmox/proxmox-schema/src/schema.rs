@@ -1,14 +1,15 @@
-//! Data types to decscribe data types.
+//! Data types to describe data types.
 //!
-//! This is loosly based on JSON Schema, but uses static rust data types. This way we can build
+//! This is loosely based on JSON Schema, but uses static rust data types. This way we can build
 //! completely static API definitions that can be included within the programs read-only text
 //! segment.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
+use std::sync::Arc;
 
-use anyhow::{bail, format_err, Error};
-use serde_json::{json, Value};
+use anyhow::{Error, bail, format_err};
+use serde_json::{Value, json};
 
 use crate::ConstRegexPattern;
 
@@ -78,20 +79,40 @@ impl ParameterError {
     }
 
     pub fn add_errors(&mut self, prefix: &str, err: Error) {
+        fn join_path(a: &str, b: String) -> String {
+            match (a, b) {
+                ("", b) => b,
+                (a, b) if b.is_empty() => a.to_string(),
+                (a, b) => format!("{a}/{b}"),
+            }
+        }
+
         match err.downcast::<ParameterError>() {
             Ok(param_err) => {
                 self.extend(
                     param_err
                         .into_iter()
-                        .map(|(key, err)| (format!("{}/{}", prefix, key), err)),
+                        .map(|(key, err)| (join_path(prefix, key), err)),
                 );
             }
             Err(err) => self.push(prefix.to_string(), err),
         }
     }
 
-    pub(crate) fn from_list(error_list: Vec<(String, Error)>) -> Self {
-        Self { error_list }
+    /// Add the errors of `other` for paths which have no error yet.
+    ///
+    /// Used to add oneOf type errors without duplicating a report for the same property, like an
+    /// enum format error for the type property itself.
+    pub(crate) fn extend_unreported(&mut self, other: ParameterError) {
+        for (path, err) in other {
+            if !self
+                .error_list
+                .iter()
+                .any(|(existing, _)| *existing == path)
+            {
+                self.error_list.push((path, err));
+            }
+        }
     }
 }
 
@@ -108,7 +129,7 @@ impl fmt::Display for ParameterError {
             } else {
                 msg.push_str("parameter verification failed:\n");
                 for (name, err) in self.error_list.iter() {
-                    let _ = writeln!(msg, "- '{}': {}", name, err);
+                    let _ = writeln!(msg, "- '{name}': {err}");
                 }
             }
         }
@@ -183,6 +204,7 @@ impl<'a> FromIterator<(&'a str, Error)> for ParameterError {
 /// Data type to describe boolean values
 #[derive(Debug)]
 #[cfg_attr(feature = "test-harness", derive(Eq, PartialEq))]
+#[non_exhaustive]
 pub struct BooleanSchema {
     pub description: &'static str,
     /// Optional default value.
@@ -195,6 +217,11 @@ impl BooleanSchema {
             description,
             default: None,
         }
+    }
+
+    pub const fn description(mut self, description: &'static str) -> Self {
+        self.description = description;
+        self
     }
 
     pub const fn default(mut self, default: bool) -> Self {
@@ -218,14 +245,15 @@ impl BooleanSchema {
 /// Data type to describe integer values.
 #[derive(Debug)]
 #[cfg_attr(feature = "test-harness", derive(Eq, PartialEq))]
+#[non_exhaustive]
 pub struct IntegerSchema {
     pub description: &'static str,
     /// Optional minimum.
-    pub minimum: Option<isize>,
+    pub minimum: Option<i64>,
     /// Optional maximum.
-    pub maximum: Option<isize>,
+    pub maximum: Option<i64>,
     /// Optional default.
-    pub default: Option<isize>,
+    pub default: Option<i64>,
 }
 
 impl IntegerSchema {
@@ -238,18 +266,23 @@ impl IntegerSchema {
         }
     }
 
-    pub const fn default(mut self, default: isize) -> Self {
+    pub const fn description(mut self, description: &'static str) -> Self {
+        self.description = description;
+        self
+    }
+
+    pub const fn default(mut self, default: i64) -> Self {
         self.default = Some(default);
         self
     }
 
-    pub const fn minimum(mut self, minimum: isize) -> Self {
+    pub const fn minimum(mut self, minimum: i64) -> Self {
         self.minimum = Some(minimum);
         self
     }
 
-    pub const fn maximum(mut self, maximium: isize) -> Self {
-        self.maximum = Some(maximium);
+    pub const fn maximum(mut self, maximum: i64) -> Self {
+        self.maximum = Some(maximum);
         self
     }
 
@@ -257,7 +290,7 @@ impl IntegerSchema {
         Schema::Integer(self)
     }
 
-    pub fn check_constraints(&self, value: isize) -> Result<(), Error> {
+    pub fn check_constraints(&self, value: i64) -> Result<(), Error> {
         if let Some(minimum) = self.minimum {
             if value < minimum {
                 bail!(
@@ -284,7 +317,7 @@ impl IntegerSchema {
     /// Verify JSON value using an `IntegerSchema`.
     pub fn verify_json(&self, data: &Value) -> Result<(), Error> {
         if let Some(value) = data.as_i64() {
-            self.check_constraints(value as isize)
+            self.check_constraints(value)
         } else {
             bail!("Expected integer value.");
         }
@@ -293,6 +326,7 @@ impl IntegerSchema {
 
 /// Data type to describe (JSON like) number value
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct NumberSchema {
     pub description: &'static str,
     /// Optional minimum.
@@ -313,6 +347,11 @@ impl NumberSchema {
         }
     }
 
+    pub const fn description(mut self, description: &'static str) -> Self {
+        self.description = description;
+        self
+    }
+
     pub const fn default(mut self, default: f64) -> Self {
         self.default = Some(default);
         self
@@ -323,8 +362,8 @@ impl NumberSchema {
         self
     }
 
-    pub const fn maximum(mut self, maximium: f64) -> Self {
-        self.maximum = Some(maximium);
+    pub const fn maximum(mut self, maximum: f64) -> Self {
+        self.maximum = Some(maximum);
         self
     }
 
@@ -390,6 +429,7 @@ impl PartialEq for NumberSchema {
 /// Data type to describe string values.
 #[derive(Debug)]
 #[cfg_attr(feature = "test-harness", derive(Eq, PartialEq))]
+#[non_exhaustive]
 pub struct StringSchema {
     pub description: &'static str,
     /// Optional default value.
@@ -400,6 +440,9 @@ pub struct StringSchema {
     pub max_length: Option<usize>,
     /// Optional microformat.
     pub format: Option<&'static ApiStringFormat>,
+    /// Declares the `format` to be a hint for documentation purposes, but other values will be
+    /// accepted for backward/forward compatibility purposes.
+    pub format_is_optional: bool,
     /// A text representation of the format/type (used to generate documentation).
     pub type_text: Option<&'static str>,
 }
@@ -412,8 +455,14 @@ impl StringSchema {
             min_length: None,
             max_length: None,
             format: None,
+            format_is_optional: false,
             type_text: None,
         }
+    }
+
+    pub const fn description(mut self, description: &'static str) -> Self {
+        self.description = description;
+        self
     }
 
     pub const fn default(mut self, text: &'static str) -> Self {
@@ -441,6 +490,11 @@ impl StringSchema {
         self
     }
 
+    pub const fn format_is_optional(mut self, is_optional: bool) -> Self {
+        self.format_is_optional = is_optional;
+        self
+    }
+
     pub const fn schema(self) -> Schema {
         Schema::String(self)
     }
@@ -464,6 +518,10 @@ impl StringSchema {
     pub fn check_constraints(&self, value: &str) -> Result<(), Error> {
         self.check_length(value.chars().count())?;
 
+        if self.format_is_optional {
+            return Ok(());
+        }
+
         if let Some(ref format) = self.format {
             match format {
                 ApiStringFormat::Pattern(regex) => {
@@ -477,7 +535,7 @@ impl StringSchema {
                     }
                 }
                 ApiStringFormat::PropertyString(subschema) => {
-                    crate::de::verify::verify(subschema, value)?;
+                    crate::de::verify(subschema, value)?;
                 }
                 ApiStringFormat::VerifyFn(verify_fn) => {
                     verify_fn(value)?;
@@ -512,6 +570,7 @@ impl StringSchema {
 /// schema.
 #[derive(Debug)]
 #[cfg_attr(feature = "test-harness", derive(Eq, PartialEq))]
+#[non_exhaustive]
 pub struct ArraySchema {
     pub description: &'static str,
     /// Element type schema.
@@ -530,6 +589,11 @@ impl ArraySchema {
             min_length: None,
             max_length: None,
         }
+    }
+
+    pub const fn description(mut self, description: &'static str) -> Self {
+        self.description = description;
+        self
     }
 
     pub const fn min_length(mut self, min_length: usize) -> Self {
@@ -565,7 +629,7 @@ impl ArraySchema {
     /// Verify JSON value using an `ArraySchema`.
     pub fn verify_json(&self, data: &Value) -> Result<(), Error> {
         let list = match data {
-            Value::Array(ref list) => list,
+            Value::Array(list) => list,
             Value::Object(_) => bail!("Expected array - got object."),
             _ => bail!("Expected array - got scalar value."),
         };
@@ -598,15 +662,190 @@ pub type SchemaPropertyEntry = (&'static str, bool, &'static Schema);
 /// - `optional`: Set when the property is optional
 /// - `schema`: Property type schema
 ///
-/// **Note:** The list has to be storted by name, because we use
+/// **Note:** The list has to be sorted by name, because we use
 /// a binary search to find items.
 ///
 /// This is a workaround unless RUST can const_fn `Hash::new()`
 pub type SchemaPropertyMap = &'static [SchemaPropertyEntry];
 
+/// Trait for querying a type field in an object.
+///
+/// When performing lookups or property iteration, a [`OneOfSchema`] may contain the same field
+/// multiple times with different schemas. In order to know which one is to be included callers may
+/// pass a [`WithTypeField`] to lookup a type property in the current data, if available.
+///
+/// Since we usually have a `serde_json::Value` to lookup data in, but don't want to encode that
+/// type in the lookup function for flexibility, this trait should be more convenient to use than
+/// forcing a closure.
+///
+/// In order to avoid life time issues and allow more flexible implementations (eg. when the object
+/// the data is being fetched from also needs to be mutably accessible in between calls), the code
+/// *using* the value is passed as a callback, this way the life time does not need to escapes the
+/// `with_type_field` method call itself.
+pub trait WithTypeField {
+    /// Query the value of a property which is expected to be a string and call a function with it.
+    ///
+    /// This is called by iterators in order to query the value of [`OneOfSchema`] type properties.
+    ///
+    /// The value passed to the function is `Some(value)` if the field exists and is a string, or
+    /// `None` otherwise.
+    fn with_type_field(&self, name: &str, func: &mut dyn FnMut(Option<&str>));
+}
+
+impl WithTypeField for Value {
+    fn with_type_field(&self, name: &str, func: &mut dyn FnMut(Option<&str>)) {
+        func(
+            self.as_object()
+                .and_then(|obj| obj.get(name))
+                .and_then(Value::as_str),
+        )
+    }
+}
+
+impl WithTypeField for serde_json::Map<String, Value> {
+    fn with_type_field(&self, name: &str, func: &mut dyn FnMut(Option<&str>)) {
+        func(self.get(name).and_then(Value::as_str))
+    }
+}
+
+/// Covers string to string map types like `HashMap<&str, &str>`.
+impl<K, V> WithTypeField for HashMap<K, V>
+where
+    K: Send + Sync + Eq + std::hash::Hash + std::borrow::Borrow<str>,
+    V: Send + Sync + AsRef<str>,
+{
+    fn with_type_field(&self, name: &str, func: &mut dyn FnMut(Option<&str>)) {
+        func(self.get(name).map(|v| v.as_ref()))
+    }
+}
+
+/// Empty type for when there is no data to use for [`WithTypeField`].
+/// That is, when calling [`lookup_schema`](ObjectSchemaType::lookup_schema) on a schema known not
+/// to be or contain a `OneOfSchema`, or its contents can safely be ignored.
+pub struct NoTypeData;
+
+/// This implementation can be used for `lookup_schema` if no type data is required.
+impl WithTypeField for NoTypeData {
+    fn with_type_field(&self, _: &str, _: &mut dyn FnMut(Option<&str>)) {}
+}
+
+impl<F> WithTypeField for F
+where
+    F: Fn(&str, &mut dyn FnMut(Option<&str>)),
+{
+    fn with_type_field(&self, name: &str, func: &mut dyn FnMut(Option<&str>)) {
+        (*self)(name, func)
+    }
+}
+
+const fn assert_properties_sorted(properties: SchemaPropertyMap) {
+    use std::cmp::Ordering;
+
+    let mut i = 0;
+    let mut prev = None::<&'static str>;
+    while i != properties.len() {
+        let cur = properties[i].0;
+        if let Some(prev) = prev {
+            match proxmox_const_utils::byte_string_cmp(prev.as_bytes(), cur.as_bytes()) {
+                Ordering::Greater => panic!("object schema properties must be sorted"),
+                Ordering::Equal => panic!("duplicate object schema properties not allowed"),
+                Ordering::Less => (),
+            }
+        }
+        prev = Some(cur);
+        i += 1;
+    }
+}
+
+const fn property_map_contains(properties: SchemaPropertyMap, needle: &'static str) -> bool {
+    use std::cmp::Ordering;
+
+    let mut i = 0;
+    while i != properties.len() {
+        if let Ordering::Equal =
+            proxmox_const_utils::byte_string_cmp(properties[i].0.as_bytes(), needle.as_bytes())
+        {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+const fn assert_key_not_alias(key: &str, aliases: PropertyAliasMap) {
+    use std::cmp::Ordering;
+
+    let mut i = 0;
+    while i != aliases.len() {
+        let (alias, _) = aliases[i];
+        if let Ordering::Equal =
+            proxmox_const_utils::byte_string_cmp(alias.as_bytes(), key.as_bytes())
+        {
+            panic!("key must reference a canonical property, not an alias");
+        }
+        i += 1;
+    }
+}
+
+const fn assert_property_aliases_valid(aliases: PropertyAliasMap, properties: SchemaPropertyMap) {
+    use std::cmp::Ordering;
+
+    let mut i = 0;
+    let mut prev = None::<&'static str>;
+    while i != aliases.len() {
+        let (alias, target) = aliases[i];
+        if let Some(prev) = prev {
+            match proxmox_const_utils::byte_string_cmp(prev.as_bytes(), alias.as_bytes()) {
+                Ordering::Greater => panic!("property aliases must be sorted by alias name"),
+                Ordering::Equal => panic!("duplicate property alias not allowed"),
+                Ordering::Less => (),
+            }
+        }
+        if property_map_contains(properties, alias) {
+            panic!("property alias shadows an existing property of the same name");
+        }
+        if !property_map_contains(properties, target) {
+            panic!("property alias must target an existing property");
+        }
+        prev = Some(alias);
+        i += 1;
+    }
+}
+
+/// Legacy property strings may contain shortcuts where the *value* of a specific key is used as a
+/// *key* for yet another option. Most notably, PVE's `netX` properties use `<model>=<macaddr>`
+/// instead of `model=<model>,macaddr=<macaddr>`.
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(feature = "test-harness", derive(Eq, PartialEq))]
+pub struct KeyAliasInfo {
+    pub key_alias: &'static str,
+    pub values: &'static [&'static str],
+    pub alias: &'static str,
+}
+
+impl KeyAliasInfo {
+    pub const fn new(
+        key_alias: &'static str,
+        values: &'static [&'static str],
+        alias: &'static str,
+    ) -> Self {
+        Self {
+            key_alias,
+            values,
+            alias,
+        }
+    }
+}
+
+/// Deprecated-name to canonical-name mapping for object properties.
+///
+/// Stored sorted by alias name so a binary search can resolve aliases during schema lookup.
+pub type PropertyAliasMap = &'static [(&'static str, &'static str)];
+
 /// Data type to describe objects (maps).
 #[derive(Debug)]
 #[cfg_attr(feature = "test-harness", derive(Eq, PartialEq))]
+#[non_exhaustive]
 pub struct ObjectSchema {
     pub description: &'static str,
     /// If set, allow additional properties which are not defined in
@@ -616,15 +855,74 @@ pub struct ObjectSchema {
     pub properties: SchemaPropertyMap,
     /// Default key name - used by `parse_parameter_string()`
     pub default_key: Option<&'static str>,
+    /// Deprecated property names that resolve to a canonical property in `properties`.
+    ///
+    /// Each entry is `(alias, canonical)`. Lookups for `alias` behave as if `canonical` had been
+    /// used. Parameter parsing rewrites the alias to the canonical name; specifying both at the
+    /// same time is rejected with a "cannot set both" error.
+    pub property_aliases: PropertyAliasMap,
+    /// DO NOT USE!
+    ///
+    /// This is meant for the PVE schema generator ONLY!
+    ///
+    /// This is to support legacy property string information: declare a `keyAlias` and its
+    /// corresponding `alias` property (as defined in PVE's schema).
+    pub key_alias_info: Option<KeyAliasInfo>,
 }
 
 impl ObjectSchema {
+    /// Create a new `object` schema.
+    ///
+    /// Note that the `properties` must be sorted! Therefore it is recommended that any schema
+    /// created outside of a `const` context is wrapped in a `const {}` block.
+    /// (The `#[sortable]` attribute can be used to automate the sorting).
+    ///
+    /// This is okay:
+    ///
+    /// ```
+    /// # use proxmox_schema::{ObjectSchema, Schema, StringSchema};
+    /// const SCHEMA: Schema = ObjectSchema::new(
+    ///     "Some Object",
+    ///     &[
+    ///         ("key1", false, &StringSchema::new("A String").schema()),
+    ///         ("key2", false, &StringSchema::new("Another String").schema()),
+    ///     ],
+    /// ).schema();
+    /// ```
+    ///
+    /// These will panic:
+    ///
+    /// ```compile_fail,E0080
+    /// # use proxmox_schema::{ObjectSchema, Schema, StringSchema};
+    /// const SCHEMA: Schema = ObjectSchema::new(
+    ///     "Some Object",
+    ///     &[
+    ///         ("wrong", false, &StringSchema::new("A String").schema()),
+    ///         ("order", false, &StringSchema::new("Another String").schema()),
+    ///     ],
+    /// ).schema();
+    /// ```
+    ///
+    /// ```compile_fail,E0080
+    /// # use proxmox_schema::{ObjectSchema, Schema, StringSchema};
+    /// const SCHEMA: Schema = ObjectSchema::new(
+    ///     "Some Object",
+    ///     &[
+    ///         ("same", false, &StringSchema::new("A String").schema()),
+    ///         // duplicate field name:
+    ///         ("same", false, &StringSchema::new("Another String").schema()),
+    ///     ],
+    /// ).schema();
+    /// ```
     pub const fn new(description: &'static str, properties: SchemaPropertyMap) -> Self {
+        assert_properties_sorted(properties);
         ObjectSchema {
             description,
             properties,
             additional_properties: false,
             default_key: None,
+            property_aliases: &[],
+            key_alias_info: None,
         }
     }
 
@@ -634,6 +932,7 @@ impl ObjectSchema {
     }
 
     pub const fn default_key(mut self, key: &'static str) -> Self {
+        assert_key_not_alias(key, self.property_aliases);
         self.default_key = Some(key);
         self
     }
@@ -642,16 +941,34 @@ impl ObjectSchema {
         Schema::Object(self)
     }
 
-    pub fn lookup(&self, key: &str) -> Option<(bool, &Schema)> {
+    pub fn lookup(&self, key: &str) -> Option<(bool, &'static Schema)> {
+        self.lookup_with_canonical_name(key)
+            .map(|(_name, optional, schema)| (*optional, *schema))
+    }
+
+    /// Lookup the schema of a property which may be an alias, including the canonical name in the
+    /// returned tuple.
+    pub fn lookup_with_canonical_name(&self, key: &str) -> Option<&'static SchemaPropertyEntry> {
+        let key = self.lookup_alias(key).unwrap_or(key);
         if let Ok(ind) = self
             .properties
             .binary_search_by_key(&key, |(name, _, _)| name)
         {
-            let (_name, optional, prop_schema) = self.properties[ind];
-            Some((optional, prop_schema))
+            Some(&self.properties[ind])
         } else {
             None
         }
+    }
+
+    /// Resolve a deprecated property name to its canonical name.
+    ///
+    /// Returns `None` if `key` is not registered as an alias.
+    pub fn lookup_alias(&self, key: &str) -> Option<&'static str> {
+        let idx = self
+            .property_aliases
+            .binary_search_by_key(&key, |(alias, _)| alias)
+            .ok()?;
+        Some(self.property_aliases[idx].1)
     }
 
     /// Parse key/value pairs and verify with object schema
@@ -665,6 +982,90 @@ impl ObjectSchema {
     ) -> Result<Value, ParameterError> {
         ParameterSchema::from(self).parse_parameter_strings(data, test_required)
     }
+
+    /// Register deprecated property names that resolve to a canonical property.
+    ///
+    /// Use this to keep an old name accepted after renaming a property: pass
+    /// `&[("old-name", "new-name")]` to make CLI flags, property strings, and JSON inputs that
+    /// still use `old-name` keep working, while the schema and documentation present only
+    /// `new-name`.
+    ///
+    /// The alias list must be sorted by alias name. Each alias must not shadow an existing
+    /// property and must point to an existing property; both are checked at compile time.
+    ///
+    /// ```
+    /// # use proxmox_schema::{ObjectSchema, Schema, StringSchema};
+    /// const SCHEMA: Schema = ObjectSchema::new(
+    ///     "Some Object",
+    ///     &[("mode", false, &StringSchema::new("Mode").schema())],
+    /// )
+    /// .property_aliases(&[("legacy-mode", "mode")])
+    /// .schema();
+    /// ```
+    ///
+    /// Aliases that target a non-existent property are rejected:
+    ///
+    /// ```compile_fail,E0080
+    /// # use proxmox_schema::{ObjectSchema, Schema, StringSchema};
+    /// const SCHEMA: Schema = ObjectSchema::new(
+    ///     "Some Object",
+    ///     &[("mode", false, &StringSchema::new("Mode").schema())],
+    /// )
+    /// .property_aliases(&[("legacy", "missing")])
+    /// .schema();
+    /// ```
+    ///
+    /// Aliases must not shadow an existing property:
+    ///
+    /// ```compile_fail,E0080
+    /// # use proxmox_schema::{ObjectSchema, Schema, StringSchema};
+    /// const SCHEMA: Schema = ObjectSchema::new(
+    ///     "Some Object",
+    ///     &[
+    ///         ("mode", false, &StringSchema::new("Mode").schema()),
+    ///         ("name", false, &StringSchema::new("Name").schema()),
+    ///     ],
+    /// )
+    /// .property_aliases(&[("name", "mode")])
+    /// .schema();
+    /// ```
+    pub const fn property_aliases(mut self, aliases: PropertyAliasMap) -> Self {
+        assert_property_aliases_valid(aliases, self.properties);
+        if let Some(default_key) = self.default_key {
+            assert_key_not_alias(default_key, aliases);
+        }
+        self.property_aliases = aliases;
+        self
+    }
+
+    /// DO NOT USE!
+    ///
+    /// This is meant for the PVE schema generator ONLY!
+    ///
+    /// This is to support legacy property string information: declare a `keyAlias` and its
+    /// corresponding `alias` property (as defined in PVE's schema).
+    pub const fn key_alias_info(mut self, key_alias_info: KeyAliasInfo) -> Self {
+        self.key_alias_info = Some(key_alias_info);
+        self
+    }
+
+    /// Check whether the schema contains a specific parameter.
+    /// This is meant for compile time checks and not as public API.
+    #[doc(hidden)]
+    pub const fn const_has_parameter(&self, name: &[u8], additional_properties: bool) -> bool {
+        // additional properties are not statically known, so any name could exist
+        if additional_properties && self.additional_properties {
+            return true;
+        }
+        let mut i = 0;
+        while i < self.properties.len() {
+            if proxmox_const_utils::byte_string_eq(self.properties[i].0.as_bytes(), name) {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
 }
 
 /// Combines multiple *object* schemas into one.
@@ -675,6 +1076,7 @@ impl ObjectSchema {
 /// Schema, this is not supported, so here we simply assume additional properties to be allowed.
 #[derive(Debug)]
 #[cfg_attr(feature = "test-harness", derive(Eq, PartialEq))]
+#[non_exhaustive]
 pub struct AllOfSchema {
     pub description: &'static str,
 
@@ -683,8 +1085,22 @@ pub struct AllOfSchema {
     pub list: &'static [&'static Schema],
 }
 
+const fn assert_only_objects_in_all_of(list: &'static [&'static Schema]) {
+    let mut i = 0;
+    while i != list.len() {
+        match list[i] {
+            Schema::Object(_) => (),
+            Schema::AllOf(sub) => assert_only_objects_in_all_of(sub.list),
+            Schema::OneOf(sub) => assert_only_objects_in_one_of(sub.list),
+            _ => panic!("non-object schema in all-of schema"),
+        }
+        i += 1;
+    }
+}
+
 impl AllOfSchema {
     pub const fn new(description: &'static str, list: &'static [&'static Schema]) -> Self {
+        assert_only_objects_in_all_of(list);
         Self { description, list }
     }
 
@@ -692,12 +1108,42 @@ impl AllOfSchema {
         Schema::AllOf(self)
     }
 
-    pub fn lookup(&self, key: &str) -> Option<(bool, &Schema)> {
+    #[cfg_attr(
+        proxmox_schema = "strict",
+        deprecated(note = "lookup without data ignores clashing oneOf keys, use lookup_schema")
+    )]
+    pub fn lookup(&self, key: &str) -> Option<(bool, &'static Schema)> {
+        #[allow(deprecated)]
         for entry in self.list {
             if let Some(v) = entry
                 .any_object()
                 .expect("non-object-schema in `AllOfSchema`")
                 .lookup(key)
+            {
+                return Some(v);
+            }
+        }
+
+        None
+    }
+
+    /// Lookup the schema for a key.
+    ///
+    /// The `get_type` callback will be used when descending into [`OneOfSchema`]s to decide which
+    /// variant is the currently active one.
+    ///
+    /// Otherwise, [`OneOfSchema`]s only return the schema for their type property, but their
+    /// variants are ignored.
+    pub fn lookup_schema(
+        &self,
+        key: &str,
+        get_type: &dyn WithTypeField,
+    ) -> Option<(bool, &'static Schema)> {
+        for entry in self.list {
+            if let Some(v) = entry
+                .any_object()
+                .expect("non-object-schema in `AllOfSchema`")
+                .lookup_schema(key, get_type)
             {
                 return Some(v);
             }
@@ -717,7 +1163,23 @@ impl AllOfSchema {
     ) -> Result<Value, ParameterError> {
         ParameterSchema::from(self).parse_parameter_strings(data, test_required)
     }
+
+    /// Check whether the schema contains a specific parameter.
+    /// This is meant for compile time checks and not as public API.
+    #[doc(hidden)]
+    pub const fn const_has_parameter(&self, name: &[u8], additional_properties: bool) -> bool {
+        let mut i = 0;
+        while i < self.list.len() {
+            if self.list[i].const_has_parameter(name, additional_properties) {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
 }
+
+pub type OneOfVariantList = [(&'static str, &'static Schema)];
 
 /// An object schema which is basically like a rust enum: exactly one variant may match.
 ///
@@ -727,6 +1189,7 @@ impl AllOfSchema {
 /// Note that these are limited to object schemas. Other schemas will produce errors.
 #[derive(Debug)]
 #[cfg_attr(feature = "test-harness", derive(Eq, PartialEq))]
+#[non_exhaustive]
 pub struct OneOfSchema {
     pub description: &'static str,
 
@@ -737,15 +1200,179 @@ pub struct OneOfSchema {
 
     /// The parameter is checked against all of the schemas in the list. Note that all schemas must
     /// be object schemas.
-    pub list: &'static [(&'static str, &'static Schema)],
+    pub list: &'static OneOfVariantList,
+}
+
+const fn assert_one_of_list_is_sorted(list: &[(&str, &Schema)]) {
+    use std::cmp::Ordering;
+
+    let mut i = 0;
+    let mut prev = None::<&'static str>;
+    while i != list.len() {
+        let cur = list[i].0;
+        if let Some(prev) = prev {
+            match proxmox_const_utils::byte_string_cmp(prev.as_bytes(), cur.as_bytes()) {
+                Ordering::Greater => panic!("oneOf variant list must be sorted"),
+                Ordering::Equal => panic!("multiple variants of the same type"),
+                Ordering::Less => (),
+            }
+        }
+        prev = Some(cur);
+        i += 1;
+    }
+}
+
+const fn assert_only_objects_in_one_of(list: &'static OneOfVariantList) {
+    let mut i = 0;
+    while i != list.len() {
+        match list[i].1 {
+            Schema::Object(_) => (),
+            Schema::AllOf(sub) => assert_only_objects_in_all_of(sub.list),
+            Schema::OneOf(sub) => assert_only_objects_in_one_of(sub.list),
+            _ => panic!("non-object schema in one-of schema"),
+        }
+        i += 1;
+    }
+}
+
+const fn assert_no_variant_contains(list: &'static OneOfVariantList, name: &str) {
+    let name = name.as_bytes();
+    let mut i = 0;
+    while i != list.len() {
+        if list[i].1.const_has_parameter(name, false) {
+            panic!("a oneOf variant contains a property with the same name as the type property");
+        }
+        i += 1;
+    }
 }
 
 impl OneOfSchema {
+    /// Create a new `oneOf` schema.
+    ///
+    /// Note that the `properties` must be sorted! Therefore it is recommended that any schema
+    /// created outside of a `const` context is wrapped in a `const {}` block.
+    /// (The `#[sortable]` attribute can be used to automate the sorting).
+    ///
+    /// The type property reuses the same tuple type as object properties, however, it must not be
+    /// marked as optional.
+    ///
+    /// This is okay:
+    ///
+    /// ```
+    /// # use proxmox_schema::{OneOfSchema, ObjectSchema, Schema, StringSchema};
+    /// # const SCHEMA_V1: Schema = ObjectSchema::new(
+    /// #     "Some Object",
+    /// #     &[
+    /// #         ("key1", false, &StringSchema::new("A String").schema()),
+    /// #         ("key2", false, &StringSchema::new("Another String").schema()),
+    /// #     ],
+    /// # ).schema();
+    /// # const SCHEMA_V2: Schema = ObjectSchema::new(
+    /// #     "Another Object",
+    /// #     &[
+    /// #         ("key3", false, &StringSchema::new("A String").schema()),
+    /// #         ("key4", false, &StringSchema::new("Another String").schema()),
+    /// #     ],
+    /// # ).schema();
+    /// const SCHEMA: Schema = OneOfSchema::new(
+    ///     "Some enum",
+    ///     &("type", false, &StringSchema::new("v1 or v2").schema()),
+    ///     &[
+    ///         ("v1", &SCHEMA_V1),
+    ///         ("v2", &SCHEMA_V2),
+    ///     ],
+    /// ).schema();
+    /// ```
+    ///
+    /// These will panic:
+    ///
+    /// ```compile_fail,E0080
+    /// # use proxmox_schema::{OneOfSchema, ObjectSchema, Schema, StringSchema};
+    /// # const SCHEMA_V1: Schema = ObjectSchema::new(
+    /// #     "Some Object",
+    /// #     &[
+    /// #         ("key1", false, &StringSchema::new("A String").schema()),
+    /// #         ("key2", false, &StringSchema::new("Another String").schema()),
+    /// #     ],
+    /// # ).schema();
+    /// # const SCHEMA_V2: Schema = ObjectSchema::new(
+    /// #     "Another Object",
+    /// #     &[
+    /// #         ("key3", false, &StringSchema::new("A String").schema()),
+    /// #         ("key4", false, &StringSchema::new("Another String").schema()),
+    /// #     ],
+    /// # ).schema();
+    /// const SCHEMA: Schema = OneOfSchema::new(
+    ///     "Some enum",
+    ///     &("type", false, &StringSchema::new("v1 or v2").schema()),
+    ///     &[
+    ///         ("v2", &SCHEMA_V1),
+    ///         ("v1", &SCHEMA_V2),
+    ///     ],
+    /// ).schema();
+    /// ```
+    ///
+    /// ```compile_fail,E0080
+    /// # use proxmox_schema::{OneOfSchema, ObjectSchema, Schema, StringSchema};
+    /// # const SCHEMA_V1: Schema = ObjectSchema::new(
+    /// #     "Some Object",
+    /// #     &[
+    /// #         ("key1", false, &StringSchema::new("A String").schema()),
+    /// #         ("key2", false, &StringSchema::new("Another String").schema()),
+    /// #     ],
+    /// # ).schema();
+    /// # const SCHEMA_V2: Schema = ObjectSchema::new(
+    /// #     "Another Object",
+    /// #     &[
+    /// #         ("key3", false, &StringSchema::new("A String").schema()),
+    /// #         ("key4", false, &StringSchema::new("Another String").schema()),
+    /// #     ],
+    /// # ).schema();
+    /// const SCHEMA: Schema = OneOfSchema::new(
+    ///     "Some enum",
+    ///     &("type", false, &StringSchema::new("v1 or v2").schema()),
+    ///     &[
+    ///         ("v1", &SCHEMA_V1),
+    ///         // duplicate type key:
+    ///         ("v1", &SCHEMA_V2),
+    ///     ],
+    /// ).schema();
+    /// ```
+    ///
+    /// ```compile_fail,E0080
+    /// # use proxmox_schema::{OneOfSchema, ObjectSchema, Schema, StringSchema};
+    /// # const SCHEMA_V1: Schema = ObjectSchema::new(
+    /// #     "Some Object",
+    /// #     &[
+    /// #         ("key1", false, &StringSchema::new("A String").schema()),
+    /// #         ("key2", false, &StringSchema::new("Another String").schema()),
+    /// #     ],
+    /// # ).schema();
+    /// # const SCHEMA_V2: Schema = ObjectSchema::new(
+    /// #     "Another Object",
+    /// #     &[
+    /// #         ("key3", false, &StringSchema::new("A String").schema()),
+    /// #         ("key4", false, &StringSchema::new("Another String").schema()),
+    /// #     ],
+    /// # ).schema();
+    /// const SCHEMA: Schema = OneOfSchema::new(
+    ///     "Some enum",
+    ///     &("type", true, &StringSchema::new("v1 or v2").schema()),
+    ///     &[
+    ///         ("v1", &SCHEMA_V1),
+    ///         ("v2", &SCHEMA_V2),
+    ///     ],
+    /// ).schema();
+    /// ```
     pub const fn new(
         description: &'static str,
         type_property_entry: &'static SchemaPropertyEntry,
-        list: &'static [(&'static str, &'static Schema)],
+        list: &'static OneOfVariantList,
     ) -> Self {
+        assert_one_of_list_is_sorted(list);
+        assert_only_objects_in_one_of(list);
+        assert_no_variant_contains(list, type_property_entry.0);
+        assert!(!type_property_entry.1, "type property must not be optional");
         Self {
             description,
             type_property_entry,
@@ -765,11 +1392,16 @@ impl OneOfSchema {
         self.type_property_entry.2
     }
 
-    pub fn lookup(&self, key: &str) -> Option<(bool, &Schema)> {
+    #[cfg_attr(
+        proxmox_schema = "strict",
+        deprecated(note = "lookup without data ignores clashing oneOf keys, use lookup_schema")
+    )]
+    pub fn lookup(&self, key: &str) -> Option<(bool, &'static Schema)> {
         if key == self.type_property() {
             return Some((false, self.type_schema()));
         }
 
+        #[allow(deprecated)]
         for (_variant, entry) in self.list {
             if let Some(v) = entry
                 .any_object()
@@ -783,7 +1415,37 @@ impl OneOfSchema {
         None
     }
 
-    pub fn lookup_variant(&self, name: &str) -> Option<&Schema> {
+    /// Lookup the schema for a key.
+    ///
+    /// The `get_type` callback will be used when descending into [`OneOfSchema`]s to decide which
+    /// variant is the currently active one.
+    ///
+    /// Otherwise, [`OneOfSchema`]s only return the schema for their type property, but their
+    /// variants are ignored.
+    pub fn lookup_schema(
+        &self,
+        key: &str,
+        get_type: &dyn WithTypeField,
+    ) -> Option<(bool, &'static Schema)> {
+        if key == self.type_property() {
+            return Some((self.type_property_entry.1, self.type_property_entry.2));
+        }
+
+        let mut out = None;
+        get_type.with_type_field(self.type_property(), &mut |variant| {
+            let Some(variant) = variant else { return };
+
+            if let Some(schema) = self.lookup_variant(variant) {
+                out = schema
+                    .any_object()
+                    .expect("non-object-schema in `OneOfSchema`")
+                    .lookup_schema(key, get_type)
+            }
+        });
+        out
+    }
+
+    pub fn lookup_variant(&self, name: &str) -> Option<&'static Schema> {
         Some(
             self.list[self
                 .list
@@ -804,20 +1466,166 @@ impl OneOfSchema {
     ) -> Result<Value, ParameterError> {
         ParameterSchema::from(self).parse_parameter_strings(data, test_required)
     }
+
+    /// Check whether the schema contains a specific parameter.
+    /// This is meant for compile time checks and not as public API.
+    #[doc(hidden)]
+    pub const fn const_has_parameter(&self, name: &[u8], additional_properties: bool) -> bool {
+        if proxmox_const_utils::byte_string_eq(self.type_property_entry.0.as_bytes(), name) {
+            return true;
+        }
+        let mut i = 0;
+        while i < self.list.len() {
+            if self.list[i]
+                .1
+                .const_has_parameter(name, additional_properties)
+            {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
+}
+
+mod private {
+    pub trait Sealed: Send + Sync {}
+    impl Sealed for super::ObjectSchema {}
+    impl Sealed for super::AllOfSchema {}
+    impl Sealed for super::OneOfSchema {}
+    impl Sealed for super::ParameterSchema {}
+}
+
+/// Check `aliases_present` for conflicts and, if there are none, rename each alias key in `map`
+/// to its canonical name. The caller guarantees each `alias_key` is already present in `map`. A
+/// conflict (an alias and its canonical both set, or two different aliases of the same canonical)
+/// leaves `map` unchanged and returns a [`ParameterError`].
+fn rename_aliases_to_canonicals(
+    map: &mut serde_json::Map<String, Value>,
+    aliases_present: &[(&str, &'static str)],
+) -> Result<(), Error> {
+    let mut errors = ParameterError::new();
+    let mut seen_canonical: HashSet<&'static str> = HashSet::new();
+    for (alias_key, canonical) in aliases_present {
+        if map.contains_key(*canonical) {
+            errors.push(
+                alias_key.to_string(),
+                format_err!("cannot set both `{canonical}` and `{alias_key}`."),
+            );
+        } else if !seen_canonical.insert(canonical) {
+            errors.push(
+                alias_key.to_string(),
+                format_err!("cannot set both `{alias_key}` and another alias of `{canonical}`."),
+            );
+        }
+    }
+    if !errors.is_empty() {
+        return Err(errors.into());
+    }
+    for (alias_key, canonical) in aliases_present {
+        let v = map.remove(*alias_key).expect("alias key was just observed");
+        map.insert(canonical.to_string(), v);
+    }
+    Ok(())
 }
 
 /// Beside [`ObjectSchema`] we also have an [`AllOfSchema`] which also represents objects.
-pub trait ObjectSchemaType {
+pub trait ObjectSchemaType: private::Sealed + Send + Sync {
     fn description(&self) -> &'static str;
-    fn lookup(&self, key: &str) -> Option<(bool, &Schema)>;
+    #[cfg_attr(
+        proxmox_schema = "strict",
+        deprecated(note = "lookup without data ignores clashing oneOf keys, use lookup_schema")
+    )]
+    fn lookup(&self, key: &str) -> Option<(bool, &'static Schema)>;
+    #[cfg_attr(
+        proxmox_schema = "strict",
+        deprecated(
+            note = "properties iteration with oneOf subschemas is broken, use all_properties"
+        )
+    )]
     fn properties(&self) -> ObjectPropertyIterator;
     fn additional_properties(&self) -> bool;
     fn default_key(&self) -> Option<&'static str>;
 
+    /// Iterate over all properties of this schema, including all oneOf variants.
+    /// While iterating over oneOf variants, the current set of type properties required to reach
+    /// an item is available in each item.
+    fn all_properties(&self) -> AllProperties<'static>;
+
+    /// Check that the oneOf type properties present in `data` name existing variants, including
+    /// nested oneOfs in the selected variants.
+    ///
+    /// Lookups and property iteration with type data skip all variants of a oneOf whose type is
+    /// missing or unknown, so validation cannot rely on them to reject unknown types. Missing type
+    /// properties and their value types are left to the regular property validation.
+    fn verify_type_fields(&self, _data: &dyn WithTypeField) -> Result<(), ParameterError> {
+        Ok(())
+    }
+
+    /// Resolve a deprecated property name to its canonical name.
+    ///
+    /// Schemas that have no aliases (the common case) inherit the default `None` here.
+    fn lookup_alias(&self, _key: &str) -> Option<&'static str> {
+        None
+    }
+
+    /// Lookup the schema for a key.
+    ///
+    /// The `get_type` callback will be used when descending into [`OneOfSchema`]s to decide which
+    /// variant is the currently active one.
+    ///
+    /// Otherwise, [`OneOfSchema`]s only return the schema for their type property, but their
+    /// variants are ignored.
+    fn lookup_schema(
+        &self,
+        key: &str,
+        get_type: &dyn WithTypeField,
+    ) -> Option<(bool, &'static Schema)>;
+
+    /// Lookup all schemas for a key.
+    ///
+    /// When a schema involves a `oneOf` schema, the same property name can be used in multiple
+    /// variants with different schemas. When the types are known, like when looking up a schema
+    /// for an already existing object,
+    /// [`lookup_schema`](ObjectSchemaType::lookup_schema) can be used and supplied with the data
+    /// to lookup the variants.
+    ///
+    /// When no data is available, looking up a single schema is often the wrong thing to do.
+    ///
+    /// This method allows iterating through all keys of the same name. The items yielded by the
+    /// iterator provide a set of conditions as key-value pairs which are required for a property
+    /// to be "active". Without `oneOf` schemas, this list will simply be empty. Otherwise, the
+    /// type property values will be filled in. There may be multiple such conditions if multiple
+    /// `oneOf` schemas are nested.
+    fn lookup_all<'k>(&self, key: &'k str) -> LookupAll<'k>;
+
+    /// Rewrite deprecated alias keys in `value` to their canonical names.
+    ///
+    /// For object values, every key registered via [`ObjectSchema::property_aliases`] is renamed
+    /// to its canonical name. If both an alias and its canonical (or two different aliases of
+    /// the same canonical) are present, a `cannot set both` [`ParameterError`] is returned and
+    /// `value` is left unchanged.
+    ///
+    /// Callers handing the resulting [`Value`] to API handlers generated by `#[api]` (which look
+    /// up properties by canonical name only) must call this before verification and dispatch;
+    /// otherwise the alias key passes [`verify_json`](Self::verify_json) but the downstream
+    /// handler reports the canonical as missing.
+    ///
+    /// The default implementation walks `value.keys()` and resolves each through
+    /// [`lookup_alias`](Self::lookup_alias); concrete schema kinds that can find their alias
+    /// list more directly (such as [`ObjectSchema`]'s static sidecar) override this. No-op
+    /// for schemas with no declared aliases and for non-object values.
+    fn canonicalize_aliases(&self, value: &mut Value) -> Result<(), Error>;
+
+    /// Should always return `None`, unless dealing with *legacy* PVE property strings.
+    fn key_alias_info(&self) -> Option<KeyAliasInfo> {
+        None
+    }
+
     /// Verify JSON value using an object schema.
     fn verify_json(&self, data: &Value) -> Result<(), Error> {
         let map = match data {
-            Value::Object(ref map) => map,
+            Value::Object(map) => map,
             Value::Array(_) => bail!("Expected object - got array."),
             _ => bail!("Expected object - got scalar value."),
         };
@@ -826,8 +1634,29 @@ pub trait ObjectSchemaType {
 
         let additional_properties = self.additional_properties();
 
+        // Track canonical names already seen via an alias to also catch two distinct aliases
+        // of the same canonical being set at once. Callers going through
+        // [`canonicalize_aliases`](Self::canonicalize_aliases) before `verify_json` find no
+        // aliases left in the map and skip these branches entirely.
+        let mut seen_alias_canonical: HashSet<&'static str> = HashSet::new();
         for (key, value) in map {
-            if let Some((_optional, prop_schema)) = self.lookup(key) {
+            if let Some(canonical) = self.lookup_alias(key) {
+                if map.contains_key(canonical) {
+                    errors.push(
+                        key.to_string(),
+                        format_err!("cannot set both `{canonical}` and `{key}`."),
+                    );
+                    continue;
+                }
+                if !seen_alias_canonical.insert(canonical) {
+                    errors.push(
+                        key.to_string(),
+                        format_err!("cannot set both `{key}` and another alias of `{canonical}`."),
+                    );
+                    continue;
+                }
+            }
+            if let Some((_optional, prop_schema)) = self.lookup_schema(key, map) {
                 if let Err(err) = prop_schema.verify_json(value) {
                     errors.add_errors(key, err);
                 };
@@ -839,19 +1668,451 @@ pub trait ObjectSchemaType {
             }
         }
 
-        for (name, optional, _prop_schema) in self.properties() {
-            if !(*optional) && data[name] == Value::Null {
-                errors.push(
-                    name.to_string(),
-                    format_err!("property is missing and it is not optional"),
-                );
+        for property in self.all_properties().with_types_from(map) {
+            let name = property.name();
+
+            if property.optional() || data[name] != Value::Null {
+                continue;
             }
+            // a present alias satisfies the required-property check
+            if map
+                .keys()
+                .filter_map(|k| self.lookup_alias(k))
+                .any(|canon| canon == name)
+            {
+                continue;
+            }
+            errors.push(
+                name.to_string(),
+                format_err!("property is missing and it is not optional"),
+            );
+        }
+
+        if let Err(type_errors) = self.verify_type_fields(map) {
+            errors.extend_unreported(type_errors);
         }
 
         if !errors.is_empty() {
             Err(errors.into())
         } else {
             Ok(())
+        }
+    }
+}
+
+/// This manages the conditions for [`AllProperties`] and [`LookupAll`].
+///
+/// Entering a `oneOf` schema must call the `enter_condition` method.
+/// This will "stage" the condition name in `new_condition`. Entering a variant must call the
+/// `update_condition` method which will move a staged condition or update it.
+///
+/// This requires the type property of a [`OneOfSchema`] to be dealt with first, which is
+/// important, since we do not want to have to re-query the field for every variant if we want to
+/// only query a specific one, also, we want to allow the type property to be removed (eg. for the
+/// `ExtractValueDeserializer`) during the iteration.
+#[derive(Default)]
+struct PropertyConditions<'a> {
+    conditions: Option<Arc<Vec<(&'static str, &'static str)>>>,
+    new_condition: Option<&'static str>,
+    get_type: Option<&'a dyn WithTypeField>,
+}
+
+impl PropertyConditions<'_> {
+    fn get(&self) -> Option<Arc<Vec<(&'static str, &'static str)>>> {
+        self.conditions.clone()
+    }
+
+    fn make_mut<'a>(
+        conditions: &'a mut Option<Arc<Vec<(&'static str, &'static str)>>>,
+    ) -> &'a mut Vec<(&'static str, &'static str)> {
+        Arc::make_mut(conditions.get_or_insert_default())
+    }
+
+    /// Enter a new oneOf schema, so its type property is added to the conditions.
+    ///
+    /// Iterators first go through the type property itself, though, which does not include itself
+    /// as a condition, so we remember it as a `new_condition`, and entering the *variant* (via
+    /// `update_condition()` finally promotes it into the list.
+    ///
+    /// Returns the iterator to fill into the `PropertiesIterOneOf`.
+    fn enter_condition(
+        &mut self,
+        type_property_name: &'static str,
+        list: &'static OneOfVariantList,
+    ) -> OneOfVariantIter {
+        self.new_condition = Some(type_property_name);
+
+        match self.get_type {
+            None => list.iter(),
+            Some(filter) => {
+                let mut index = None;
+                (filter).with_type_field(type_property_name, &mut |value| {
+                    index = value.and_then(|variant| {
+                        list.binary_search_by_key(&variant, |(name, _)| name).ok()
+                    })
+                });
+                match index {
+                    // Variant exists, the property iterator should only consider the one.
+                    Some(index) => list[index..(index + 1)].iter(),
+                    // Variant not found, let's not yield any of them.
+                    None => Default::default(),
+                }
+            }
+        }
+    }
+
+    /// Update the current condition.
+    fn update_condition(&mut self, value: &'static str) {
+        if let Some(type_property_name) = self.new_condition.take() {
+            Self::make_mut(&mut self.conditions).push((type_property_name, value));
+        } else {
+            Self::make_mut(&mut self.conditions)
+                .last_mut()
+                .expect("`update_condition()` called without a prior `push()`")
+                .1 = value;
+        }
+    }
+
+    /// Leave the current oneOf schema.
+    fn pop(&mut self) {
+        // If we never iterate through any variants of an enum, `self.conditions` does not contain
+        // the type property name (although such a case should technically not be reachable, as
+        // oneOf schemas with no variants make no sense). The moment we enter a variant,
+        // `update_condition` is called and moves it there. Anyway, verify `new_condition` first.
+        if self.new_condition.take().is_none() {
+            if let Some(conditions) = &mut self.conditions {
+                let conditions = Arc::make_mut(conditions);
+                conditions.pop();
+                if conditions.is_empty() {
+                    self.conditions = None;
+                }
+            }
+        }
+    }
+}
+
+/// An iterator over the properties of an object-like schema.
+///
+/// Note that a property name can appear multiple times if it exists in multiple variants of a
+/// [`OneOfSchema`]. To know which variant the property belongs to, each item may have associated
+/// conditions with it.
+///
+/// This yields items of type [`AllPropertiesItem`].
+///
+/// When entering a [`OneOfSchema`], the type property is yielded first.
+///
+/// It is safe to subsequently remove the type property from an object used via
+/// [`with_types_from`](AllProperties::with_types_from), as its value takes effect internally
+/// immediately when the type property is
+/// being yielded.
+pub struct AllProperties<'a> {
+    iter: Vec<PropertiesIter>,
+    conditions: PropertyConditions<'a>,
+}
+
+impl AllProperties<'static> {
+    fn new_empty() -> Self {
+        Self {
+            iter: Vec::new(),
+            conditions: Default::default(),
+        }
+    }
+}
+
+impl AllProperties<'_> {
+    /// Attach a type fetcher to the iterator.
+    ///
+    /// This causes `oneOf` variants to only be iterated through if they are the currently active
+    /// type.
+    ///
+    /// Note that it does not make sense to call this in the middle of an iteration, as it may then
+    /// yield multiple but not all variants of a `oneOf` schema.
+    ///
+    /// For each contained [`OneOfSchema`] this is called only once right before the type property
+    /// is returned in the iteration.
+    pub fn with_types_from<'a>(self, get_type: &'a dyn WithTypeField) -> AllProperties<'a> {
+        AllProperties {
+            iter: self.iter,
+            conditions: PropertyConditions {
+                conditions: self.conditions.conditions,
+                new_condition: self.conditions.new_condition,
+                get_type: Some(get_type),
+            },
+        }
+    }
+
+    fn push_iter(&mut self, schema: &'static Schema) {
+        match schema {
+            Schema::Object(schema) => self.push_object(schema),
+            Schema::AllOf(schema) => self.push_all_of(schema),
+            Schema::OneOf(schema) => self.push_one_of(schema),
+            _ => panic!("non-object-schema in object properties iteration"),
+        }
+    }
+
+    fn push_object(&mut self, schema: &ObjectSchema) {
+        self.iter
+            .push(PropertiesIter::Object(schema.properties.iter()));
+    }
+
+    fn push_all_of(&mut self, schema: &AllOfSchema) {
+        self.iter.push(PropertiesIter::AllOf(schema.list.iter()));
+    }
+
+    fn push_one_of(&mut self, schema: &OneOfSchema) {
+        self.iter
+            .push(PropertiesIter::OneOf(PropertiesIterOneOf::TypeProperty(
+                schema.type_property_entry,
+                schema.list,
+            )));
+    }
+
+    fn pop_iter(&mut self) {
+        if matches!(self.iter.pop(), Some(PropertiesIter::OneOf(_))) {
+            self.conditions.pop();
+        }
+    }
+
+    fn make_item(&self, entry: SchemaPropertyEntry) -> AllPropertiesItem {
+        AllPropertiesItem {
+            entry,
+            conditions: self.conditions.get(),
+        }
+    }
+}
+
+/// An entry from a [`AllProperties`] iterator.
+///
+/// Note that each item may have associated conditions with it, in case it was reached through
+/// [`OneOfSchema`] entries.
+#[derive(Clone, Debug)]
+pub struct AllPropertiesItem {
+    entry: SchemaPropertyEntry,
+    conditions: Option<Arc<Vec<(&'static str, &'static str)>>>,
+}
+
+impl AllPropertiesItem {
+    /// The item's canonical name in the object schema.
+    pub const fn name(&self) -> &'static str {
+        self.entry.0
+    }
+
+    /// Whether the item is optional in the schema.
+    pub const fn optional(&self) -> bool {
+        self.entry.1
+    }
+
+    /// The item's schema.
+    pub const fn schema(&self) -> &'static Schema {
+        self.entry.2
+    }
+
+    /// The conditions under which this item exists.
+    ///
+    /// This is a set of key-value pairs. The keys are type properties of [`OneOfSchema`]s, and the
+    /// values are its variant names.
+    pub fn conditions(&self) -> &[(&'static str, &'static str)] {
+        match &self.conditions {
+            None => &[],
+            Some(arc) => arc,
+        }
+    }
+}
+
+/// Implementation of property iteration.
+enum PropertiesIter {
+    Object(std::slice::Iter<'static, SchemaPropertyEntry>),
+    AllOf(std::slice::Iter<'static, &'static Schema>),
+    OneOf(PropertiesIterOneOf),
+}
+
+type OneOfVariantIter = std::slice::Iter<'static, (&'static str, &'static Schema)>;
+enum PropertiesIterOneOf {
+    TypeProperty(&'static SchemaPropertyEntry, &'static OneOfVariantList),
+    Variants(OneOfVariantIter),
+}
+
+impl Iterator for AllProperties<'_> {
+    type Item = AllPropertiesItem;
+
+    fn next(&mut self) -> Option<AllPropertiesItem> {
+        loop {
+            match self.iter.last_mut()? {
+                PropertiesIter::Object(iter) => match iter.next() {
+                    None => self.pop_iter(),
+                    Some(item) => {
+                        return Some(self.make_item(*item));
+                    }
+                },
+                PropertiesIter::AllOf(iter) => match iter.next() {
+                    None => self.pop_iter(),
+                    Some(schema) => self.push_iter(schema),
+                },
+                PropertiesIter::OneOf(iter) => match iter {
+                    PropertiesIterOneOf::TypeProperty(item, list) => {
+                        let item = **item;
+                        *iter = PropertiesIterOneOf::Variants(
+                            self.conditions.enter_condition(item.0, list),
+                        );
+                        return Some(self.make_item(item));
+                    }
+                    PropertiesIterOneOf::Variants(iter) => match iter.next() {
+                        None => self.pop_iter(),
+                        Some((variant, schema)) => {
+                            self.conditions.update_condition(variant);
+                            self.push_iter(schema);
+                        }
+                    },
+                },
+            };
+        }
+    }
+}
+
+/// An iterator over all properties of a specific name in an object-like schema.
+///
+/// The yielded items include the canonical name, in case an alias was looked up.
+/// This means that it is possible to see multiple different names if oneOf variants contain
+/// objects with aliases.
+///
+/// Like in an [`AllProperties`] iterator, each item has a set of conditions attached to it.
+pub struct LookupAll<'a> {
+    name: &'a str,
+    iter: Vec<LookupIter>,
+    conditions: PropertyConditions<'static>,
+}
+
+impl<'a> LookupAll<'a> {
+    fn new(name: &'a str) -> Self {
+        Self {
+            name,
+            iter: Vec::new(),
+            conditions: Default::default(),
+        }
+    }
+
+    fn push_iter(&mut self, schema: &'static Schema) {
+        match schema {
+            Schema::Object(schema) => self.push_object(schema),
+            Schema::AllOf(schema) => self.push_all_of(schema),
+            Schema::OneOf(schema) => self.push_one_of(schema),
+            _ => panic!("non-object-schema in object lookup-all iteration"),
+        }
+    }
+
+    fn push_object(&mut self, schema: &ObjectSchema) {
+        if let Some(entry) = schema.lookup_with_canonical_name(self.name) {
+            self.iter.push(LookupIter::Object(entry));
+        }
+    }
+
+    fn push_all_of(&mut self, schema: &AllOfSchema) {
+        self.iter.push(LookupIter::AllOf(schema.list.iter()));
+    }
+
+    fn push_one_of(&mut self, schema: &OneOfSchema) {
+        self.iter
+            .push(LookupIter::OneOf(PropertiesIterOneOf::TypeProperty(
+                schema.type_property_entry,
+                schema.list,
+            )));
+    }
+
+    fn pop_iter(&mut self) {
+        if matches!(self.iter.pop(), Some(LookupIter::OneOf(_))) {
+            self.conditions.pop();
+        }
+    }
+
+    fn make_item(&self, entry: SchemaPropertyEntry) -> LookupAllItem {
+        LookupAllItem {
+            inner: AllPropertiesItem {
+                entry,
+                conditions: self.conditions.get(),
+            },
+        }
+    }
+}
+
+/// An entry from a [`LookupAll`] iterator.
+///
+/// Note that each item may have associated conditions with it, in case it was reached through
+/// [`OneOfSchema`] entries.
+#[derive(Clone, Debug)]
+pub struct LookupAllItem {
+    // reuse AllPropertiesItem - it is currently identical.
+    inner: AllPropertiesItem,
+}
+
+impl LookupAllItem {
+    /// The item's canonical name in the object schema.
+    pub const fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+
+    /// Whether the item is optional in the schema.
+    pub const fn optional(&self) -> bool {
+        self.inner.optional()
+    }
+
+    /// The item's schema.
+    pub const fn schema(&self) -> &'static Schema {
+        self.inner.schema()
+    }
+
+    /// The conditions under which this item exists.
+    ///
+    /// This is a set of key-value pairs. The keys are type properties of [`OneOfSchema`]s, and the
+    /// values are its variant names.
+    pub fn conditions(&self) -> &[(&'static str, &'static str)] {
+        self.inner.conditions()
+    }
+}
+
+enum LookupIter {
+    Object(&'static SchemaPropertyEntry),
+    AllOf(std::slice::Iter<'static, &'static Schema>),
+    OneOf(PropertiesIterOneOf),
+}
+
+impl Iterator for LookupAll<'_> {
+    type Item = LookupAllItem;
+
+    fn next(&mut self) -> Option<LookupAllItem> {
+        loop {
+            match self.iter.last_mut()? {
+                LookupIter::Object(entry) => {
+                    let entry = **entry;
+                    self.pop_iter();
+                    return Some(self.make_item(entry));
+                }
+                LookupIter::AllOf(iter) => match iter.next() {
+                    Some(schema) => self.push_iter(schema),
+                    None => self.pop_iter(),
+                },
+                LookupIter::OneOf(iter) => match iter {
+                    PropertiesIterOneOf::TypeProperty(item, list) => {
+                        let item = **item;
+                        *iter = PropertiesIterOneOf::Variants(
+                            self.conditions.enter_condition(item.0, list),
+                        );
+                        if self.name == item.0 {
+                            // If we requested the type property, we're done with this oneOf
+                            // schema, as it is illegal for it to contain the type property again
+                            // within itself.
+                            self.pop_iter();
+                            return Some(self.make_item(item));
+                        }
+                    }
+                    PropertiesIterOneOf::Variants(iter) => match iter.next() {
+                        None => self.pop_iter(),
+                        Some((variant, schema)) => {
+                            self.conditions.update_condition(variant);
+                            self.push_iter(schema);
+                        }
+                    },
+                },
+            }
         }
     }
 }
@@ -878,8 +2139,18 @@ impl ObjectSchemaType for ObjectSchema {
         self.description
     }
 
-    fn lookup(&self, key: &str) -> Option<(bool, &Schema)> {
+    fn lookup(&self, key: &str) -> Option<(bool, &'static Schema)> {
         ObjectSchema::lookup(self, key)
+    }
+
+    fn lookup_schema(&self, key: &str, _: &dyn WithTypeField) -> Option<(bool, &'static Schema)> {
+        ObjectSchema::lookup(self, key)
+    }
+
+    fn lookup_all<'k>(&self, key: &'k str) -> LookupAll<'k> {
+        let mut lookup = LookupAll::new(key);
+        lookup.push_object(self);
+        lookup
     }
 
     fn properties(&self) -> ObjectPropertyIterator {
@@ -890,12 +2161,47 @@ impl ObjectSchemaType for ObjectSchema {
         })
     }
 
+    fn all_properties(&self) -> AllProperties<'static> {
+        let mut properties = AllProperties::new_empty();
+        properties.push_object(self);
+        properties
+    }
+
     fn additional_properties(&self) -> bool {
         self.additional_properties
     }
 
     fn default_key(&self) -> Option<&'static str> {
         self.default_key
+    }
+
+    fn lookup_alias(&self, key: &str) -> Option<&'static str> {
+        ObjectSchema::lookup_alias(self, key)
+    }
+
+    /// Works directly from the static [`property_aliases`](ObjectSchema::property_aliases) list
+    /// so schemas without aliases (the common case) skip the map walk entirely.
+    fn canonicalize_aliases(&self, value: &mut Value) -> Result<(), Error> {
+        if self.property_aliases.is_empty() {
+            return Ok(());
+        }
+        let Some(map) = value.as_object_mut() else {
+            return Ok(());
+        };
+        let aliases: Vec<(&str, &'static str)> = self
+            .property_aliases
+            .iter()
+            .filter(|&&(alias, _canonical)| map.contains_key(alias))
+            .map(|&(alias, canonical)| (alias, canonical))
+            .collect();
+        if aliases.is_empty() {
+            return Ok(());
+        }
+        rename_aliases_to_canonicals(map, &aliases)
+    }
+
+    fn key_alias_info(&self) -> Option<KeyAliasInfo> {
+        self.key_alias_info
     }
 }
 
@@ -904,8 +2210,23 @@ impl ObjectSchemaType for AllOfSchema {
         self.description
     }
 
-    fn lookup(&self, key: &str) -> Option<(bool, &Schema)> {
+    fn lookup(&self, key: &str) -> Option<(bool, &'static Schema)> {
+        #[allow(deprecated)]
         AllOfSchema::lookup(self, key)
+    }
+
+    fn lookup_schema(
+        &self,
+        key: &str,
+        get_type: &dyn WithTypeField,
+    ) -> Option<(bool, &'static Schema)> {
+        AllOfSchema::lookup_schema(self, key, get_type)
+    }
+
+    fn lookup_all<'k>(&self, key: &'k str) -> LookupAll<'k> {
+        let mut lookup = LookupAll::new(key);
+        lookup.push_all_of(self);
+        lookup
     }
 
     fn properties(&self) -> ObjectPropertyIterator {
@@ -914,6 +2235,26 @@ impl ObjectSchemaType for AllOfSchema {
             properties: None,
             nested: None,
         })
+    }
+
+    fn all_properties(&self) -> AllProperties<'static> {
+        let mut properties = AllProperties::new_empty();
+        properties.push_all_of(self);
+        properties
+    }
+
+    fn verify_type_fields(&self, data: &dyn WithTypeField) -> Result<(), ParameterError> {
+        let mut errors = ParameterError::new();
+        for schema in self.list {
+            if let Err(err) = schema.unwrap_any_object_schema().verify_type_fields(data) {
+                errors.extend(err);
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
     }
 
     fn additional_properties(&self) -> bool {
@@ -939,6 +2280,31 @@ impl ObjectSchemaType for AllOfSchema {
 
         None
     }
+
+    /// Iterates branches left-to-right and returns the first match (`find_map`). Branches that
+    /// declare conflicting alias targets for the same alias name are not detected here; in
+    /// practice this is unlikely to come up, since AllOf branches are usually disjoint by
+    /// design.
+    fn lookup_alias(&self, key: &str) -> Option<&'static str> {
+        self.list.iter().find_map(|schema| {
+            schema
+                .any_object()
+                .expect("non-object-schema in `AllOfSchema`")
+                .lookup_alias(key)
+        })
+    }
+
+    /// Forwards to each sub-schema so the specialized per-schema-kind logic runs (e.g. an
+    /// inner [`ObjectSchema`] uses its sidecar and skips schemas without aliases).
+    fn canonicalize_aliases(&self, value: &mut Value) -> Result<(), Error> {
+        for schema in self.list {
+            schema
+                .any_object()
+                .expect("non-object-schema in `AllOfSchema`")
+                .canonicalize_aliases(value)?;
+        }
+        Ok(())
+    }
 }
 
 #[doc(hidden)]
@@ -951,6 +2317,7 @@ pub struct SimpleObjectPropertyIterator {
 impl Iterator for SimpleObjectPropertyIterator {
     type Item = &'static SchemaPropertyEntry;
 
+    #[allow(deprecated)]
     fn next(&mut self) -> Option<&'static SchemaPropertyEntry> {
         loop {
             match self.nested.as_mut().and_then(Iterator::next) {
@@ -979,8 +2346,23 @@ impl ObjectSchemaType for OneOfSchema {
         self.description
     }
 
-    fn lookup(&self, key: &str) -> Option<(bool, &Schema)> {
+    fn lookup(&self, key: &str) -> Option<(bool, &'static Schema)> {
+        #[allow(deprecated)]
         OneOfSchema::lookup(self, key)
+    }
+
+    fn lookup_schema(
+        &self,
+        key: &str,
+        get_type: &dyn WithTypeField,
+    ) -> Option<(bool, &'static Schema)> {
+        OneOfSchema::lookup_schema(self, key, get_type)
+    }
+
+    fn lookup_all<'k>(&self, key: &'k str) -> LookupAll<'k> {
+        let mut lookup = LookupAll::new(key);
+        lookup.push_one_of(self);
+        lookup
     }
 
     fn properties(&self) -> ObjectPropertyIterator {
@@ -990,6 +2372,31 @@ impl ObjectSchemaType for OneOfSchema {
             done: HashSet::new(),
             nested: None,
         })
+    }
+
+    fn all_properties(&self) -> AllProperties<'static> {
+        let mut properties = AllProperties::new_empty();
+        properties.push_one_of(self);
+        properties
+    }
+
+    fn verify_type_fields(&self, data: &dyn WithTypeField) -> Result<(), ParameterError> {
+        let mut result = Ok(());
+        data.with_type_field(self.type_property(), &mut |variant| {
+            let Some(variant) = variant else { return };
+            result = match self.lookup_variant(variant) {
+                Some(schema) => schema.unwrap_any_object_schema().verify_type_fields(data),
+                None => {
+                    let mut errors = ParameterError::new();
+                    errors.push(
+                        self.type_property().to_string(),
+                        format_err!("invalid variant {variant:?}"),
+                    );
+                    Err(errors)
+                }
+            };
+        });
+        result
     }
 
     fn additional_properties(&self) -> bool {
@@ -1002,12 +2409,40 @@ impl ObjectSchemaType for OneOfSchema {
     }
 
     fn default_key(&self) -> Option<&'static str> {
+        // They could be different across variants, so better don't return a default key at all.
         None
+    }
+
+    fn lookup_alias(&self, key: &str) -> Option<&'static str> {
+        self.list.iter().find_map(|(_, schema)| match schema {
+            Schema::String(_) => None,
+            _ => schema
+                .any_object()
+                .expect("non-object-schema in `OneOfSchema`")
+                .lookup_alias(key),
+        })
+    }
+
+    /// Forwards to each sub-schema so the specialized per-schema-kind logic runs (e.g. an
+    /// inner [`ObjectSchema`] uses its sidecar and skips schemas without aliases).
+    fn canonicalize_aliases(&self, value: &mut Value) -> Result<(), Error> {
+        for (_, schema) in self.list {
+            // a oneOf may carry a single plain-string variant; it has no properties to
+            // canonicalize, so skip it like `lookup_alias` and `additional_properties` do.
+            match schema {
+                Schema::String(_) => continue,
+                _ => schema
+                    .any_object()
+                    .expect("non-object-schema in `OneOfSchema`")
+                    .canonicalize_aliases(value)?,
+            }
+        }
+        Ok(())
     }
 
     fn verify_json(&self, data: &Value) -> Result<(), Error> {
         let map = match data {
-            Value::Object(ref map) => map,
+            Value::Object(map) => map,
             Value::Array(_) => bail!("Expected object - got array."),
             _ => bail!("Expected object - got scalar value."),
         };
@@ -1038,6 +2473,7 @@ pub struct OneOfPropertyIterator {
 impl Iterator for OneOfPropertyIterator {
     type Item = &'static SchemaPropertyEntry;
 
+    #[allow(deprecated)]
     fn next(&mut self) -> Option<&'static SchemaPropertyEntry> {
         if self.done.insert(self.type_property_entry.0) {
             return Some(self.type_property_entry);
@@ -1076,7 +2512,7 @@ impl Iterator for OneOfPropertyIterator {
 ///
 /// const SIMPLE_OBJECT: Schema = ObjectSchema::new(
 ///     "A very simple object with 2 properties",
-///     &[ // this arrays needs to be storted by name!
+///     &[ // this arrays needs to be sorted by name!
 ///         (
 ///             "property_one",
 ///             false /* required */,
@@ -1141,7 +2577,7 @@ impl Schema {
                 Value::Bool(res)
             }
             Schema::Integer(integer_schema) => {
-                let res: isize = value_str.parse()?;
+                let res: i64 = value_str.parse()?;
                 integer_schema.check_constraints(res)?;
                 Value::Number(res.into())
             }
@@ -1176,7 +2612,9 @@ impl Schema {
                         if let Some(key) = default_key {
                             param_list.push((key.to_string(), value.into_owned()));
                         } else {
-                            bail!("Value without key, but schema does not define a default key.");
+                            bail!(
+                                "Value '{value}' without key, but schema does not define a default key."
+                            );
                         }
                     }
                 }
@@ -1278,6 +2716,17 @@ impl Schema {
         }
     }
 
+    /// Gets the underlying schema as a [`dyn ObjectSchemaType`], panics on schema types other than
+    /// `Object`, `AllOf` or `OneOf`.
+    pub const fn unwrap_any_object_schema(&self) -> &dyn ObjectSchemaType {
+        match self {
+            Schema::Object(s) => s,
+            Schema::AllOf(s) => s,
+            Schema::OneOf(s) => s,
+            _ => panic!("unwrap_any_object_schema on non-object schema"),
+        }
+    }
+
     /// Gets the underlying [`BooleanSchema`].
     pub const fn boolean(&self) -> Option<&BooleanSchema> {
         match self {
@@ -1342,12 +2791,89 @@ impl Schema {
         }
     }
 
-    pub fn any_object(&self) -> Option<&dyn ObjectSchemaType> {
+    /// Gets the underlying schema as a [`dyn ObjectSchemaType`].
+    pub const fn any_object(&self) -> Option<&dyn ObjectSchemaType> {
         match self {
             Schema::Object(s) => Some(s),
             Schema::AllOf(s) => Some(s),
             Schema::OneOf(s) => Some(s),
             _ => None,
+        }
+    }
+
+    /// Gets a copy of the underlying [`BooleanSchema`], panics on different schemas.
+    pub const fn unwrap_boolean_schema_cloned(&self) -> BooleanSchema {
+        match self {
+            Schema::Boolean(s) => BooleanSchema { ..*s },
+            _ => panic!("unwrap_boolean_schema_cloned on different schema"),
+        }
+    }
+
+    /// Gets a copy of the underlying [`IntegerSchema`], panics on different schemas.
+    pub const fn unwrap_integer_schema_cloned(&self) -> IntegerSchema {
+        match self {
+            Schema::Integer(s) => IntegerSchema { ..*s },
+            _ => panic!("unwrap_integer_schema_cloned on different schema"),
+        }
+    }
+
+    /// Gets a copy of the underlying [`NumberSchema`], panics on different schemas.
+    pub const fn unwrap_number_schema_cloned(&self) -> NumberSchema {
+        match self {
+            Schema::Number(s) => NumberSchema { ..*s },
+            _ => panic!("unwrap_number_schema_cloned on different schema"),
+        }
+    }
+
+    /// Gets the underlying [`StringSchema`], panics on different schemas.
+    pub const fn unwrap_string_schema_cloned(&self) -> StringSchema {
+        match self {
+            Schema::String(s) => StringSchema { ..*s },
+            _ => panic!("unwrap_string_schema_cloned on different schema"),
+        }
+    }
+
+    /// Gets the underlying [`ObjectSchema`], panics on different schemas.
+    pub const fn unwrap_object_schema_cloned(&self) -> ObjectSchema {
+        match self {
+            Schema::Object(s) => ObjectSchema { ..*s },
+            _ => panic!("unwrap_object_schema_cloned on different schema"),
+        }
+    }
+
+    /// Gets the underlying [`ArraySchema`], panics on different schemas.
+    pub const fn unwrap_array_schema_cloned(&self) -> ArraySchema {
+        match self {
+            Schema::Array(s) => ArraySchema { ..*s },
+            _ => panic!("unwrap_array_schema_cloned on different schema"),
+        }
+    }
+
+    /// Gets the underlying [`AllOfSchema`], panics on different schemas.
+    pub const fn unwrap_all_of_schema_cloned(&self) -> AllOfSchema {
+        match self {
+            Schema::AllOf(s) => AllOfSchema { ..*s },
+            _ => panic!("unwrap_all_of_schema_cloned on different schema"),
+        }
+    }
+
+    /// Gets the underlying [`OneOfSchema`], panics on different schemas.
+    pub const fn unwrap_one_of_schema_cloned(&self) -> OneOfSchema {
+        match self {
+            Schema::OneOf(s) => OneOfSchema { ..*s },
+            _ => panic!("unwrap_one_of_schema_cloned on different schema"),
+        }
+    }
+
+    /// Check whether the schema contains a specific parameter.
+    /// This is meant for compile time checks and not as public API.
+    #[doc(hidden)]
+    pub const fn const_has_parameter(&self, name: &[u8], additional_properties: bool) -> bool {
+        match self {
+            Schema::Object(object) => object.const_has_parameter(name, additional_properties),
+            Schema::AllOf(all_of) => all_of.const_has_parameter(name, additional_properties),
+            Schema::OneOf(one_of) => one_of.const_has_parameter(name, additional_properties),
+            _ => false,
         }
     }
 }
@@ -1403,7 +2929,7 @@ impl EnumEntry {
 /// Use a schema to describe complex types encoded as string.
 ///
 /// Arrays are parsed as comma separated lists, i.e: `"1,2,3"`. The
-/// list may be sparated by comma, semicolon or whitespace.
+/// list may be separated by comma, semicolon or whitespace.
 ///
 /// Objects are parsed as comma (or semicolon) separated `key=value` pairs, i.e:
 /// `"prop1=2,prop2=test"`. Any whitespace is trimmed from key and value.
@@ -1416,7 +2942,6 @@ impl EnumEntry {
 ///
 /// ```
 /// use proxmox_schema::{ApiStringFormat, ArraySchema, IntegerSchema, Schema, StringSchema};
-/// use proxmox_schema::{parse_simple_value, parse_property_string};
 ///
 /// const PRODUCT_LIST_SCHEMA: Schema =
 ///             ArraySchema::new("Product List.", &IntegerSchema::new("Product ID").schema())
@@ -1427,13 +2952,13 @@ impl EnumEntry {
 ///     .format(&ApiStringFormat::PropertyString(&PRODUCT_LIST_SCHEMA))
 ///     .schema();
 ///
-/// let res = parse_simple_value("", &SCHEMA);
+/// let res = SCHEMA.parse_simple_value("");
 /// assert!(res.is_err());
 ///
-/// let res = parse_simple_value("1,2,3", &SCHEMA); // parse as String
+/// let res = SCHEMA.parse_simple_value("1,2,3"); // parse as String
 /// assert!(res.is_ok());
 ///
-/// let data = parse_property_string("1,2", &PRODUCT_LIST_SCHEMA); // parse as Array
+/// let data = PRODUCT_LIST_SCHEMA.parse_property_string("1,2"); // parse as Array
 /// assert!(data.is_ok());
 /// ```
 pub enum ApiStringFormat {
@@ -1479,10 +3004,10 @@ impl ApiStringFormat {
 impl std::fmt::Debug for ApiStringFormat {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            ApiStringFormat::VerifyFn(fnptr) => write!(f, "VerifyFn({:p}", fnptr),
-            ApiStringFormat::Enum(variants) => write!(f, "Enum({:?}", variants),
-            ApiStringFormat::Pattern(regex) => write!(f, "Pattern({:?}", regex),
-            ApiStringFormat::PropertyString(schema) => write!(f, "PropertyString({:?}", schema),
+            ApiStringFormat::VerifyFn(fnptr) => write!(f, "VerifyFn({fnptr:p}"),
+            ApiStringFormat::Enum(variants) => write!(f, "Enum({variants:?}"),
+            ApiStringFormat::Pattern(regex) => write!(f, "Pattern({regex:?}"),
+            ApiStringFormat::PropertyString(schema) => write!(f, "PropertyString({schema:?}"),
         }
     }
 }
@@ -1525,6 +3050,17 @@ impl ParameterSchema {
     ) -> Result<Value, ParameterError> {
         do_parse_parameter_strings(self, data, test_required)
     }
+
+    /// Check whether the schema contains a specific parameter.
+    /// This is meant for compile time checks and not as public API.
+    #[doc(hidden)]
+    pub const fn const_has_parameter(&self, name: &[u8], additional_properties: bool) -> bool {
+        match self {
+            Self::Object(o) => o.const_has_parameter(name, additional_properties),
+            Self::AllOf(o) => o.const_has_parameter(name, additional_properties),
+            Self::OneOf(o) => o.const_has_parameter(name, additional_properties),
+        }
+    }
 }
 
 impl ObjectSchemaType for ParameterSchema {
@@ -1536,7 +3072,8 @@ impl ObjectSchemaType for ParameterSchema {
         }
     }
 
-    fn lookup(&self, key: &str) -> Option<(bool, &Schema)> {
+    fn lookup(&self, key: &str) -> Option<(bool, &'static Schema)> {
+        #[allow(deprecated)]
         match self {
             ParameterSchema::Object(o) => o.lookup(key),
             ParameterSchema::AllOf(o) => o.lookup(key),
@@ -1544,11 +3081,48 @@ impl ObjectSchemaType for ParameterSchema {
         }
     }
 
+    fn lookup_schema(
+        &self,
+        key: &str,
+        get_type: &dyn WithTypeField,
+    ) -> Option<(bool, &'static Schema)> {
+        match self {
+            ParameterSchema::Object(o) => o.lookup_schema(key, get_type),
+            ParameterSchema::AllOf(o) => o.lookup_schema(key, get_type),
+            ParameterSchema::OneOf(o) => o.lookup_schema(key, get_type),
+        }
+    }
+
+    fn lookup_all<'k>(&self, key: &'k str) -> LookupAll<'k> {
+        match self {
+            ParameterSchema::Object(o) => o.lookup_all(key),
+            ParameterSchema::AllOf(o) => o.lookup_all(key),
+            ParameterSchema::OneOf(o) => o.lookup_all(key),
+        }
+    }
+
     fn properties(&self) -> ObjectPropertyIterator {
+        #[allow(deprecated)]
         match self {
             ParameterSchema::Object(o) => o.properties(),
             ParameterSchema::AllOf(o) => o.properties(),
             ParameterSchema::OneOf(o) => o.properties(),
+        }
+    }
+
+    fn all_properties(&self) -> AllProperties<'static> {
+        match self {
+            ParameterSchema::Object(o) => o.all_properties(),
+            ParameterSchema::AllOf(o) => o.all_properties(),
+            ParameterSchema::OneOf(o) => o.all_properties(),
+        }
+    }
+
+    fn verify_type_fields(&self, data: &dyn WithTypeField) -> Result<(), ParameterError> {
+        match self {
+            ParameterSchema::Object(o) => o.verify_type_fields(data),
+            ParameterSchema::AllOf(o) => o.verify_type_fields(data),
+            ParameterSchema::OneOf(o) => o.verify_type_fields(data),
         }
     }
 
@@ -1565,6 +3139,24 @@ impl ObjectSchemaType for ParameterSchema {
             ParameterSchema::Object(o) => o.default_key(),
             ParameterSchema::AllOf(o) => o.default_key(),
             ParameterSchema::OneOf(o) => o.default_key(),
+        }
+    }
+
+    fn lookup_alias(&self, key: &str) -> Option<&'static str> {
+        match self {
+            ParameterSchema::Object(o) => o.lookup_alias(key),
+            ParameterSchema::AllOf(o) => o.lookup_alias(key),
+            ParameterSchema::OneOf(o) => o.lookup_alias(key),
+        }
+    }
+
+    /// Dispatches to the concrete variant so the specialized impl runs (ObjectSchema's
+    /// sidecar-driven fast path, AllOfSchema's per-branch forward, etc.).
+    fn canonicalize_aliases(&self, value: &mut Value) -> Result<(), Error> {
+        match self {
+            ParameterSchema::Object(o) => o.canonicalize_aliases(value),
+            ParameterSchema::AllOf(o) => o.canonicalize_aliases(value),
+            ParameterSchema::OneOf(o) => o.canonicalize_aliases(value),
         }
     }
 }
@@ -1599,31 +3191,6 @@ pub fn parse_boolean(value_str: &str) -> Result<bool, Error> {
     }
 }
 
-/// Parse a complex property string (`ApiStringFormat::PropertyString`)
-#[deprecated(note = "this is now a method of Schema")]
-pub fn parse_property_string(value_str: &str, schema: &'static Schema) -> Result<Value, Error> {
-    schema.parse_property_string(value_str)
-}
-
-/// Parse a simple value (no arrays and no objects)
-#[deprecated(note = "this is now a method of Schema")]
-pub fn parse_simple_value(value_str: &str, schema: &Schema) -> Result<Value, Error> {
-    schema.parse_simple_value(value_str)
-}
-
-/// Parse key/value pairs and verify with object schema
-///
-/// - `test_required`: is set, checks if all required properties are
-///   present.
-#[deprecated(note = "this is now a method of parameter schema types")]
-pub fn parse_parameter_strings<T: Into<ParameterSchema>>(
-    data: &[(String, String)],
-    schema: T,
-    test_required: bool,
-) -> Result<Value, ParameterError> {
-    do_parse_parameter_strings(schema.into(), data, test_required)
-}
-
 fn do_parse_parameter_strings(
     schema: ParameterSchema,
     data: &[(String, String)],
@@ -1635,8 +3202,38 @@ fn do_parse_parameter_strings(
 
     let additional_properties = schema.additional_properties();
 
-    for (key, value) in data {
-        if let Some((_optional, prop_schema)) = schema.lookup(key) {
+    // Track the first raw key that wrote to each canonical key. Used to detect mixing of an
+    // alias and its canonical (or two different aliases) regardless of scalar vs. array.
+    let mut first_raw = HashMap::<String, String>::new();
+
+    // To provide type lookups for oneOf schemas:
+    let data_map = data
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect::<HashMap<&str, &str>>();
+
+    for (raw_key, value) in data {
+        let (key, alias_from): (&str, Option<&str>) = match schema.lookup_alias(raw_key) {
+            Some(canonical) => (canonical, Some(raw_key.as_str())),
+            None => (raw_key.as_str(), None),
+        };
+        // Reject mixing an alias with its canonical (or two distinct aliases of the same
+        // canonical) before any mutation. The same raw_key appearing again is *not* a mix
+        // and falls through to the per-arm logic below (legitimate for arrays, rejected as
+        // `duplicate parameter` for scalars).
+        if let Some(prev_raw) = first_raw.get(key) {
+            if prev_raw != raw_key.as_str() {
+                let other = alias_from.unwrap_or(prev_raw.as_str());
+                errors.push(
+                    raw_key.into(),
+                    format_err!("cannot set both `{key}` and `{other}`."),
+                );
+                continue;
+            }
+        } else {
+            first_raw.insert(key.to_string(), raw_key.clone());
+        }
+        if let Some((_optional, prop_schema)) = schema.lookup_schema(key, &data_map) {
             match prop_schema {
                 Schema::Array(array_schema) => {
                     if params[key] == Value::Null {
@@ -1646,12 +3243,13 @@ fn do_parse_parameter_strings(
                         Value::Array(ref mut array) => {
                             match array_schema.items.parse_simple_value(value) {
                                 Ok(res) => array.push(res), // fixme: check_length??
-                                Err(err) => errors.push(key.into(), err),
+                                Err(err) => errors.push(raw_key.into(), err),
                             }
                         }
-                        _ => {
-                            errors.push(key.into(), format_err!("expected array - type missmatch"))
-                        }
+                        _ => errors.push(
+                            raw_key.into(),
+                            format_err!("expected array - type mismatch"),
+                        ),
                     }
                 }
                 _ => match prop_schema.parse_simple_value(value) {
@@ -1659,10 +3257,10 @@ fn do_parse_parameter_strings(
                         if params[key] == Value::Null {
                             params[key] = res;
                         } else {
-                            errors.push(key.into(), format_err!("duplicate parameter."));
+                            errors.push(raw_key.into(), format_err!("duplicate parameter."));
                         }
                     }
-                    Err(err) => errors.push(key.into(), err),
+                    Err(err) => errors.push(raw_key.into(), err),
                 },
             }
         } else if additional_properties {
@@ -1679,7 +3277,7 @@ fn do_parse_parameter_strings(
                 Value::Array(ref mut array) => {
                     array.push(Value::String(value.to_string()));
                 }
-                _ => errors.push(key.into(), format_err!("expected array - type missmatch")),
+                _ => errors.push(key.into(), format_err!("expected array - type mismatch")),
             }
         } else {
             errors.push(
@@ -1690,14 +3288,20 @@ fn do_parse_parameter_strings(
     }
 
     if test_required && errors.is_empty() {
-        for (name, optional, _prop_schema) in schema.properties() {
-            if !(*optional) && params[name] == Value::Null {
-                errors.push(
-                    name.to_string(),
-                    format_err!("parameter is missing and it is not optional."),
-                );
+        for property in schema.all_properties().with_types_from(&data_map) {
+            let name = property.name();
+            if property.optional() || params[name] != Value::Null {
+                continue;
             }
+            errors.push(
+                name.to_string(),
+                format_err!("parameter is missing and it is not optional."),
+            );
         }
+    }
+
+    if let Err(type_errors) = schema.verify_type_fields(&data_map) {
+        errors.extend_unreported(type_errors);
     }
 
     if !errors.is_empty() {
@@ -1705,48 +3309,6 @@ fn do_parse_parameter_strings(
     } else {
         Ok(params)
     }
-}
-
-/// Verify JSON value with `schema`.
-#[deprecated(note = "use the method schema.verify_json() instead")]
-pub fn verify_json(data: &Value, schema: &Schema) -> Result<(), Error> {
-    schema.verify_json(data)
-}
-
-/// Verify JSON value using a `StringSchema`.
-#[deprecated(note = "use the method string_schema.verify_json() instead")]
-pub fn verify_json_string(data: &Value, schema: &StringSchema) -> Result<(), Error> {
-    schema.verify_json(data)
-}
-
-/// Verify JSON value using a `BooleanSchema`.
-#[deprecated(note = "use the method boolean_schema.verify_json() instead")]
-pub fn verify_json_boolean(data: &Value, schema: &BooleanSchema) -> Result<(), Error> {
-    schema.verify_json(data)
-}
-
-/// Verify JSON value using an `IntegerSchema`.
-#[deprecated(note = "use the method integer_schema.verify_json() instead")]
-pub fn verify_json_integer(data: &Value, schema: &IntegerSchema) -> Result<(), Error> {
-    schema.verify_json(data)
-}
-
-/// Verify JSON value using an `NumberSchema`.
-#[deprecated(note = "use the method number_schema.verify_json() instead")]
-pub fn verify_json_number(data: &Value, schema: &NumberSchema) -> Result<(), Error> {
-    schema.verify_json(data)
-}
-
-/// Verify JSON value using an `ArraySchema`.
-#[deprecated(note = "use the method array_schema.verify_json() instead")]
-pub fn verify_json_array(data: &Value, schema: &ArraySchema) -> Result<(), Error> {
-    schema.verify_json(data)
-}
-
-/// Verify JSON value using an `ObjectSchema`.
-#[deprecated(note = "use the verify_json() method via the ObjectSchemaType trait instead")]
-pub fn verify_json_object(data: &Value, schema: &dyn ObjectSchemaType) -> Result<(), Error> {
-    schema.verify_json(data)
 }
 
 /// API types should define an "updater type" via this trait in order to support derived "Updater"
@@ -1786,6 +3348,18 @@ where
 
 // this will replace the whole Vec
 impl<T> UpdaterType for Vec<T> {
+    type Updater = Option<Self>;
+}
+
+impl<T> UpdaterType for crate::property_string::PropertyString<T> {
+    type Updater = Option<Self>;
+}
+
+impl<K, V> UpdaterType for HashMap<K, V> {
+    type Updater = Option<Self>;
+}
+
+impl<K, V> UpdaterType for BTreeMap<K, V> {
     type Updater = Option<Self>;
 }
 

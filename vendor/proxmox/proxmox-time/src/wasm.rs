@@ -1,4 +1,4 @@
-use anyhow::{bail, format_err, Error};
+use anyhow::{Error, bail, format_err};
 
 /// Returns Unix Epoch (now)
 pub fn epoch_i64() -> i64 {
@@ -58,7 +58,7 @@ pub fn epoch_to_rfc3339(epoch: i64) -> Result<String, Error> {
 
 /// Parse RFC3339 into Unix epoch
 pub fn parse_rfc3339(input_str: &str) -> Result<i64, Error> {
-    // TOTO: This should parse olny RFC3339, but currently also parse
+    // TODO: This should parse only RFC3339, but currently also parses
     // other formats
     let time_milli = js_sys::Date::parse(input_str);
     if time_milli.is_nan() {

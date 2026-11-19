@@ -3,7 +3,7 @@ use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use anyhow::{format_err, Error};
+use anyhow::{Error, format_err};
 use bytes::Bytes;
 use futures::ready;
 use futures::stream::Stream;
@@ -32,7 +32,7 @@ pub struct ZstdEncoder<'a, T> {
     state: EncoderState,
 }
 
-impl<'a, T, O, E> ZstdEncoder<'a, T>
+impl<T, O, E> ZstdEncoder<'_, T>
 where
     T: Stream<Item = Result<O, E>> + Unpin,
     O: Into<Bytes>,
@@ -55,7 +55,7 @@ where
     }
 }
 
-impl<'a, T> ZstdEncoder<'a, T> {
+impl<T> ZstdEncoder<'_, T> {
     /// Returns the wrapped [Stream]
     pub fn into_inner(self) -> T {
         self.inner
@@ -80,7 +80,7 @@ impl<'a, T> ZstdEncoder<'a, T> {
     }
 }
 
-impl<'a, T, O, E> Stream for ZstdEncoder<'a, T>
+impl<T, O, E> Stream for ZstdEncoder<'_, T>
 where
     T: Stream<Item = Result<O, E>> + Unpin,
     O: Into<Bytes>,

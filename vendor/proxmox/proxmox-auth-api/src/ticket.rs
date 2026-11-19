@@ -1,11 +1,12 @@
 //! Generate and verify Authentication tickets
 
 use std::borrow::Cow;
+use std::fmt;
 use std::marker::PhantomData;
 
-use anyhow::{bail, format_err, Error};
+use anyhow::{Error, bail, format_err};
 use openssl::hash::MessageDigest;
-use percent_encoding::{percent_decode_str, percent_encode, AsciiSet};
+use percent_encoding::{AsciiSet, percent_decode_str, percent_encode};
 
 use crate::auth_key::Keyring;
 
@@ -14,13 +15,13 @@ use crate::TICKET_LIFETIME;
 /// Stringified ticket data must not contain colons...
 const TICKET_ASCIISET: &AsciiSet = &percent_encoding::CONTROLS.add(b':');
 
-/// An empty type implementing [`ToString`] and [`FromStr`](std::str::FromStr), used for tickets
-/// with no data.
+/// An empty type implementing [`Display`](fmt::Display) and [`FromStr`](std::str::FromStr), used
+/// for tickets with no data.
 pub struct Empty;
 
-impl ToString for Empty {
-    fn to_string(&self) -> String {
-        String::new()
+impl fmt::Display for Empty {
+    fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Ok(())
     }
 }
 
@@ -36,7 +37,7 @@ impl std::str::FromStr for Empty {
 }
 
 /// An API ticket consists of a ticket type (prefix), type-dependent data, optional additional
-/// authenticaztion data, a timestamp and a signature. We store these values in the form
+/// authentication data, a timestamp and a signature. We store these values in the form
 /// `<prefix>:<stringified data>:<timestamp>::<signature>`.
 ///
 /// The signature is made over the string consisting of prefix, data, timestamp and aad joined
@@ -124,7 +125,7 @@ where
         write!(
             &mut output,
             "::{}",
-            base64::encode_config(&signature, base64::STANDARD_NO_PAD),
+            proxmox_base64::encode_no_pad(&signature),
         )?;
 
         self.signature = Some(signature);
@@ -160,7 +161,7 @@ where
 
         let is_valid = keyring.verify(
             MessageDigest::sha256(),
-            &signature,
+            signature,
             &self.verification_data(aad),
         )?;
 
@@ -216,7 +217,7 @@ where
         if !remainder.starts_with(':') {
             bail!("ticket without signature separator");
         }
-        let signature = base64::decode_config(&remainder[1..], base64::STANDARD_NO_PAD)
+        let signature = proxmox_base64::decode_no_pad(&remainder[1..])
             .map_err(|err| format_err!("ticket with bad signature: {}", err))?;
 
         Ok(Self {
@@ -226,6 +227,11 @@ where
             signature: Some(signature),
             _type_marker: PhantomData,
         })
+    }
+
+    pub fn ticket_info(&self) -> String {
+        // append a `::ticketinfo` signature to distinguish the ticket info from proper tickets
+        format!("{}::ticketinfo", self.ticket_data())
     }
 }
 

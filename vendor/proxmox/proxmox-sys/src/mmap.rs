@@ -3,18 +3,18 @@
 use std::convert::TryFrom;
 use std::mem::MaybeUninit;
 use std::num::NonZeroUsize;
-use std::os::unix::io::RawFd;
+use std::os::fd::AsFd;
+use std::ptr::NonNull;
 use std::{io, mem};
 
-use anyhow::format_err;
 use nix::sys::mman;
 
-use proxmox_lang::error::io_err_other;
+use proxmox_lang::io_format_err;
 
 use crate::error::SysError;
 
 pub struct Mmap<T> {
-    data: *mut T,
+    data: NonNull<T>,
     len: usize,
     /// Bytes mapped in front of `data` to page align the offset passed to mmap(2).
     align_offset: usize,
@@ -29,8 +29,8 @@ impl<T> Mmap<T> {
     /// # Safety
     ///
     /// `fd` must refer to a valid file descriptor.
-    pub unsafe fn map_fd(
-        fd: RawFd,
+    pub unsafe fn map_fd<F: AsFd>(
+        fd: F,
         ofs: u64,
         count: usize,
         prot: mman::ProtFlags,
@@ -38,7 +38,7 @@ impl<T> Mmap<T> {
     ) -> io::Result<Self> {
         let byte_len = count * mem::size_of::<T>();
         if byte_len == 0 {
-            return Err(io_err_other(format_err!("mapped length must not be zero")));
+            return Err(io_format_err!("mapped length must not be zero"));
         }
 
         // mmap(2) requires the offset to be a multiple of the page size, which is not the case
@@ -49,21 +49,35 @@ impl<T> Mmap<T> {
 
         // libc::size_t vs usize
         #[allow(clippy::useless_conversion)]
-        let data = mman::mmap(
-            None,
-            map_len,
-            prot,
-            flags,
-            fd,
-            libc::off_t::try_from(ofs - align_offset as u64).map_err(io_err_other)?,
-        )
+        let data = unsafe {
+            mman::mmap(
+                None,
+                map_len,
+                prot,
+                flags,
+                fd,
+                libc::off_t::try_from(ofs - align_offset as u64).map_err(io::Error::other)?,
+            )
+        }
         .map_err(SysError::into_io_error)?;
 
         Ok(Self {
-            data: (data as *mut u8).add(align_offset) as *mut T,
+            data: unsafe { data.byte_add(align_offset) }.cast::<T>(),
             len: count,
             align_offset,
         })
+    }
+
+    /// Flush all in-memory contents to the backing file.
+    pub fn msync(&self, flags: mman::MsFlags) -> io::Result<()> {
+        unsafe {
+            mman::msync(
+                self.data.cast::<core::ffi::c_void>(),
+                self.len * mem::size_of::<T>(),
+                flags,
+            )
+        }
+        .map_err(SysError::into_io_error)
     }
 }
 
@@ -79,14 +93,14 @@ impl<T> std::ops::Deref for Mmap<T> {
 
     #[inline]
     fn deref(&self) -> &[T] {
-        unsafe { std::slice::from_raw_parts(self.data, self.len) }
+        unsafe { NonNull::slice_from_raw_parts(self.data, self.len).as_ref() }
     }
 }
 
 impl<T> std::ops::DerefMut for Mmap<T> {
     #[inline]
     fn deref_mut(&mut self) -> &mut [T] {
-        unsafe { std::slice::from_raw_parts_mut(self.data, self.len) }
+        unsafe { NonNull::slice_from_raw_parts(self.data, self.len).as_mut() }
     }
 }
 
@@ -97,7 +111,9 @@ impl<T> Drop for Mmap<T> {
             // unmapping a smaller region inside a bigger one, causing it to become split into 2
             // regions. But then we have bigger problems already anyway, so we'll just ignore this.
             let _ = mman::munmap(
-                (self.data as *mut u8).sub(self.align_offset) as *mut libc::c_void,
+                self.data
+                    .byte_sub(self.align_offset)
+                    .cast::<core::ffi::c_void>(),
                 self.len * mem::size_of::<T>() + self.align_offset,
             );
         }
@@ -122,7 +138,7 @@ impl<T> Mmap<MaybeUninit<T>> {
     /// [`MaybeUninit::assume_init`](std::mem::MaybeUninit::assume_init).
     pub unsafe fn assume_init(self) -> Mmap<T> {
         let out = Mmap {
-            data: self.data as *mut T,
+            data: self.data.cast::<T>(),
             len: self.len,
             align_offset: self.align_offset,
         };

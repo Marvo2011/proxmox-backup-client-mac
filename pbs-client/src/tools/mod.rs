@@ -3,11 +3,14 @@ use std::collections::HashMap;
 use std::env::VarError::{NotPresent, NotUnicode};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::FromRawFd;
 use std::process::Command;
+use std::sync::OnceLock;
 
-use anyhow::{bail, format_err, Context, Error};
-use serde_json::{json, Value};
+use anyhow::{Context, Error, bail, format_err};
+use serde_json::{Value, json};
 use xdg::BaseDirectories;
 
 use proxmox_http::uri::json_object_to_query;
@@ -15,25 +18,69 @@ use proxmox_router::cli::{complete_file_name, shellword_split};
 use proxmox_schema::*;
 use proxmox_sys::fs::file_get_json;
 
-use pbs_api_types::{Authid, BackupNamespace, RateLimitConfig, UserWithTokens, BACKUP_REPO_URL};
+use pbs_api_types::{Authid, BackupArchiveName, BackupNamespace, RateLimitConfig, UserWithTokens};
+use pbs_datastore::BackupManifest;
 
-use crate::{BackupRepository, HttpClient, HttpClientOptions};
+use crate::{BackupRepository, BackupRepositoryArgs, HttpClient, HttpClientOptions};
+
+// Re-export for backward compatibility; the canonical definition is now in backup_repo alongside
+// BackupRepositoryArgs.
+pub use crate::REPO_URL_SCHEMA;
 
 pub mod key_source;
 
 const ENV_VAR_PBS_FINGERPRINT: &str = "PBS_FINGERPRINT";
 const ENV_VAR_PBS_PASSWORD: &str = "PBS_PASSWORD";
+const ENV_VAR_PBS_ENCRYPTION_PASSWORD: &str = "PBS_ENCRYPTION_PASSWORD";
+const ENV_VAR_PBS_REPOSITORY: &str = "PBS_REPOSITORY";
+const ENV_VAR_PBS_SERVER: &str = "PBS_SERVER";
+const ENV_VAR_PBS_PORT: &str = "PBS_PORT";
+const ENV_VAR_PBS_DATASTORE: &str = "PBS_DATASTORE";
+const ENV_VAR_PBS_AUTH_ID: &str = "PBS_AUTH_ID";
+const ENV_VAR_PBS_NAMESPACE: &str = "PBS_NAMESPACE";
 
-pub const REPO_URL_SCHEMA: Schema = StringSchema::new("Repository URL.")
-    .format(&BACKUP_REPO_URL)
-    .max_length(256)
-    .schema();
+/// Directory with system [credential]s. See systemd-creds(1).
+///
+/// [credential]: https://systemd.io/CREDENTIALS/
+const ENV_VAR_CREDENTIALS_DIRECTORY: &str = "CREDENTIALS_DIRECTORY";
+/// Credential name of the encryption password.
+const CRED_PBS_ENCRYPTION_PASSWORD: &str = "proxmox-backup-client.encryption-password";
+/// Credential name of the the password.
+const CRED_PBS_PASSWORD: &str = "proxmox-backup-client.password";
+/// Credential name of the the repository.
+const CRED_PBS_REPOSITORY: &str = "proxmox-backup-client.repository";
+/// Credential name of the the fingerprint.
+const CRED_PBS_FINGERPRINT: &str = "proxmox-backup-client.fingerprint";
 
 pub const CHUNK_SIZE_SCHEMA: Schema = IntegerSchema::new("Chunk size in KB. Must be a power of 2.")
     .minimum(64)
     .maximum(4096)
     .default(4096)
     .schema();
+
+/// Retrieves a secret stored in a [credential] provided by systemd.
+///
+/// Returns `Ok(None)` if the credential does not exist.
+///
+/// [credential]: https://systemd.io/CREDENTIALS/
+fn get_credential(cred_name: &str) -> std::io::Result<Option<Vec<u8>>> {
+    let Some(creds_dir) = std::env::var_os(ENV_VAR_CREDENTIALS_DIRECTORY) else {
+        return Ok(None);
+    };
+    let path = std::path::Path::new(&creds_dir).join(cred_name);
+
+    proxmox_log::debug!("attempting to use credential {cred_name} from {creds_dir:?}",);
+    // We read the whole contents without a BufRead. As per systemd-creds(1):
+    // Credentials are limited-size binary or textual objects.
+    match std::fs::read(&path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            proxmox_log::debug!("no {cred_name} credential found in {creds_dir:?}");
+            Ok(None)
+        }
+        Err(err) => Err(err),
+    }
+}
 
 /// Helper to read a secret through a environment variable (ENV).
 ///
@@ -46,7 +93,7 @@ pub const CHUNK_SIZE_SCHEMA: Schema = IntegerSchema::new("Chunk size in KB. Must
 /// BASE_NAME_CMD => read the secret from specified command first line of output on stdout
 ///
 /// Only return the first line of data (without CRLF).
-pub fn get_secret_from_env(base_name: &str) -> Result<Option<String>, Error> {
+fn get_secret_from_env(base_name: &str) -> Result<Option<String>, Error> {
     let firstline = |data: String| -> String {
         match data.lines().next() {
             Some(line) => line.to_string(),
@@ -69,7 +116,7 @@ pub fn get_secret_from_env(base_name: &str) -> Result<Option<String>, Error> {
         Err(NotPresent) => {}
     };
 
-    let env_name = format!("{}_FD", base_name);
+    let env_name = format!("{base_name}_FD");
     match std::env::var(&env_name) {
         Ok(fd_str) => {
             let fd: i32 = fd_str.parse().map_err(|err| {
@@ -86,7 +133,7 @@ pub fn get_secret_from_env(base_name: &str) -> Result<Option<String>, Error> {
         Err(NotPresent) => {}
     }
 
-    let env_name = format!("{}_FILE", base_name);
+    let env_name = format!("{base_name}_FILE");
     match std::env::var(&env_name) {
         Ok(filename) => {
             let mut file = std::fs::File::open(filename)
@@ -97,7 +144,7 @@ pub fn get_secret_from_env(base_name: &str) -> Result<Option<String>, Error> {
         Err(NotPresent) => {}
     }
 
-    let env_name = format!("{}_CMD", base_name);
+    let env_name = format!("{base_name}_CMD");
     match std::env::var(&env_name) {
         Ok(ref command) => {
             let args = shellword_split(command)?;
@@ -113,28 +160,198 @@ pub fn get_secret_from_env(base_name: &str) -> Result<Option<String>, Error> {
     Ok(None)
 }
 
+/// Gets a secret or value from the environment.
+///
+/// Checks for an environment variable named `env_variable`, and if missing, it
+/// checks for a system [credential] named `credential_name`. Assumes the secret
+/// is UTF-8 encoded.
+///
+/// [credential]: https://systemd.io/CREDENTIALS/
+fn get_secret_impl(env_variable: &str, credential_name: &str) -> Result<Option<String>, Error> {
+    if let Some(password) = get_secret_from_env(env_variable)? {
+        Ok(Some(password))
+    } else if let Some(password) = get_credential(credential_name)? {
+        String::from_utf8(password)
+            .map(Option::Some)
+            .map_err(|_err| format_err!("credential {credential_name} is not utf8 encoded"))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Gets the backup server's password.
+///
+/// Looks for a password in the `PBS_PASSWORD` environment variable, if there
+/// isn't one it reads the `proxmox-backup-client.password` [credential].
+///
+/// Returns `Ok(None)` if neither the environment variable or credentials are
+/// present.
+///
+/// [credential]: https://systemd.io/CREDENTIALS/
+pub fn get_password() -> Result<Option<String>, Error> {
+    get_secret_impl(ENV_VAR_PBS_PASSWORD, CRED_PBS_PASSWORD)
+}
+
+/// Gets an encryption password.
+///
+///
+/// Looks for a password in the `PBS_ENCRYPTION_PASSWORD` environment variable,
+/// if there isn't one it reads the `proxmox-backup-client.encryption-password`
+/// [credential].
+///
+/// Returns `Ok(None)` if neither the environment variable or credentials are
+/// present.
+///
+/// [credential]: https://systemd.io/CREDENTIALS/
+pub fn get_encryption_password() -> Result<Option<String>, Error> {
+    get_secret_impl(
+        ENV_VAR_PBS_ENCRYPTION_PASSWORD,
+        CRED_PBS_ENCRYPTION_PASSWORD,
+    )
+}
+
 pub fn get_default_repository() -> Option<String> {
-    std::env::var("PBS_REPOSITORY").ok()
+    get_secret_impl(ENV_VAR_PBS_REPOSITORY, CRED_PBS_REPOSITORY)
+        .inspect_err(|err| {
+            proxmox_log::error!("could not read default repository: {err:#}");
+        })
+        .unwrap_or_default()
 }
 
+/// Gets the repository fingerprint.
+///
+/// Looks for the fingerprint in the `PBS_FINGERPRINT` environment variable, if
+/// there isn't one it reads the `proxmox-backup-client.fingerprint`
+/// [credential].
+///
+/// Returns `None` if neither the environment variable or the credential are
+/// present.
+///
+/// [credential]: https://systemd.io/CREDENTIALS/
+pub fn get_fingerprint() -> Option<String> {
+    get_secret_impl(ENV_VAR_PBS_FINGERPRINT, CRED_PBS_FINGERPRINT)
+        .inspect_err(|err| {
+            proxmox_log::error!("could not read fingerprint: {err:#}");
+        })
+        .unwrap_or_default()
+}
+
+/// Build [`BackupRepositoryArgs`] from the fields in a JSON Value.
+fn args_from_value(param: &Value) -> BackupRepositoryArgs {
+    BackupRepositoryArgs {
+        repository: param["repository"].as_str().map(String::from),
+        server: param["server"].as_str().map(String::from),
+        port: param["port"].as_u64().map(|p| p as u16),
+        datastore: param["datastore"].as_str().map(String::from),
+        auth_id: param["auth-id"]
+            .as_str()
+            .and_then(|s| s.parse::<Authid>().ok()),
+    }
+}
+
+/// Build [`BackupRepositoryArgs`] from `PBS_*` environment variables.
+fn args_from_env() -> BackupRepositoryArgs {
+    BackupRepositoryArgs {
+        repository: None,
+        server: std::env::var(ENV_VAR_PBS_SERVER).ok(),
+        port: std::env::var(ENV_VAR_PBS_PORT)
+            .ok()
+            .and_then(|p| p.parse::<u16>().ok()),
+        datastore: std::env::var(ENV_VAR_PBS_DATASTORE).ok(),
+        auth_id: std::env::var(ENV_VAR_PBS_AUTH_ID)
+            .ok()
+            .and_then(|s| s.parse::<Authid>().ok()),
+    }
+}
+
+/// Resolve a [`BackupRepository`] from explicit CLI arguments with environment variable fallback.
+///
+/// Resolution:
+/// - `--repository` and CLI atoms are mutually exclusive.
+/// - `--repository` alone is used as-is (env vars ignored).
+/// - CLI atoms are merged with `PBS_*` env atom vars per-field (CLI wins).
+/// - If no CLI args are given, falls back to `PBS_REPOSITORY`, then to
+///   `PBS_*` atom env vars, then errors.
+fn resolve_repository(cli: BackupRepositoryArgs) -> Result<BackupRepository, Error> {
+    cli.check_mutual_exclusion()?;
+
+    if cli.repository.is_some() {
+        return BackupRepository::try_from(cli);
+    }
+    if cli.has_atoms() {
+        let env = args_from_env();
+        return BackupRepository::try_from(cli.merge_from(env));
+    }
+
+    // No CLI args at all, try environment.
+    if let Some(url) = get_default_repository() {
+        return url.parse();
+    }
+    let env = args_from_env();
+    if env.has_atoms() {
+        return BackupRepository::try_from(env);
+    }
+    bail!("unable to get (default) repository");
+}
+
+/// Remove repository-related keys from a JSON Value and return the parsed [`BackupRepository`].
+///
+/// This is used by commands that forward the remaining parameters to the server API after stripping
+/// the repository fields.
+pub fn remove_repository_from_value(param: &mut Value) -> Result<BackupRepository, Error> {
+    let map = param
+        .as_object_mut()
+        .ok_or_else(|| format_err!("unable to get repository (parameter is not an object)"))?;
+
+    let to_string = |v: Value| v.as_str().map(String::from);
+
+    let args = BackupRepositoryArgs {
+        repository: map.remove("repository").and_then(to_string),
+        server: map.remove("server").and_then(to_string),
+        port: map
+            .remove("port")
+            .and_then(|v| v.as_u64())
+            .map(|p| p as u16),
+        datastore: map.remove("datastore").and_then(to_string),
+        auth_id: map
+            .remove("auth-id")
+            .and_then(to_string)
+            .map(|s| s.parse::<Authid>())
+            .transpose()?,
+    };
+
+    resolve_repository(args)
+}
+
+/// Extract a [`BackupRepository`] from CLI parameters.
 pub fn extract_repository_from_value(param: &Value) -> Result<BackupRepository, Error> {
-    let repo_url = param["repository"]
-        .as_str()
-        .map(String::from)
-        .or_else(get_default_repository)
-        .ok_or_else(|| format_err!("unable to get (default) repository"))?;
-
-    let repo: BackupRepository = repo_url.parse()?;
-
-    Ok(repo)
+    resolve_repository(args_from_value(param))
 }
 
+/// Extract a [`BackupRepository`] from a parameter map (used for shell completion callbacks).
 pub fn extract_repository_from_map(param: &HashMap<String, String>) -> Option<BackupRepository> {
-    param
-        .get("repository")
-        .map(String::from)
-        .or_else(get_default_repository)
-        .and_then(|repo_url| repo_url.parse::<BackupRepository>().ok())
+    let cli = BackupRepositoryArgs {
+        repository: param.get("repository").cloned(),
+        server: param.get("server").cloned(),
+        port: param.get("port").and_then(|p| p.parse().ok()),
+        datastore: param.get("datastore").cloned(),
+        auth_id: param.get("auth-id").and_then(|s| s.parse().ok()),
+    };
+
+    resolve_repository(cli).ok()
+}
+
+/// Extract a [`BackupNamespace`] from CLI parameters, falling back to PBS_NAMESPACE.
+pub fn optional_ns_param(param: &Value) -> Result<BackupNamespace, Error> {
+    match param.get("ns") {
+        Some(Value::String(ns)) => return ns.parse(),
+        Some(_) => bail!("invalid namespace parameter"),
+        None => {}
+    }
+    if let Ok(ns) = std::env::var(ENV_VAR_PBS_NAMESPACE) {
+        return ns.parse();
+    }
+    Ok(BackupNamespace::root())
 }
 
 pub fn connect(repo: &BackupRepository) -> Result<HttpClient, Error> {
@@ -157,9 +374,9 @@ fn connect_do(
     auth_id: &Authid,
     rate_limit: RateLimitConfig,
 ) -> Result<HttpClient, Error> {
-    let fingerprint = std::env::var(ENV_VAR_PBS_FINGERPRINT).ok();
+    let fingerprint = get_fingerprint();
 
-    let password = get_secret_from_env(ENV_VAR_PBS_PASSWORD)?;
+    let password = get_password()?;
     let options = HttpClientOptions::new_interactive(password, fingerprint).rate_limit(rate_limit);
 
     HttpClient::new(server, port, auth_id, options)
@@ -167,8 +384,8 @@ fn connect_do(
 
 /// like get, but simply ignore errors and return Null instead
 pub async fn try_get(repo: &BackupRepository, url: &str) -> Value {
-    let fingerprint = std::env::var(ENV_VAR_PBS_FINGERPRINT).ok();
-    let password = get_secret_from_env(ENV_VAR_PBS_PASSWORD).unwrap_or(None);
+    let fingerprint = get_fingerprint();
+    let password = get_password().unwrap_or(None);
 
     // ticket cache, but no questions asked
     let options = HttpClientOptions::new_interactive(password, fingerprint).interactive(false);
@@ -212,7 +429,7 @@ pub async fn complete_backup_group_do(param: &HashMap<String, String>) -> Vec<St
             if let (Some(backup_id), Some(backup_type)) =
                 (item["backup-id"].as_str(), item["backup-type"].as_str())
             {
-                result.push(format!("{}/{}", backup_type, backup_id));
+                result.push(format!("{backup_type}/{backup_id}"));
             }
         }
     }
@@ -233,7 +450,7 @@ pub async fn complete_group_or_snapshot_do(
         let mut result = vec![];
         for group in groups {
             result.push(group.to_string());
-            result.push(format!("{}/", group));
+            result.push(format!("{group}/"));
         }
         return result;
     }
@@ -337,7 +554,7 @@ pub fn complete_pxar_archive_name(arg: &str, param: &HashMap<String, String>) ->
     complete_server_file_name(arg, param)
         .iter()
         .filter_map(|name| {
-            if name.ends_with(".pxar.didx") {
+            if has_pxar_filename_extension(name, true) {
                 Some(pbs_tools::format::strip_server_file_extension(name).to_owned())
             } else {
                 None
@@ -502,31 +719,6 @@ pub async fn complete_namespace_do(
     result
 }
 
-/// Create an anonymous temporary file, which is removed once it is closed.
-///
-/// Uses `O_TMPFILE` in `/tmp` on Linux. Elsewhere a file is created in the
-/// temporary directory and unlinked right away.
-pub fn create_tmp_file() -> std::io::Result<File> {
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new()
-            .write(true)
-            .read(true)
-            .custom_flags(libc::O_TMPFILE)
-            .open("/tmp")
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    {
-        let template = std::env::temp_dir().join("proxmox-backup-client");
-        let (file, path) = proxmox_sys::fs::make_tmp_file(template, Default::default())
-            .map_err(std::io::Error::other)?;
-        std::fs::remove_file(path)?;
-        Ok(file)
-    }
-}
-
 pub fn base_directories() -> Result<xdg::BaseDirectories, Error> {
     xdg::BaseDirectories::with_prefix("proxmox-backup").map_err(Error::from)
 }
@@ -539,7 +731,7 @@ pub fn find_xdg_file(
     let file_name = file_name.as_ref();
     base_directories()
         .map(|base| base.find_config_file(file_name))
-        .with_context(|| format!("error searching for {}", description))
+        .with_context(|| format!("error searching for {description}"))
 }
 
 pub fn place_xdg_file(
@@ -549,5 +741,309 @@ pub fn place_xdg_file(
     let file_name = file_name.as_ref();
     base_directories()
         .and_then(|base| base.place_config_file(file_name).map_err(Error::from))
-        .with_context(|| format!("failed to place {} in xdg home", description))
+        .with_context(|| format!("failed to place {description} in xdg home"))
+}
+
+pub fn get_pxar_archive_names(
+    archive_name: &BackupArchiveName,
+    manifest: &BackupManifest,
+) -> Result<(BackupArchiveName, Option<BackupArchiveName>), Error> {
+    let filename = archive_name.without_type_extension();
+    let ext = archive_name.archive_type().extension();
+
+    // Check if archive is given as split archive or regular archive and is present in manifest,
+    // otherwise goto fallback below
+    if manifest
+        .files()
+        .iter()
+        .any(|fileinfo| fileinfo.filename == *archive_name)
+    {
+        // check if already given as one of split archive name variants
+        if let Some(base) = filename
+            .strip_suffix(".mpxar")
+            .or_else(|| filename.strip_suffix(".ppxar"))
+        {
+            return Ok((
+                format!("{base}.mpxar.{ext}").as_str().try_into()?,
+                Some(format!("{base}.ppxar.{ext}").as_str().try_into()?),
+            ));
+        }
+        return Ok((archive_name.to_owned(), None));
+    }
+
+    // if not, try fallback from regular to split archive
+    if let Some(base) = filename.strip_suffix(".pxar") {
+        return get_pxar_archive_names(
+            &format!("{base}.mpxar.{ext}").as_str().try_into()?,
+            manifest,
+        );
+    }
+
+    bail!("archive not found in manifest");
+}
+
+/// Check if the given filename has a valid pxar filename extension variant
+///
+/// If `with_didx_extension` is `true`, check the additional `.didx` ending.
+pub fn has_pxar_filename_extension(name: &str, with_didx_extension: bool) -> bool {
+    if with_didx_extension {
+        name.ends_with(".pxar.didx")
+            || name.ends_with(".mpxar.didx")
+            || name.ends_with(".ppxar.didx")
+    } else {
+        name.ends_with(".pxar") || name.ends_with(".mpxar") || name.ends_with(".ppxar")
+    }
+}
+
+/// Raise the soft limit for open file handles to the hard limit
+///
+/// Returns the values set before raising the limit as libc::rlimit64
+#[cfg(target_os = "linux")]
+pub fn raise_nofile_limit() -> Result<libc::rlimit64, Error> {
+    let mut old = libc::rlimit64 {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if 0 != unsafe { libc::getrlimit64(libc::RLIMIT_NOFILE, &mut old as *mut libc::rlimit64) } {
+        bail!("Failed to get nofile rlimit");
+    }
+
+    let mut new = libc::rlimit64 {
+        rlim_cur: old.rlim_max,
+        rlim_max: old.rlim_max,
+    };
+    if 0 != unsafe { libc::setrlimit64(libc::RLIMIT_NOFILE, &mut new as *mut libc::rlimit64) } {
+        bail!("Failed to set nofile rlimit");
+    }
+
+    Ok(old)
+}
+
+/// Raise the soft limit for open file handles to the hard limit
+///
+/// The hard limit usually is `RLIM_INFINITY` on macOS, which cannot be set for open files, the
+/// per process limit of the kernel (`kern.maxfilesperproc`) applies instead. Returns the soft
+/// limit set before and this effective hard limit.
+#[cfg(target_os = "macos")]
+pub fn raise_nofile_limit() -> Result<libc::rlimit, Error> {
+    let mut old = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if 0 != unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut old) } {
+        bail!("Failed to get nofile rlimit");
+    }
+
+    let mut max_per_proc: libc::c_int = 0;
+    let mut size = std::mem::size_of::<libc::c_int>();
+    if 0 != unsafe {
+        libc::sysctlbyname(
+            c"kern.maxfilesperproc".as_ptr(),
+            &mut max_per_proc as *mut libc::c_int as *mut libc::c_void,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    } {
+        bail!("Failed to get kern.maxfilesperproc");
+    }
+    let max = old.rlim_max.min(max_per_proc as libc::rlim_t);
+
+    let new = libc::rlimit {
+        rlim_cur: max.max(old.rlim_cur),
+        rlim_max: old.rlim_max,
+    };
+    if 0 != unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &new) } {
+        bail!("Failed to set nofile rlimit");
+    }
+
+    Ok(libc::rlimit {
+        rlim_cur: old.rlim_cur,
+        rlim_max: max,
+    })
+}
+
+/// Creates a temporary file (with `O_TMPFILE`) in `XDG_CACHE_HOME`. If we
+/// cannot create the file there it will be created in `/tmp` instead.
+///
+/// Without `O_TMPFILE` (not Linux) a named file is created and unlinked right away.
+pub fn create_tmp_file() -> std::io::Result<std::fs::File> {
+    static TMP_PATH: OnceLock<std::path::PathBuf> = OnceLock::new();
+    let tmp_path = TMP_PATH.get_or_init(|| {
+        xdg::BaseDirectories::new()
+            .map(|base| base.get_cache_home())
+            .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
+    });
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let create = |dir: &std::path::Path| {
+            let template = dir.join("proxmox-backup-client");
+            let (file, path) = proxmox_sys::fs::make_tmp_file(template, Default::default())
+                .map_err(std::io::Error::other)?;
+            std::fs::remove_file(path)?;
+            Ok(file)
+        };
+        create(tmp_path).or_else(|err| {
+            if tmp_path != std::path::Path::new("/tmp") {
+                create(std::path::Path::new("/tmp"))
+            } else {
+                Err(err)
+            }
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let mut open_opts_binding = std::fs::OpenOptions::new();
+        let builder = open_opts_binding
+            .write(true)
+            .read(true)
+            .custom_flags(libc::O_TMPFILE);
+        builder.open(tmp_path).or_else(|err| {
+            if tmp_path != std::path::Path::new("/tmp") {
+                builder.open("/tmp")
+            } else {
+                Err(err)
+            }
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    const REPO_ENV_VARS: &[&str] = &[
+        ENV_VAR_PBS_REPOSITORY,
+        ENV_VAR_PBS_SERVER,
+        ENV_VAR_PBS_PORT,
+        ENV_VAR_PBS_DATASTORE,
+        ENV_VAR_PBS_AUTH_ID,
+        ENV_VAR_PBS_NAMESPACE,
+        ENV_VAR_CREDENTIALS_DIRECTORY,
+    ];
+
+    fn with_cleared_repo_env(f: impl FnOnce()) {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        for k in REPO_ENV_VARS {
+            std::env::remove_var(k);
+        }
+        f();
+        for k in REPO_ENV_VARS {
+            std::env::remove_var(k);
+        }
+    }
+
+    #[test]
+    fn extract_repo_from_atoms() {
+        with_cleared_repo_env(|| {
+            let param = json!({"server": "myhost", "datastore": "mystore"});
+            let repo = extract_repository_from_value(&param).unwrap();
+            assert_eq!(repo.host(), "myhost");
+            assert_eq!(repo.store(), "mystore");
+            assert_eq!(repo.port(), 8007);
+        });
+    }
+
+    #[test]
+    fn extract_repo_from_url() {
+        with_cleared_repo_env(|| {
+            let param = json!({"repository": "myhost:mystore"});
+            let repo = extract_repository_from_value(&param).unwrap();
+            assert_eq!(repo.host(), "myhost");
+            assert_eq!(repo.store(), "mystore");
+        });
+    }
+
+    #[test]
+    fn extract_repo_mutual_exclusion_error() {
+        with_cleared_repo_env(|| {
+            let param = json!({"repository": "myhost:mystore", "auth-id": "user@pam"});
+            let err = extract_repository_from_value(&param).unwrap_err();
+            assert!(err.to_string().contains("mutually exclusive"), "got: {err}");
+        });
+    }
+
+    #[test]
+    fn extract_repo_atoms_without_datastore_error() {
+        with_cleared_repo_env(|| {
+            let param = json!({"server": "myhost"});
+            let err = extract_repository_from_value(&param).unwrap_err();
+            assert!(
+                err.to_string().contains("--datastore is required"),
+                "got: {err}"
+            );
+        });
+    }
+
+    #[test]
+    fn extract_repo_nothing_provided_error() {
+        with_cleared_repo_env(|| {
+            let err = extract_repository_from_value(&json!({})).unwrap_err();
+            assert!(err.to_string().contains("unable to get"), "got: {err}");
+        });
+    }
+
+    #[test]
+    fn extract_repo_env_fallback() {
+        with_cleared_repo_env(|| {
+            std::env::set_var(ENV_VAR_PBS_SERVER, "envhost");
+            std::env::set_var(ENV_VAR_PBS_DATASTORE, "envstore");
+            let repo = extract_repository_from_value(&json!({})).unwrap();
+            assert_eq!(repo.host(), "envhost");
+            assert_eq!(repo.store(), "envstore");
+        });
+    }
+
+    #[test]
+    fn extract_repo_pbs_repository_env_takes_precedence() {
+        with_cleared_repo_env(|| {
+            std::env::set_var(ENV_VAR_PBS_REPOSITORY, "repohost:repostore");
+            std::env::set_var(ENV_VAR_PBS_SERVER, "envhost");
+            std::env::set_var(ENV_VAR_PBS_DATASTORE, "envstore");
+            let repo = extract_repository_from_value(&json!({})).unwrap();
+            assert_eq!(repo.host(), "repohost");
+            assert_eq!(repo.store(), "repostore");
+        });
+    }
+
+    #[test]
+    fn extract_repo_cli_overrides_env() {
+        with_cleared_repo_env(|| {
+            std::env::set_var(ENV_VAR_PBS_REPOSITORY, "envhost:envstore");
+            let param = json!({"server": "clihost", "datastore": "clistore"});
+            let repo = extract_repository_from_value(&param).unwrap();
+            assert_eq!(repo.host(), "clihost");
+            assert_eq!(repo.store(), "clistore");
+        });
+    }
+
+    #[test]
+    fn extract_repo_cli_atoms_merge_with_env_atoms() {
+        with_cleared_repo_env(|| {
+            std::env::set_var(ENV_VAR_PBS_SERVER, "envhost");
+            std::env::set_var(ENV_VAR_PBS_DATASTORE, "envstore");
+            let param = json!({"auth-id": "backup@pbs"});
+            let repo = extract_repository_from_value(&param).unwrap();
+            assert_eq!(repo.host(), "envhost");
+            assert_eq!(repo.store(), "envstore");
+            assert_eq!(repo.auth_id().to_string(), "backup@pbs");
+        });
+    }
+
+    #[test]
+    fn extract_repo_cli_atom_overrides_same_env_atom() {
+        with_cleared_repo_env(|| {
+            std::env::set_var(ENV_VAR_PBS_SERVER, "envhost");
+            std::env::set_var(ENV_VAR_PBS_DATASTORE, "envstore");
+            let param = json!({"server": "clihost"});
+            let repo = extract_repository_from_value(&param).unwrap();
+            assert_eq!(repo.host(), "clihost");
+            assert_eq!(repo.store(), "envstore");
+        });
+    }
 }

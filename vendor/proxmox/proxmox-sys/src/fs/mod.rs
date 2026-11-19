@@ -1,7 +1,7 @@
 //! File system related utilities
 use std::path::Path;
 
-use anyhow::{bail, Context, Error};
+use anyhow::{Context, Error, bail};
 
 use nix::sys::stat;
 use nix::unistd::{Gid, Uid};
@@ -33,7 +33,7 @@ pub fn fchown(fd: RawFd, owner: Option<Uid>, group: Option<Gid>) -> Result<(), E
 }
 
 /// Define permissions, owner and group when creating files/dirs
-#[derive(Clone, Default)]
+#[derive(Copy, Clone, Default)]
 pub struct CreateOptions {
     perm: Option<stat::Mode>,
     owner: Option<Uid>,

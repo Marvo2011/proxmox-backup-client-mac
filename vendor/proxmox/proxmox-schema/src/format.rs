@@ -1,6 +1,6 @@
-//! Module to generate and format API Documenation
+//! Module to generate and format API Documentation
 
-use anyhow::{bail, Error};
+use anyhow::{Error, bail};
 
 use crate::*;
 
@@ -37,6 +37,23 @@ pub fn wrap_text(
     text: &str,
     columns: usize,
 ) -> String {
+    // first we condense paragraphs by normalizing whitespace:
+    let paragraphs = text
+        .split("\n\n")
+        .map(|paragraph| {
+            paragraph
+                .split_ascii_whitespace()
+                .fold(String::new(), |mut acc, word| {
+                    if !acc.is_empty() {
+                        acc.push(' ');
+                    }
+                    acc.push_str(word);
+                    acc
+                })
+        })
+        .collect::<Vec<_>>();
+
+    // Then we wrap each paragraph with textwrap.
     let wrap_options1 = textwrap::Options::new(columns)
         .initial_indent(initial_indent)
         .subsequent_indent(subsequent_indent);
@@ -45,27 +62,45 @@ pub fn wrap_text(
         .initial_indent(subsequent_indent)
         .subsequent_indent(subsequent_indent);
 
-    text.split("\n\n")
-        .map(|p| p.trim())
+    paragraphs
+        .into_iter()
         .filter(|p| !p.is_empty())
         .fold(String::new(), |mut acc, p| {
             if acc.is_empty() {
-                acc.push_str(&textwrap::wrap(p, &wrap_options1).join("\n"));
+                acc.push_str(&textwrap::wrap(&p, &wrap_options1).join("\n"));
             } else {
-                acc.push_str(&textwrap::wrap(p, &wrap_options2).join("\n"));
+                acc.push_str("\n\n");
+                acc.push_str(&textwrap::wrap(&p, &wrap_options2).join("\n"));
             }
-            acc.push_str("\n\n");
             acc
         })
 }
 
 #[test]
 fn test_wrap_text() {
-    let text = "Command. This may be a list in order to spefify nested sub-commands.";
-    let expect = "             Command. This may be a list in order to spefify nested sub-\n             commands.\n\n";
+    let text = "\
+Command. This may be a list in order to specify nested subcommands.
 
-    let indent = "             ";
-    let wrapped = wrap_text(indent, indent, text, 80);
+A
+second
+paragraph which will be formatted differently, consisting of both lines
+which are too long and ones which are
+too
+short.";
+
+    let expect = "    \
+    Command. This may be a list in order to specify nested
+        subcommands.
+
+        A second paragraph which will be formatted
+        differently, consisting of both lines which are too
+        long and ones which are too short.\
+    ";
+
+    let wrapped = wrap_text("    ", "        ", text, 60);
+
+    eprintln!("[[[[\n{expect}]]]]");
+    eprintln!("[[[[\n{wrapped}]]]]");
 
     assert_eq!(wrapped, expect);
 }
@@ -99,7 +134,7 @@ fn get_simple_type_text(schema: &Schema, list_enums: bool) -> String {
     }
 }
 
-/// Generate ReST Documentaion for object properties
+/// Generate ReST Documentation for object properties
 pub fn dump_properties(
     param: &dyn ObjectSchemaType,
     indent: &str,
@@ -107,22 +142,31 @@ pub fn dump_properties(
     skip: &[&str],
 ) -> String {
     let mut res = String::new();
-    let next_indent = format!("  {}", indent);
+    let next_indent = format!("  {indent}");
 
     let mut required_list: Vec<String> = Vec::new();
     let mut optional_list: Vec<String> = Vec::new();
 
-    for (prop, optional, schema) in param.properties() {
-        if skip.iter().any(|n| n == prop) {
+    for property in param.all_properties() {
+        let name = property.name();
+
+        if skip.contains(&name) {
             continue;
         }
 
-        let mut param_descr =
-            get_property_description(prop, schema, style, DocumentationFormat::ReST);
+        let schema = property.schema();
+
+        let mut param_descr = get_property_description_with_conditions(
+            name,
+            schema,
+            style,
+            DocumentationFormat::ReST,
+            property.conditions(),
+        );
 
         if !indent.is_empty() {
-            param_descr = format!("{}{}", indent, param_descr); // indent first line
-            param_descr = param_descr.replace('\n', &format!("\n{}", indent)); // indent rest
+            param_descr = format!("{indent}{param_descr}"); // indent first line
+            param_descr = param_descr.replace('\n', &format!("\n{indent}")); // indent rest
         }
 
         if style == ParameterDisplayStyle::Config {
@@ -139,6 +183,9 @@ pub fn dump_properties(
                             ParameterDisplayStyle::ConfigSub,
                             &[],
                         );
+                        if !sub_text.is_empty() {
+                            param_descr.push_str("\n\n");
+                        }
                         param_descr.push_str(&sub_text);
                     }
                     Schema::Array(_) => {
@@ -148,7 +195,7 @@ pub fn dump_properties(
                 }
             }
         }
-        if *optional {
+        if property.optional() {
             optional_list.push(param_descr);
         } else {
             required_list.push(param_descr);
@@ -180,6 +227,10 @@ pub fn dump_properties(
     res
 }
 
+#[cfg_attr(
+    proxmox_schema = "strict",
+    deprecated(note = "caller is not oneOf aware - use get_property_description_with_conditions")
+)]
 /// Helper to format an object property, including name, type and description.
 pub fn get_property_description(
     name: &str,
@@ -187,34 +238,45 @@ pub fn get_property_description(
     style: ParameterDisplayStyle,
     format: DocumentationFormat,
 ) -> String {
+    get_property_description_with_conditions(name, schema, style, format, &[])
+}
+
+/// Helper to format an object property, including name, type and description.
+pub fn get_property_description_with_conditions(
+    name: &str,
+    schema: &Schema,
+    style: ParameterDisplayStyle,
+    format: DocumentationFormat,
+    conditions: &[(&'static str, &'static str)],
+) -> String {
     let type_text = get_schema_type_text(schema, style);
 
     let (descr, default, extra) = match schema {
         Schema::Null => ("null", None, None),
-        Schema::String(ref schema) => (
+        Schema::String(schema) => (
             schema.description,
             schema.default.map(|v| v.to_owned()),
             None,
         ),
-        Schema::Boolean(ref schema) => (
+        Schema::Boolean(schema) => (
             schema.description,
             schema.default.map(|v| v.to_string()),
             None,
         ),
-        Schema::Integer(ref schema) => (
+        Schema::Integer(schema) => (
             schema.description,
             schema.default.map(|v| v.to_string()),
             None,
         ),
-        Schema::Number(ref schema) => (
+        Schema::Number(schema) => (
             schema.description,
             schema.default.map(|v| v.to_string()),
             None,
         ),
-        Schema::Object(ref schema) => (schema.description, None, None),
-        Schema::AllOf(ref schema) => (schema.description, None, None),
-        Schema::OneOf(ref schema) => (schema.description, None, None),
-        Schema::Array(ref schema) => (
+        Schema::Object(schema) => (schema.description, None, None),
+        Schema::AllOf(schema) => (schema.description, None, None),
+        Schema::OneOf(schema) => (schema.description, None, None),
+        Schema::Array(schema) => (
             schema.description,
             None,
             Some(String::from("Can be specified more than once.")),
@@ -222,49 +284,66 @@ pub fn get_property_description(
     };
 
     let default_text = match default {
-        Some(text) => format!("   (default={})", text),
+        Some(text) => format!("   (default={text})"),
         None => String::new(),
     };
 
     let descr = match extra {
-        Some(extra) => format!("{} {}", descr, extra),
+        Some(extra) => format!("{descr} {extra}"),
         None => String::from(descr),
+    };
+
+    let conditions_text = if conditions.is_empty() {
+        String::new()
+    } else {
+        let conditions: Vec<String> = conditions
+            .iter()
+            .map(|(key, value)| format!("{key}={value:?}"))
+            .collect();
+        format!("(if {})", conditions.join(", "))
     };
 
     if format == DocumentationFormat::ReST {
         let mut text = match style {
             ParameterDisplayStyle::Config => {
                 // reST definition list format
-                format!("``{}`` : ``{}{}``\n  ", name, type_text, default_text)
+                format!("``{name}`` : ``{type_text}{default_text}``\n")
             }
             ParameterDisplayStyle::ConfigSub => {
                 // reST definition list format
-                format!("``{}`` = ``{}{}``\n  ", name, type_text, default_text)
+                format!("``{name}`` = ``{type_text}{default_text}``\n")
             }
             ParameterDisplayStyle::Arg => {
                 // reST option list format
-                format!("``--{}`` ``{}{}``\n  ", name, type_text, default_text)
+                format!("``--{name}`` ``{type_text}{default_text}``\n")
             }
             ParameterDisplayStyle::Fixed => {
-                format!("``<{}>`` : ``{}{}``\n  ", name, type_text, default_text)
+                format!("``<{name}>`` : ``{type_text}{default_text}``\n")
             }
         };
 
-        text.push_str(&wrap_text("", "  ", &descr, 80));
-        text.push('\n');
+        if !conditions_text.is_empty() {
+            text.push_str(&wrap_text("  ", "  ", &conditions_text, 80));
+            text.push('\n');
+        }
+        text.push_str(&wrap_text("  ", "  ", &descr, 80));
 
         text
     } else {
         let display_name = match style {
-            ParameterDisplayStyle::Config => format!("{}:", name),
-            ParameterDisplayStyle::ConfigSub => format!("{}=", name),
-            ParameterDisplayStyle::Arg => format!("--{}", name),
-            ParameterDisplayStyle::Fixed => format!("<{}>", name),
+            ParameterDisplayStyle::Config => format!("{name}:"),
+            ParameterDisplayStyle::ConfigSub => format!("{name}="),
+            ParameterDisplayStyle::Arg => format!("--{name}"),
+            ParameterDisplayStyle::Fixed => format!("<{name}>"),
         };
 
-        let mut text = format!(" {:-10} {}{}", display_name, type_text, default_text);
+        let mut text = format!(" {display_name:-10} {type_text}{default_text}");
         let indent = "             ";
         text.push('\n');
+        if !conditions_text.is_empty() {
+            text.push_str(&wrap_text(indent, indent, &conditions_text, 80));
+            text.push('\n');
+        }
         text.push_str(&wrap_text(indent, indent, &descr, 80));
 
         text
@@ -292,7 +371,7 @@ pub fn get_schema_type_text(schema: &Schema, _style: ParameterDisplayStyle) -> S
                         variants.iter().map(|e| String::from(e.value)).collect();
                     list.join("|")
                 }
-                // displaying regex add more confision than it helps
+                // displaying regex adds more confusion than it helps
                 //StringSchema { format: Some(ApiStringFormat::Pattern(const_regex)), .. } => {
                 //    format!("/{}/", const_regex.regex_string)
                 //}
@@ -305,15 +384,15 @@ pub fn get_schema_type_text(schema: &Schema, _style: ParameterDisplayStyle) -> S
         }
         Schema::Boolean(_) => String::from("<boolean>"),
         Schema::Integer(integer_schema) => match (integer_schema.minimum, integer_schema.maximum) {
-            (Some(min), Some(max)) => format!("<integer> ({} - {})", min, max),
-            (Some(min), None) => format!("<integer> ({} - N)", min),
-            (None, Some(max)) => format!("<integer> (-N - {})", max),
+            (Some(min), Some(max)) => format!("<integer> ({min} - {max})"),
+            (Some(min), None) => format!("<integer> ({min} - N)"),
+            (None, Some(max)) => format!("<integer> (-N - {max})"),
             _ => String::from("<integer>"),
         },
         Schema::Number(number_schema) => match (number_schema.minimum, number_schema.maximum) {
-            (Some(min), Some(max)) => format!("<number> ({} - {})", min, max),
-            (Some(min), None) => format!("<number> ({} - N)", min),
-            (None, Some(max)) => format!("<number> (-N - {})", max),
+            (Some(min), Some(max)) => format!("<number> ({min} - {max})"),
+            (Some(min), None) => format!("<number> ({min} - N)"),
+            (None, Some(max)) => format!("<number> (-N - {max})"),
             _ => String::from("<number>"),
         },
         Schema::Object(_) => String::from("<object>"),
@@ -328,7 +407,7 @@ pub fn get_property_string_type_text(schema: &Schema) -> String {
         Schema::Object(object_schema) => get_object_type_text(object_schema),
         Schema::Array(array_schema) => {
             let item_type = get_simple_type_text(array_schema.items, true);
-            format!("[{}, ...]", item_type)
+            format!("[{item_type}, ...]")
         }
         _ => panic!("get_property_string_type_text: expected array or object"),
     }
@@ -340,12 +419,12 @@ fn get_object_type_text(object_schema: &ObjectSchema) -> String {
     let mut add_part = |name, optional, schema| {
         let tt = get_simple_type_text(schema, false);
         let text = if parts.is_empty() {
-            format!("{}={}", name, tt)
+            format!("{name}={tt}")
         } else {
-            format!(",{}={}", name, tt)
+            format!(",{name}={tt}")
         };
         if optional {
-            parts.push(format!("[{}]", text));
+            parts.push(format!("[{text}]"));
         } else {
             parts.push(text);
         }
@@ -390,7 +469,7 @@ fn get_object_type_text(object_schema: &ObjectSchema) -> String {
     type_text
 }
 
-/// Generate ReST Documentaion for enumeration.
+/// Generate ReST Documentation for enumeration.
 pub fn dump_enum_properties(schema: &Schema) -> Result<String, Error> {
     let mut res = String::new();
 
@@ -425,7 +504,7 @@ pub fn dump_api_return_schema(returns: &ReturnType, style: ParameterDisplayStyle
     };
 
     let type_text = get_schema_type_text(schema, style);
-    let _ = write!(res, "**{}**\n\n", type_text);
+    let _ = write!(res, "**{type_text}**\n\n");
 
     match schema {
         Schema::Null => {

@@ -3,7 +3,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use anyhow::{format_err, Error};
+use anyhow::{Error, format_err};
 
 /// Attach a raw image file read-only, without mounting any file system on it.
 ///

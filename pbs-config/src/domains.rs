@@ -1,25 +1,41 @@
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
 use anyhow::Error;
-use lazy_static::lazy_static;
 
 use pbs_buildcfg::configdir;
+use proxmox_product_config::replace_privileged_config;
 use proxmox_schema::{ApiType, ObjectSchema};
 use proxmox_section_config::{SectionConfig, SectionConfigData, SectionConfigPlugin};
 
-use crate::{open_backup_lockfile, replace_backup_config, BackupLockGuard};
-use pbs_api_types::{AdRealmConfig, LdapRealmConfig, OpenIdRealmConfig, REALM_ID_SCHEMA};
+use crate::{BackupLockGuard, open_backup_lockfile};
+use pbs_api_types::{
+    AdRealmConfig, LdapRealmConfig, OpenIdRealmConfig, PamRealmConfig, PbsRealmConfig,
+    REALM_ID_SCHEMA,
+};
 
-lazy_static! {
-    pub static ref CONFIG: SectionConfig = init();
-}
+pub static CONFIG: LazyLock<SectionConfig> = LazyLock::new(init);
 
 fn init() -> SectionConfig {
+    const PAM_SCHEMA: &ObjectSchema = PamRealmConfig::API_SCHEMA.unwrap_object_schema();
+    const PBS_SCHEMA: &ObjectSchema = PbsRealmConfig::API_SCHEMA.unwrap_object_schema();
     const AD_SCHEMA: &ObjectSchema = AdRealmConfig::API_SCHEMA.unwrap_object_schema();
     const LDAP_SCHEMA: &ObjectSchema = LdapRealmConfig::API_SCHEMA.unwrap_object_schema();
     const OPENID_SCHEMA: &ObjectSchema = OpenIdRealmConfig::API_SCHEMA.unwrap_object_schema();
 
     let mut config = SectionConfig::new(&REALM_ID_SCHEMA);
+
+    config.register_plugin(SectionConfigPlugin::new(
+        "pam".to_owned(),
+        Some("realm".to_owned()),
+        PAM_SCHEMA,
+    ));
+
+    config.register_plugin(SectionConfigPlugin::new(
+        "pbs".to_owned(),
+        Some("realm".to_owned()),
+        PBS_SCHEMA,
+    ));
 
     let plugin = SectionConfigPlugin::new(
         "openid".to_string(),
@@ -60,12 +76,27 @@ pub fn config() -> Result<(SectionConfigData, [u8; 32]), Error> {
 
 pub fn save_config(config: &SectionConfigData) -> Result<(), Error> {
     let raw = CONFIG.write(DOMAINS_CFG_FILENAME, config)?;
-    replace_backup_config(DOMAINS_CFG_FILENAME, raw.as_bytes())
+    replace_privileged_config(DOMAINS_CFG_FILENAME, raw.as_bytes())
+}
+
+/// Unsets the default login realm for users by deleting the `default` property
+/// from the respective realm.
+///
+/// This only updates the configuration as given in `config`, making it
+/// permanent is left to the caller.
+pub fn unset_default_realm(config: &mut SectionConfigData) -> Result<(), Error> {
+    for (_, data) in &mut config.sections.values_mut() {
+        if let Some(obj) = data.as_object_mut() {
+            obj.remove("default");
+        }
+    }
+
+    Ok(())
 }
 
 /// Check if a realm with the given name exists
 pub fn exists(domains: &SectionConfigData, realm: &str) -> bool {
-    realm == "pbs" || realm == "pam" || domains.sections.get(realm).is_some()
+    domains.sections.contains_key(realm)
 }
 
 // shell completion helper

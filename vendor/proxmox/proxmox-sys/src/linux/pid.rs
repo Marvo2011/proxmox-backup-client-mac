@@ -4,14 +4,12 @@ use std::fs::File;
 use std::io;
 use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 
+use nix::NixPath;
 use nix::fcntl::OFlag;
 use nix::sys::signal::Signal;
 use nix::sys::signalfd::siginfo;
 use nix::sys::stat::Mode;
 use nix::unistd::Pid;
-use nix::NixPath;
-
-use proxmox_lang::{c_str, error::io_err_other};
 
 use crate::error::SysResult;
 use crate::linux::procfs::{MountInfo, PidStat};
@@ -26,7 +24,7 @@ pub const SYS_pidfd_open: libc::c_long = 434;
 pub const SYS_pidfd_send_signal: libc::c_long = 424;
 
 unsafe fn pidfd_open(pid: libc::pid_t, flags: libc::c_uint) -> libc::c_long {
-    libc::syscall(SYS_pidfd_open, pid, flags)
+    unsafe { libc::syscall(SYS_pidfd_open, pid, flags) }
 }
 
 unsafe fn pidfd_send_signal(
@@ -35,10 +33,10 @@ unsafe fn pidfd_send_signal(
     info: *mut libc::siginfo_t,
     flags: libc::c_uint,
 ) -> libc::c_long {
-    libc::syscall(SYS_pidfd_send_signal, pidfd, sig, info, flags)
+    unsafe { libc::syscall(SYS_pidfd_send_signal, pidfd, sig, info, flags) }
 }
 
-/// File descriptor refernce to a process.
+/// File descriptor reference to a process.
 pub struct PidFd {
     fd: OwnedFd,
     pid: Pid,
@@ -108,14 +106,14 @@ impl PidFd {
 
     /// Get the `PidStat` structure for this process. (`/proc/PID/stat`)
     pub fn get_stat(&self) -> io::Result<PidStat> {
-        let data = self.read_file(c_str!("stat"))?;
-        let data = String::from_utf8(data).map_err(io_err_other)?;
-        PidStat::parse(&data).map_err(io_err_other)
+        let data = self.read_file(c"stat")?;
+        let data = String::from_utf8(data).map_err(io::Error::other)?;
+        PidStat::parse(&data).map_err(io::Error::other)
     }
 
     /// Read this process' `/proc/PID/mountinfo` file.
     pub fn get_mount_info(&self) -> io::Result<MountInfo> {
-        MountInfo::parse(&self.read_file(c_str!("mountinfo"))?).map_err(io_err_other)
+        MountInfo::parse(&self.read_file(c"mountinfo")?).map_err(io::Error::other)
     }
 
     /// Attempt to get a `PidFd` from a raw file descriptor.

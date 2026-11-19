@@ -1,13 +1,14 @@
 [package]
 name = "proxmox-api-macro"
-edition.workspace = true
-version = "1.0.8"
+description = "Proxmox API macro"
+version = "1.7.1"
+
 authors.workspace = true
+edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Proxmox API macro"
-
-exclude.workspace = true
 
 [lib]
 proc-macro = true
@@ -22,6 +23,7 @@ syn = { workspace = true , features = [ "extra-traits" ] }
 futures.workspace = true
 serde = { workspace = true, features = [ "derive" ] }
 serde_json.workspace = true
+proxmox-section-config.workspace = true
 
 [dev-dependencies.proxmox-schema]
 workspace = true

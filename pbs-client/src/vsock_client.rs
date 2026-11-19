@@ -1,18 +1,22 @@
+use std::os::fd::{AsRawFd, IntoRawFd};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use anyhow::{bail, format_err, Error};
+use anyhow::{Error, bail, format_err};
 use futures::*;
-use http::Uri;
-use http::{Request, Response};
-use hyper::client::connect::{Connected, Connection};
-use hyper::client::Client;
-use hyper::Body;
+use http_body_util::{BodyDataStream, BodyExt};
+use hyper::body::Incoming;
+use hyper::http::Uri;
+use hyper::http::{Request, Response};
+use hyper_util::client::legacy::Client;
+use hyper_util::client::legacy::connect::{Connected, Connection};
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use pin_project_lite::pin_project;
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::UnixStream;
 
+use proxmox_http::Body;
 use proxmox_http::uri::json_object_to_query;
 use proxmox_router::HttpError;
 
@@ -30,9 +34,9 @@ pin_project! {
 }
 
 impl tower_service::Service<Uri> for VsockConnector {
-    type Response = UnixConnection;
+    type Response = TokioIo<UnixConnection>;
     type Error = Error;
-    type Future = Pin<Box<dyn Future<Output = Result<UnixConnection, Error>> + Send>>;
+    type Future = Pin<Box<dyn Future<Output = Result<TokioIo<UnixConnection>, Error>> + Send>>;
 
     fn poll_ready(&mut self, _cx: &mut task::Context<'_>) -> Poll<Result<(), Self::Error>> {
         Poll::Ready(Ok(()))
@@ -73,16 +77,17 @@ impl tower_service::Service<Uri> for VsockConnector {
             )?;
 
             let sock_addr = VsockAddr::new(cid, port as u32);
-            connect(sock_fd, &sock_addr)?;
+            connect(sock_fd.as_raw_fd(), &sock_addr)?;
 
             // connect sync, but set nonblock after (tokio requires it)
-            let std_stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(sock_fd) };
+            let std_stream =
+                unsafe { std::os::unix::net::UnixStream::from_raw_fd(sock_fd.into_raw_fd()) };
             std_stream.set_nonblocking(true)?;
 
             let stream = tokio::net::UnixStream::from_std(std_stream)?;
             let connection = UnixConnection { stream };
 
-            Ok(connection)
+            Ok(TokioIo::new(connection))
         })
         // unravel the thread JoinHandle to a usable future
         .map(|res| match res {
@@ -133,7 +138,7 @@ impl AsyncWrite for UnixConnection {
 
 /// Slimmed down version of HttpClient for virtio-vsock connections (file restore daemon)
 pub struct VsockClient {
-    client: Client<VsockConnector>,
+    client: Client<VsockConnector, Body>,
     cid: i32,
     port: u16,
     auth: Option<String>,
@@ -142,7 +147,7 @@ pub struct VsockClient {
 impl VsockClient {
     pub fn new(cid: i32, port: u16, auth: Option<String>) -> Self {
         let conn = VsockConnector {};
-        let client = Client::builder().build::<_, Body>(conn);
+        let client = Client::builder(TokioExecutor::new()).build::<_, Body>(conn);
         Self {
             client,
             cid,
@@ -179,8 +184,7 @@ impl VsockClient {
         if !status.is_success() {
             Self::api_response(resp).await.map(|_| ())?
         } else {
-            resp.into_body()
-                .map_err(Error::from)
+            futures::TryStreamExt::map_err(BodyDataStream::new(resp.into_body()), Error::from)
                 .try_fold(output, move |acc, chunk| async move {
                     acc.write_all(&chunk).await?;
                     Ok::<_, Error>(acc)
@@ -190,9 +194,9 @@ impl VsockClient {
         Ok(())
     }
 
-    async fn api_response(response: Response<Body>) -> Result<Value, Error> {
+    async fn api_response(response: Response<Incoming>) -> Result<Value, Error> {
         let status = response.status();
-        let data = hyper::body::to_bytes(response.into_body()).await?;
+        let data = response.into_body().collect().await?.to_bytes();
 
         let text = String::from_utf8(data.to_vec()).unwrap();
         if status.is_success() {
@@ -238,7 +242,7 @@ impl VsockClient {
         if let Some(data) = data {
             if method == "POST" {
                 let builder = make_builder("application/json", &url);
-                let request = builder.body(Body::from(data.to_string()))?;
+                let request = builder.body(data.to_string().into())?;
                 return Ok(request);
             } else {
                 let query = json_object_to_query(data)?;

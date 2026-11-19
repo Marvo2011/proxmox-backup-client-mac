@@ -1,11 +1,11 @@
 use proxmox_http_error::HttpError;
 
+use crate::Config;
 use crate::api::{http_bail, http_err};
 use crate::endpoints::smtp::{
-    DeleteableSmtpProperty, SmtpConfig, SmtpConfigUpdater, SmtpPrivateConfig,
-    SmtpPrivateConfigUpdater, SMTP_TYPENAME,
+    DeleteableSmtpProperty, SMTP_TYPENAME, SmtpConfig, SmtpConfigUpdater, SmtpPrivateConfig,
+    SmtpPrivateConfigUpdater,
 };
-use crate::Config;
 
 /// Get a list of all smtp endpoints.
 ///
@@ -96,8 +96,8 @@ pub fn update_endpoint(
     let mut endpoint = get_endpoint(config, name)?;
 
     if let Some(delete) = delete {
-        for deleteable_property in delete {
-            match deleteable_property {
+        for deletable_property in delete {
+            match deletable_property {
                 DeleteableSmtpProperty::Author => endpoint.author = None,
                 DeleteableSmtpProperty::Comment => endpoint.comment = None,
                 DeleteableSmtpProperty::Disable => endpoint.disable = None,
@@ -249,15 +249,17 @@ pub mod tests {
     fn test_update_not_existing_returns_error() -> Result<(), HttpError> {
         let mut config = empty_config();
 
-        assert!(update_endpoint(
-            &mut config,
-            "test",
-            Default::default(),
-            Default::default(),
-            None,
-            None,
-        )
-        .is_err());
+        assert!(
+            update_endpoint(
+                &mut config,
+                "test",
+                Default::default(),
+                Default::default(),
+                None,
+                None,
+            )
+            .is_err()
+        );
 
         Ok(())
     }
@@ -267,15 +269,17 @@ pub mod tests {
         let mut config = empty_config();
         add_smtp_endpoint_for_test(&mut config, "sendmail-endpoint")?;
 
-        assert!(update_endpoint(
-            &mut config,
-            "sendmail-endpoint",
-            Default::default(),
-            Default::default(),
-            None,
-            Some(&[0; 32]),
-        )
-        .is_err());
+        assert!(
+            update_endpoint(
+                &mut config,
+                "sendmail-endpoint",
+                Default::default(),
+                Default::default(),
+                None,
+                Some(&[0; 32]),
+            )
+            .is_err()
+        );
 
         Ok(())
     }

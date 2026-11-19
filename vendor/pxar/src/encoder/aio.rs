@@ -5,9 +5,9 @@ use std::path::Path;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use crate::encoder::{self, LinkOffset, SeqWrite};
+use crate::encoder::{self, LinkOffset, PayloadOffset, SeqWrite};
 use crate::format;
-use crate::Metadata;
+use crate::{Metadata, PxarVariant};
 
 /// Asynchronous `pxar` encoder.
 ///
@@ -22,10 +22,16 @@ impl<'a, T: tokio::io::AsyncWrite + 'a> Encoder<'a, TokioWriter<T>> {
     /// Encode a `pxar` archive into a `tokio::io::AsyncWrite` output.
     #[inline]
     pub async fn from_tokio(
-        output: T,
+        output: PxarVariant<T, T>,
         metadata: &Metadata,
+        prelude: Option<&[u8]>,
     ) -> io::Result<Encoder<'a, TokioWriter<T>>> {
-        Encoder::new(TokioWriter::new(output), metadata).await
+        Encoder::new(
+            output.wrap(|output| TokioWriter::new(output)),
+            metadata,
+            prelude,
+        )
+        .await
     }
 }
 
@@ -37,8 +43,11 @@ impl<'a> Encoder<'a, TokioWriter<tokio::fs::File>> {
         metadata: &'b Metadata,
     ) -> io::Result<Encoder<'a, TokioWriter<tokio::fs::File>>> {
         Encoder::new(
-            TokioWriter::new(tokio::fs::File::create(path.as_ref()).await?),
+            PxarVariant::Unified(TokioWriter::new(
+                tokio::fs::File::create(path.as_ref()).await?,
+            )),
             metadata,
+            None,
         )
         .await
     }
@@ -46,9 +55,14 @@ impl<'a> Encoder<'a, TokioWriter<tokio::fs::File>> {
 
 impl<'a, T: SeqWrite + 'a> Encoder<'a, T> {
     /// Create an asynchronous encoder for an output implementing our internal write interface.
-    pub async fn new(output: T, metadata: &Metadata) -> io::Result<Encoder<'a, T>> {
+    pub async fn new(
+        output: PxarVariant<T, T>,
+        metadata: &Metadata,
+        prelude: Option<&[u8]>,
+    ) -> io::Result<Encoder<'a, T>> {
+        let output = output.wrap_multi(|output| output.into(), |payload_output| payload_output);
         Ok(Self {
-            inner: encoder::EncoderImpl::new(output.into(), metadata).await?,
+            inner: encoder::EncoderImpl::new(output, metadata, prelude).await?,
         })
     }
 
@@ -72,6 +86,11 @@ impl<'a, T: SeqWrite + 'a> Encoder<'a, T> {
         })
     }
 
+    /// Get current position for payload stream
+    pub fn payload_position(&self) -> io::Result<PayloadOffset> {
+        self.inner.payload_position()
+    }
+
     // /// Convenience shortcut to add a *regular* file by path including its contents to the archive.
     // pub async fn add_file<P, F>(
     //     &mut self,
@@ -92,24 +111,48 @@ impl<'a, T: SeqWrite + 'a> Encoder<'a, T> {
     //     ).await
     // }
 
+    /// Encode a payload reference pointing to given offset in the separate payload output
+    ///
+    /// Returns with error if the encoder instance has no separate payload output or encoding
+    /// failed.
+    pub async fn add_payload_ref(
+        &mut self,
+        metadata: &Metadata,
+        file_name: &Path,
+        file_size: u64,
+        payload_offset: PayloadOffset,
+    ) -> io::Result<LinkOffset> {
+        self.inner
+            .add_payload_ref(metadata, file_name.as_ref(), file_size, payload_offset)
+            .await
+    }
+
+    /// Add size to payload stream
+    pub fn advance(&mut self, size: PayloadOffset) -> io::Result<()> {
+        self.inner.advance(size)
+    }
+
     /// Create a new subdirectory. Note that the subdirectory has to be finished by calling the
     /// `finish()` method, otherwise the entire archive will be in an error state.
     pub async fn create_directory<P: AsRef<Path>>(
         &mut self,
         file_name: P,
         metadata: &Metadata,
-    ) -> io::Result<Encoder<'_, T>> {
-        Ok(Encoder {
-            inner: self
-                .inner
-                .create_directory(file_name.as_ref(), metadata)
-                .await?,
-        })
+    ) -> io::Result<()> {
+        self.inner
+            .create_directory(file_name.as_ref(), metadata)
+            .await
     }
 
-    /// Finish this directory. This is mandatory, otherwise the `Drop` handler will `panic!`.
-    pub async fn finish(self) -> io::Result<()> {
+    /// Finish this directory. This is mandatory, encodes the end for the current directory.
+    pub async fn finish(&mut self) -> io::Result<()> {
         self.inner.finish().await
+    }
+
+    /// Close the encoder instance. This is mandatory, encodes the end for the optional payload
+    /// output stream, if some is given
+    pub async fn close(self) -> io::Result<()> {
+        self.inner.close().await
     }
 
     /// Add a symbolic link to the archive.
@@ -177,7 +220,7 @@ pub struct File<'a, S: SeqWrite> {
     inner: encoder::FileImpl<'a, S>,
 }
 
-impl<'a, S: SeqWrite> File<'a, S> {
+impl<S: SeqWrite> File<'_, S> {
     /// Get the file offset to be able to reference it with `add_hardlink`.
     pub fn file_offset(&self) -> LinkOffset {
         self.inner.file_offset()
@@ -195,7 +238,7 @@ impl<'a, S: SeqWrite> File<'a, S> {
 }
 
 #[cfg(feature = "tokio-io")]
-impl<'a, S: SeqWrite> tokio::io::AsyncWrite for File<'a, S> {
+impl<S: SeqWrite> tokio::io::AsyncWrite for File<'_, S> {
     fn poll_write(self: Pin<&mut Self>, cx: &mut Context, data: &[u8]) -> Poll<io::Result<usize>> {
         unsafe { self.map_unchecked_mut(|this| &mut this.inner) }.poll_write(cx, data)
     }
@@ -291,15 +334,20 @@ mod test {
     /// Assert that `Encoder` is `Send`
     fn send_test() {
         let test = async {
-            let mut encoder = Encoder::new(DummyOutput, &Metadata::dir_builder(0o700).build())
-                .await
-                .unwrap();
+            let mut encoder = Encoder::new(
+                crate::PxarVariant::Unified(DummyOutput),
+                &Metadata::dir_builder(0o700).build(),
+                None,
+            )
+            .await
+            .unwrap();
             {
-                let mut dir = encoder
+                encoder
                     .create_directory("baba", &Metadata::dir_builder(0o700).build())
                     .await
                     .unwrap();
-                dir.create_file(&Metadata::file_builder(0o755).build(), "abab", 1024)
+                encoder
+                    .create_file(&Metadata::file_builder(0o755).build(), "abab", 1024)
                     .await
                     .unwrap();
             }

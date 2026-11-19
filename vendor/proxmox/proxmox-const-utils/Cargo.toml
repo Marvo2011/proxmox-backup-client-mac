@@ -1,0 +1,13 @@
+[package]
+name = "proxmox-const-utils"
+description = "const fn utilities used by proxmox crates"
+version = "0.1.0"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+exclude.workspace = true
+rust-version.workspace = true
+
+[dependencies]

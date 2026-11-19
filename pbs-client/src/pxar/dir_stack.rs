@@ -2,10 +2,10 @@ use std::ffi::OsString;
 use std::os::unix::io::{AsRawFd, BorrowedFd, RawFd};
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Error};
+use anyhow::{Context, Error, bail};
 use nix::dir::Dir;
 use nix::fcntl::OFlag;
-use nix::sys::stat::{mkdirat, Mode};
+use nix::sys::stat::{Mode, mkdirat};
 
 use proxmox_sys::error::SysError;
 use pxar::Metadata;
@@ -36,12 +36,12 @@ impl PxarDir {
     }
 
     fn create_dir(
-        &mut self,
+        &'_ mut self,
         parent: RawFd,
         allow_existing_dirs: bool,
-    ) -> Result<BorrowedFd, Error> {
+    ) -> Result<BorrowedFd<'_>, Error> {
         if let Err(err) = mkdirat(
-            parent,
+            Some(parent),
             self.file_name.as_os_str(),
             perms_from_metadata(&self.metadata)?,
         ) {
@@ -53,11 +53,11 @@ impl PxarDir {
         self.open_dir(parent)
     }
 
-    fn open_dir(&mut self, parent: RawFd) -> Result<BorrowedFd, Error> {
+    fn open_dir(&'_ mut self, parent: RawFd) -> Result<BorrowedFd<'_>, Error> {
         let dir = Dir::openat(
-            parent,
+            Some(parent),
             self.file_name.as_os_str(),
-            OFlag::O_DIRECTORY,
+            OFlag::O_DIRECTORY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
             Mode::empty(),
         )?;
 
@@ -68,7 +68,7 @@ impl PxarDir {
         Ok(fd)
     }
 
-    pub fn try_as_borrowed_fd(&self) -> Option<BorrowedFd> {
+    pub fn try_as_borrowed_fd(&'_ self) -> Option<BorrowedFd<'_>> {
         // Once `nix` adds `AsFd` support use `.as_fd()` instead.
         self.dir
             .as_ref()
@@ -120,7 +120,7 @@ impl PxarDirStack {
         Ok(out)
     }
 
-    pub fn last_dir_fd(&mut self, allow_existing_dirs: bool) -> Result<BorrowedFd, Error> {
+    pub fn last_dir_fd(&'_ mut self, allow_existing_dirs: bool) -> Result<BorrowedFd<'_>, Error> {
         // should not be possible given the way we use it:
         assert!(!self.dirs.is_empty(), "PxarDirStack underrun");
 
@@ -147,7 +147,7 @@ impl PxarDirStack {
         Ok(())
     }
 
-    pub fn root_dir_fd(&self) -> Result<BorrowedFd, Error> {
+    pub fn root_dir_fd(&'_ self) -> Result<BorrowedFd<'_>, Error> {
         // should not be possible given the way we use it:
         assert!(!self.dirs.is_empty(), "PxarDirStack underrun");
 

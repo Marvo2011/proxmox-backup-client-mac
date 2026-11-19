@@ -1,17 +1,19 @@
 #![allow(clippy::match_bool)] // just no...
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
+use anyhow::{Error, bail};
 use serde::Serialize;
 use serde_json::Value;
 
 use proxmox_schema::format::{
-    get_property_description, get_schema_type_text, DocumentationFormat, ParameterDisplayStyle,
+    DocumentationFormat, ParameterDisplayStyle, get_property_description_with_conditions,
+    get_schema_type_text,
 };
 use proxmox_schema::*;
 
-use super::{value_to_text, TableFormatOptions};
-use super::{CliCommand, CliCommandMap, CommandLineInterface};
+use super::{CliCommand, CliCommandMap, CommandLineInterface, GlobalOptions};
+use super::{TableFormatOptions, value_to_text};
 
 /// Helper function to format and print result.
 ///
@@ -49,10 +51,10 @@ pub fn format_and_print_result_full(
         println!("{}", serde_json::to_string(&result).unwrap());
     } else if output_format == "text" {
         if let Err(err) = value_to_text(std::io::stdout(), result, return_type.schema, options) {
-            eprintln!("unable to format result: {}", err);
+            eprintln!("unable to format result: {err}");
         }
     } else {
-        eprintln!("undefined output format '{}'", output_format);
+        eprintln!("undefined output format '{output_format}'");
     }
 }
 
@@ -63,6 +65,24 @@ pub fn generate_usage_str(
     format: DocumentationFormat,
     indent: &str,
     skip_options: &[&str],
+) -> String {
+    generate_usage_str_do(
+        prefix,
+        cli_cmd,
+        format,
+        indent,
+        skip_options,
+        [].into_iter(),
+    )
+}
+
+pub(crate) fn generate_usage_str_do<'cli>(
+    prefix: &str,
+    cli_cmd: &CliCommand,
+    format: DocumentationFormat,
+    indent: &str,
+    skip_options: &[&str],
+    global_options_iter: impl Iterator<Item = &'cli GlobalOptions>,
 ) -> String {
     let arg_param = cli_cmd.arg_param;
     let fixed_param = &cli_cmd.fixed_param;
@@ -76,12 +96,13 @@ pub fn generate_usage_str(
     let mut args = String::new();
 
     for positional_arg in arg_param {
-        match schema.lookup(positional_arg) {
-            Some((optional, param_schema)) => {
+        // Positional parameters cannot have clashing schemas across oneOf variants.
+        match schema.lookup_all(positional_arg).next() {
+            Some(property) => {
                 args.push(' ');
 
-                let is_array = matches!(param_schema, Schema::Array(_));
-                if optional {
+                let is_array = matches!(property.schema(), Schema::Array(_));
+                if property.optional() {
                     args.push('[');
                 }
                 if is_array {
@@ -93,31 +114,45 @@ pub fn generate_usage_str(
                 if is_array {
                     args.push('}');
                 }
-                if optional {
+                if property.optional() {
                     args.push(']');
                 }
 
                 done_hash.insert(positional_arg);
             }
-            None => panic!("no such property '{}' in schema", positional_arg),
+            None => panic!("no such property '{positional_arg}' in schema"),
         }
     }
 
     let mut arg_descr = String::new();
     for positional_arg in arg_param {
-        let (_optional, param_schema) = schema.lookup(positional_arg).unwrap();
-        let param_descr = get_property_description(
-            positional_arg,
-            param_schema,
-            ParameterDisplayStyle::Fixed,
-            format,
-        );
-        arg_descr.push_str(&param_descr);
+        for property in schema.lookup_all(positional_arg) {
+            let param_descr = get_property_description_with_conditions(
+                positional_arg,
+                property.schema(),
+                ParameterDisplayStyle::Fixed,
+                format,
+                property.conditions(),
+            );
+            if !arg_descr.is_empty() {
+                arg_descr.push_str("\n\n");
+            }
+            arg_descr.push_str(&param_descr);
+        }
     }
 
     let mut options = String::new();
 
-    for (prop, optional, param_schema) in schema.properties() {
+    let mut properties: Vec<_> = schema.all_properties().collect();
+    properties.sort_by(|a, b| a.name().cmp(b.name()));
+
+    // A property can exist in multiple oneOf variants: describe each, but list a required one only
+    // once in the synopsis.
+    let mut synopsis_done = HashSet::new();
+    for property in &properties {
+        let prop = property.name();
+        let param_schema = property.schema();
+
         if done_hash.contains(prop) {
             continue;
         }
@@ -127,22 +162,34 @@ pub fn generate_usage_str(
 
         let type_text = get_schema_type_text(param_schema, ParameterDisplayStyle::Arg);
 
-        let prop_descr =
-            get_property_description(prop, param_schema, ParameterDisplayStyle::Arg, format);
+        let prop_descr = get_property_description_with_conditions(
+            prop,
+            param_schema,
+            ParameterDisplayStyle::Arg,
+            format,
+            property.conditions(),
+        );
 
-        if *optional {
+        if property.optional() {
+            if !options.is_empty() {
+                options.push('\n');
+            }
             options.push_str(&prop_descr);
         } else {
-            args.push_str(" --");
-            args.push_str(prop);
-            args.push(' ');
-            args.push_str(&type_text);
+            if synopsis_done.insert(prop) {
+                args.push_str(" --");
+                args.push_str(prop);
+                args.push(' ');
+                args.push_str(&type_text);
+            }
 
+            if !arg_descr.is_empty() {
+                arg_descr.push_str("\n\n");
+            }
             arg_descr.push_str(&prop_descr);
         }
-
-        done_hash.insert(prop);
     }
+    done_hash.extend(properties.iter().map(|property| property.name()));
 
     let option_indicator = if !options.is_empty() {
         " [OPTIONS]"
@@ -152,47 +199,216 @@ pub fn generate_usage_str(
 
     let mut text = match format {
         DocumentationFormat::Short => {
-            return format!("{}{}{}{}\n", indent, prefix, args, option_indicator);
+            return format!("{indent}{prefix}{args}{option_indicator}");
         }
-        DocumentationFormat::Long => format!("{}{}{}{}\n", indent, prefix, args, option_indicator),
+        DocumentationFormat::Long => format!("{indent}{prefix}{args}{option_indicator}"),
         DocumentationFormat::Full => format!(
-            "{}{}{}{}\n\n{}\n\n",
-            indent,
-            prefix,
-            args,
-            option_indicator,
+            "{indent}{prefix}{args}{option_indicator}\n\n{}",
             schema.description()
         ),
         DocumentationFormat::ReST => format!(
-            "``{}{}{}``\n\n{}\n\n",
-            prefix,
-            args,
-            option_indicator,
+            "``{prefix}{args}{option_indicator}``\n\n{}",
             schema.description()
         ),
     };
 
     if !arg_descr.is_empty() {
+        text.push_str("\n\n");
         text.push_str(&arg_descr);
     }
 
     if !options.is_empty() {
-        text.push_str("Optional parameters:\n\n");
+        text.push_str("\n\nOptional parameters:\n\n");
         text.push_str(&options);
     }
+
+    let mut global_options = String::new();
+
+    let mut properties: Vec<_> = global_options_iter
+        .flat_map(|o| o.schema.any_object().unwrap().all_properties())
+        .collect();
+    properties.sort_by(|a, b| a.name().cmp(b.name()));
+
+    let mut listed = HashSet::new();
+    for property in properties {
+        let name = property.name();
+        let param_schema = property.schema();
+
+        if done_hash.contains(name) {
+            continue;
+        }
+        if format == DocumentationFormat::ReST {
+            use std::fmt::Write as _;
+
+            // In the ReST outputs we don't include the documentation for global options each time
+            // as this is mostly used for the man page and we have a separate section before
+            // labeled
+            // "Options available for command group <stuff>:"
+            // which documents them fully.
+            //
+            // FIXME: Ideally we'd instead be able to tell the difference between generating the
+            // entire tree or just a single command's documentation to know whether to print all of
+            // them?
+
+            // Only names are listed here, so list a property of multiple variants once.
+            if !listed.insert(name) {
+                continue;
+            }
+            if !global_options.is_empty() {
+                global_options.push_str("\n\n");
+            }
+
+            let _ = write!(global_options, "``--{name}``");
+        } else {
+            // For the other ones we use the same generation method as for any other option:
+
+            if !global_options.is_empty() {
+                global_options.push('\n');
+            }
+            global_options.push_str(&get_property_description_with_conditions(
+                name,
+                param_schema,
+                ParameterDisplayStyle::Arg,
+                format,
+                property.conditions(),
+            ));
+        }
+    }
+
+    if !global_options.is_empty() {
+        text.push_str("\n\nInherited group parameters:\n\n");
+        text.push_str(&global_options);
+    }
+
     text
 }
 
+#[deprecated = "will be removed, not meant to be a public interface"]
 /// Print command usage for simple commands to ``stderr``.
 pub fn print_simple_usage_error(prefix: &str, cli_cmd: &CliCommand, err_msg: &str) {
-    let usage = generate_usage_str(prefix, cli_cmd, DocumentationFormat::Long, "", &[]);
-    eprint!("Error: {}\nUsage: {}", err_msg, usage);
+    print_simple_usage_error_do(prefix, cli_cmd, err_msg, [].into_iter())
+}
+
+/// Print command usage for simple commands to ``stderr``.
+pub(crate) fn print_simple_usage_error_do<'cli>(
+    prefix: &str,
+    cli_cmd: &CliCommand,
+    err_msg: &str,
+    global_options_iter: impl Iterator<Item = &'cli GlobalOptions>,
+) {
+    let usage = generate_usage_str_do(
+        prefix,
+        cli_cmd,
+        DocumentationFormat::Long,
+        "",
+        &[],
+        global_options_iter,
+    );
+    eprintln!("Error: {err_msg}\nUsage: {usage}");
 }
 
 /// Print command usage for nested commands to ``stderr``.
 pub fn print_nested_usage_error(prefix: &str, def: &CliCommandMap, err_msg: &str) {
     let usage = generate_nested_usage(prefix, def, DocumentationFormat::Short);
-    eprintln!("Error: {}\n\nUsage:\n\n{}", err_msg, usage);
+    eprintln!("Error: {err_msg}\n\nUsage:\n\n{usage}");
+}
+
+/// While going through nested commands, this keeps track of the available global options.
+#[derive(Default)]
+struct UsageState<'cli> {
+    global_options: Vec<Vec<&'cli GlobalOptions>>,
+}
+
+impl<'cli> UsageState<'cli> {
+    fn push_global_options(&mut self, options: &'cli HashMap<std::any::TypeId, GlobalOptions>) {
+        self.global_options.push(options.values().collect());
+    }
+
+    fn pop_global_options(&mut self) {
+        self.global_options.pop();
+    }
+
+    fn describe_current(&self, prefix: &str, format: DocumentationFormat) -> String {
+        use std::fmt::Write as _;
+
+        let Some(opts) = self.global_options.last() else {
+            return String::new();
+        };
+
+        if opts.is_empty() {
+            return String::new();
+        }
+
+        // The Long format is used for per-command parameter-error reporting where the same
+        // information is already rendered inline by `generate_usage_str_do` under
+        // `Inherited group parameters`; emitting it twice would just be noise.
+        if matches!(format, DocumentationFormat::Long) {
+            return String::new();
+        }
+
+        let mut out = String::new();
+
+        if matches!(format, DocumentationFormat::Short) {
+            // Compact one-line summary for the top-of-usage banner. Listing each global
+            // option with its full type signature and description here would dwarf the
+            // per-command usage lines that follow; users get the full description via
+            // `<binary> help <subcommand>` (which uses Full) or on a parameter error.
+            let mut names: Vec<_> = opts.iter().flat_map(|opt| opt.properties()).collect();
+            names.sort_by(|a, b| a.0.cmp(b.0));
+
+            // Qualify with the prefix so the line cannot be misread as belonging to the
+            // adjacent per-command usage line. ReST/Full output already uses this scoping
+            // ("Options available for command group ..."); Short keeps the same spirit
+            // with a tighter form. The `help` command lists its usage lines without the binary
+            // name, so its prefix is empty for the top level, which needs no qualification.
+            if prefix.is_empty() {
+                out.push_str("Global options:");
+            } else {
+                let _ = write!(out, "Global options for `{prefix}`:");
+            }
+            for (name, schema) in &names {
+                let type_text = get_schema_type_text(schema, ParameterDisplayStyle::Arg);
+                let _ = write!(out, " --{name} {type_text}");
+            }
+            // Trailing newline so the per-command list below gets a blank-line separator
+            // (the surrounding loop joins commands with a single "\n" in Short format).
+            out.push('\n');
+            return out;
+        }
+
+        if prefix.is_empty() {
+            out.push_str("Options available for all commands:");
+        } else {
+            let _ = write!(out, "Options available for command group ``{prefix}``:");
+        }
+        for opt in opts {
+            let mut properties: Vec<_> = opt
+                .schema
+                .any_object()
+                .expect("non-object schema in global options")
+                .all_properties()
+                .collect();
+            properties.sort_by(|a, b| a.name().cmp(b.name()));
+            for property in properties {
+                let description = get_property_description_with_conditions(
+                    property.name(),
+                    property.schema(),
+                    ParameterDisplayStyle::Arg,
+                    format,
+                    property.conditions(),
+                );
+                let _ = write!(out, "\n\n{description}");
+            }
+        }
+
+        out
+    }
+
+    fn global_options_iter(&self) -> impl Iterator<Item = &'cli GlobalOptions> + '_ {
+        self.global_options
+            .iter()
+            .flat_map(|list| list.iter().copied())
+    }
 }
 
 /// Helper to generate command usage text for nested commands.
@@ -201,6 +417,17 @@ pub fn generate_nested_usage(
     def: &CliCommandMap,
     format: DocumentationFormat,
 ) -> String {
+    generate_nested_usage_do(&mut UsageState::default(), prefix, def, format)
+}
+
+fn generate_nested_usage_do<'cli>(
+    state: &mut UsageState<'cli>,
+    prefix: &str,
+    def: &'cli CliCommandMap,
+    format: DocumentationFormat,
+) -> String {
+    state.push_global_options(&def.global_options);
+
     let mut cmds: Vec<&String> = def.commands.keys().collect();
     cmds.sort();
 
@@ -208,31 +435,53 @@ pub fn generate_nested_usage(
 
     let mut usage = String::new();
 
+    let globals = state.describe_current(prefix, format);
+    if !globals.is_empty() {
+        usage.push_str(&globals);
+    }
+
     for cmd in cmds {
+        if !usage.is_empty() {
+            // Only the short format has a single line per command, the others would run the
+            // description of one command into the usage line of the next.
+            if matches!(
+                format,
+                DocumentationFormat::ReST | DocumentationFormat::Long | DocumentationFormat::Full
+            ) {
+                usage.push_str("\n\n");
+            } else {
+                usage.push('\n');
+            }
+        }
+
         let new_prefix = if prefix.is_empty() {
             String::from(cmd)
         } else {
-            format!("{} {}", prefix, cmd)
+            format!("{prefix} {cmd}")
         };
+
+        if !usage.is_empty() && format == DocumentationFormat::ReST {
+            usage.push_str("----\n\n"); // add transition for better visual separation
+        }
 
         match def.commands.get(cmd).unwrap() {
             CommandLineInterface::Simple(cli_cmd) => {
-                if !usage.is_empty() && format == DocumentationFormat::ReST {
-                    usage.push_str("----\n\n");
-                }
-                usage.push_str(&generate_usage_str(
+                usage.push_str(&generate_usage_str_do(
                     &new_prefix,
                     cli_cmd,
                     format,
                     "",
                     skip_options,
+                    state.global_options_iter(),
                 ));
             }
             CommandLineInterface::Nested(map) => {
-                usage.push_str(&generate_nested_usage(&new_prefix, map, format));
+                usage.push_str(&generate_nested_usage_do(state, &new_prefix, map, format));
             }
         }
     }
+
+    state.pop_global_options();
 
     usage
 }
@@ -240,14 +489,32 @@ pub fn generate_nested_usage(
 /// Print help text to ``stderr``.
 pub fn print_help(
     top_def: &CommandLineInterface,
+    prefix: String,
+    args: &[String],
+    verbose: Option<bool>,
+) {
+    let mut message = String::new();
+    match print_help_to(top_def, prefix, args, verbose, &mut message) {
+        Ok(()) => print!("{message}"),
+        Err(err) => eprintln!("{err}"),
+    }
+}
+
+pub fn print_help_to(
+    top_def: &CommandLineInterface,
     mut prefix: String,
     args: &[String],
     mut verbose: Option<bool>,
-) {
+    mut to: impl std::fmt::Write,
+) -> Result<(), Error> {
     let mut iface = top_def;
+
+    let mut usage_state = UsageState::default();
 
     for cmd in args {
         if let CommandLineInterface::Nested(map) = iface {
+            usage_state.push_global_options(&map.global_options);
+
             if let Some((full_name, subcmd)) = map.find_command(cmd) {
                 iface = subcmd;
                 if !prefix.is_empty() {
@@ -258,11 +525,10 @@ pub fn print_help(
             }
         }
         if prefix.is_empty() {
-            eprintln!("no such command '{}'", cmd);
+            bail!("no such command '{}'", cmd);
         } else {
-            eprintln!("no such command '{} {}'", prefix, cmd);
+            bail!("no such command '{} {}'", prefix, cmd);
         }
-        return;
     }
 
     if verbose.is_none() {
@@ -278,13 +544,178 @@ pub fn print_help(
 
     match iface {
         CommandLineInterface::Nested(map) => {
-            println!("Usage:\n\n{}", generate_nested_usage(&prefix, map, format));
+            writeln!(
+                to,
+                "Usage:\n\n{}",
+                generate_nested_usage_do(&mut usage_state, &prefix, map, format)
+            )?;
         }
         CommandLineInterface::Simple(cli_cmd) => {
-            println!(
+            writeln!(
+                to,
                 "Usage: {}",
-                generate_usage_str(&prefix, cli_cmd, format, "", &[])
-            );
+                generate_usage_str_do(
+                    &prefix,
+                    cli_cmd,
+                    format,
+                    "",
+                    &[],
+                    usage_state.global_options_iter()
+                )
+            )?;
         }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ApiHandler, ApiMethod, RpcEnvironment};
+    use proxmox_schema::{ApiType, ObjectSchema, Schema, StringSchema};
+
+    fn dummy_method(
+        _param: Value,
+        _info: &ApiMethod,
+        _rpcenv: &mut dyn RpcEnvironment,
+    ) -> Result<Value, Error> {
+        Ok(Value::Null)
+    }
+
+    const API_METHOD_NOOP: ApiMethod = ApiMethod::new(
+        &ApiHandler::Sync(&dummy_method),
+        &ObjectSchema::new("noop", &[]),
+    );
+
+    #[allow(dead_code)]
+    struct DummyGlobals {
+        config: Option<String>,
+    }
+
+    impl<'de> serde::Deserialize<'de> for DummyGlobals {
+        fn deserialize<D>(_d: D) -> Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            unreachable!("not used in tests")
+        }
+    }
+
+    impl ApiType for DummyGlobals {
+        const API_SCHEMA: Schema = ObjectSchema::new(
+            "Dummy globals for tests.",
+            &[(
+                "config",
+                true,
+                &StringSchema::new("Path to config file.").schema(),
+            )],
+        )
+        .schema();
+    }
+
+    #[test]
+    fn nested_usage_short_includes_globals() {
+        let map = CliCommandMap::new()
+            .global_option(GlobalOptions::of::<DummyGlobals>())
+            .insert("foo", CliCommand::new(&API_METHOD_NOOP));
+        let usage = generate_nested_usage("bin", &map, DocumentationFormat::Short);
+        assert!(
+            usage.starts_with("Global options for `bin`: --config <string>"),
+            "expected compact globals header in Short format, got: {usage:?}",
+        );
+        assert!(
+            usage.contains("bin foo"),
+            "per-command usage line still expected, got: {usage:?}",
+        );
+    }
+
+    #[test]
+    fn nested_usage_short_separates_globals_from_first_command_with_blank_line() {
+        // Pin the visual contract: the globals header must be separated from the first
+        // per-command line by exactly one blank line. A regression here would make the
+        // banner run together with the command list and confuse readers.
+        let map = CliCommandMap::new()
+            .global_option(GlobalOptions::of::<DummyGlobals>())
+            .insert("foo", CliCommand::new(&API_METHOD_NOOP));
+        let usage = generate_nested_usage("bin", &map, DocumentationFormat::Short);
+        assert!(
+            usage.contains("--config <string>\n\nbin foo"),
+            "expected blank-line separator between globals and first command, got: {usage:?}",
+        );
+    }
+
+    #[test]
+    fn nested_usage_short_qualifies_subgroup_globals_with_prefix() {
+        // Globals registered on a subgroup (not the root) must surface with their
+        // group prefix so the reader cannot misread them as scoped to the preceding
+        // sibling command at the parent level.
+        let sub = CliCommandMap::new()
+            .global_option(GlobalOptions::of::<DummyGlobals>())
+            .insert("inner", CliCommand::new(&API_METHOD_NOOP));
+        let map = CliCommandMap::new().insert("group", CommandLineInterface::Nested(sub));
+        let usage = generate_nested_usage("bin", &map, DocumentationFormat::Short);
+        assert!(
+            usage.contains("Global options for `bin group`: --config <string>"),
+            "expected subgroup globals header to be qualified with its prefix, got: {usage:?}",
+        );
+    }
+
+    #[test]
+    fn nested_usage_without_prefix_names_no_empty_group() {
+        // The `help` command renders the top level with an empty prefix, which must not show
+        // up as an empty group name.
+        let map = CliCommandMap::new()
+            .global_option(GlobalOptions::of::<DummyGlobals>())
+            .insert("foo", CliCommand::new(&API_METHOD_NOOP));
+        let usage = generate_nested_usage("", &map, DocumentationFormat::Short);
+        assert!(
+            usage.starts_with("Global options: --config <string>"),
+            "expected an unqualified globals header in Short format, got: {usage:?}",
+        );
+        let usage = generate_nested_usage("", &map, DocumentationFormat::Full);
+        assert!(
+            usage.starts_with("Options available for all commands:"),
+            "expected an unqualified globals header in Full format, got: {usage:?}",
+        );
+        assert!(!usage.contains("``"), "no empty group name, got: {usage:?}");
+    }
+
+    #[test]
+    fn nested_usage_full_separates_commands_with_blank_line() {
+        let map = CliCommandMap::new()
+            .global_option(GlobalOptions::of::<DummyGlobals>())
+            .insert("bar", CliCommand::new(&API_METHOD_NOOP))
+            .insert("foo", CliCommand::new(&API_METHOD_NOOP));
+        let usage = generate_nested_usage("bin", &map, DocumentationFormat::Full);
+        assert!(
+            usage.contains("\n\nbin bar") && usage.contains("\n\nbin foo"),
+            "expected a blank line before every command, got: {usage:?}",
+        );
+    }
+
+    #[test]
+    fn nested_usage_short_no_globals_when_none_registered() {
+        let map = CliCommandMap::new().insert("foo", CliCommand::new(&API_METHOD_NOOP));
+        let usage = generate_nested_usage("bin", &map, DocumentationFormat::Short);
+        assert!(
+            !usage.contains("Global options"),
+            "should not emit globals header when none registered, got: {usage:?}",
+        );
+    }
+
+    #[test]
+    fn nested_usage_long_does_not_repeat_globals() {
+        // Long format is the per-command usage error path; globals are already inlined as
+        // "Inherited group parameters" by generate_usage_str_do, so describe_current must
+        // not also surface them here.
+        let map = CliCommandMap::new()
+            .global_option(GlobalOptions::of::<DummyGlobals>())
+            .insert("foo", CliCommand::new(&API_METHOD_NOOP));
+        let usage = generate_nested_usage("bin", &map, DocumentationFormat::Long);
+        assert!(
+            !usage.contains("Global options"),
+            "describe_current must stay quiet for Long format, got: {usage:?}",
+        );
     }
 }

@@ -3,13 +3,17 @@
 
 #![allow(dead_code)]
 
-use proxmox_api_macro::api;
+use std::collections::HashMap;
+
+use proxmox_api_macro::{api, json_schema};
 use proxmox_schema as schema;
 use proxmox_schema::{ApiType, EnumEntry};
 
 use anyhow::Error;
 use serde::Deserialize;
 use serde_json::Value;
+
+pub const TEXT_SCHEMA: schema::Schema = schema::StringSchema::new("Text.").schema();
 
 #[api(
     type: String,
@@ -41,6 +45,10 @@ pub struct TestStruct {
 
     /// An optional auto-derived value for testing:
     another: Option<String>,
+
+    /// Disabled field.
+    #[cfg(false)]
+    disabled_field: String,
 }
 
 #[test]
@@ -64,6 +72,24 @@ fn test_struct() {
     .schema();
 
     assert_eq!(TEST_SCHEMA, TestStruct::API_SCHEMA);
+
+    const TEST_JSON_SCHEMA: ::proxmox_schema::Schema = json_schema! {
+        description: "An example of a simple struct type.",
+        properties: {
+            another: {
+                type: String,
+                description: "An optional auto-derived value for testing:",
+                optional: true,
+            },
+            test_string: {
+                type: String,
+                description: "A test string.",
+                optional: false,
+            },
+        },
+    };
+
+    assert_eq!(TEST_SCHEMA, TEST_JSON_SCHEMA);
 }
 
 #[api]
@@ -103,6 +129,42 @@ fn renamed_struct() {
 }
 
 #[api]
+/// An example of a struct with fully qualified Option types.
+pub struct QualifiedOptionStruct {
+    /// An optional value using the std path.
+    std_option: std::option::Option<String>,
+
+    /// An optional value using the absolute core path.
+    core_option: ::core::option::Option<String>,
+}
+
+#[test]
+fn qualified_option_struct() {
+    const TEST_SCHEMA: ::proxmox_schema::Schema = ::proxmox_schema::ObjectSchema::new(
+        "An example of a struct with fully qualified Option types.",
+        &[
+            (
+                "core_option",
+                true,
+                &::proxmox_schema::StringSchema::new(
+                    "An optional value using the absolute core path.",
+                )
+                .schema(),
+            ),
+            (
+                "std_option",
+                true,
+                &::proxmox_schema::StringSchema::new("An optional value using the std path.")
+                    .schema(),
+            ),
+        ],
+    )
+    .schema();
+
+    assert_eq!(TEST_SCHEMA, QualifiedOptionStruct::API_SCHEMA);
+}
+
+#[api]
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 /// A selection of either 'onekind', 'another-kind' or 'selection-number-three'.
@@ -115,6 +177,9 @@ pub enum Selection {
     AnotherKind,
     /// And yet another.
     SelectionNumberThree,
+    #[cfg(false)]
+    /// And one that isn't compiled due to a cfg and won't be included in the test below.
+    NotIncludedKind,
 }
 
 #[test]
@@ -185,4 +250,152 @@ fn string_check_schema_test() {
 /// Some Description.
 pub struct RenamedAndDescribed {
     a_field: String,
+}
+
+#[api(
+    properties: {},
+    additional_properties: "rest",
+)]
+#[derive(Deserialize)]
+/// Some Description.
+pub struct UnspecifiedData {
+    /// Text.
+    field: String,
+
+    /// Remaining data.
+    rest: HashMap<String, Value>,
+}
+
+#[test]
+fn additional_properties_test() {
+    const TEST_UNSPECIFIED: ::proxmox_schema::Schema =
+        ::proxmox_schema::ObjectSchema::new("Some Description.", &[("field", false, &TEXT_SCHEMA)])
+            .additional_properties(true)
+            .schema();
+
+    assert_eq!(TEST_UNSPECIFIED, UnspecifiedData::API_SCHEMA);
+}
+
+#[api]
+/// An enum with an "other"/fallback value.
+#[derive(Debug, PartialEq, Eq, Deserialize)]
+pub enum WithOther {
+    /// First value.
+    First,
+
+    /// Second value.
+    Second,
+
+    /// Unknown values.
+    #[serde(untagged)]
+    Other(String),
+}
+
+#[test]
+fn enum_with_other() {
+    const WITH_OTHER_SCHEMA: ::proxmox_schema::Schema =
+        ::proxmox_schema::StringSchema::new("An enum with an \"other\"/fallback value.")
+            .format(&::proxmox_schema::ApiStringFormat::Enum(&[
+                EnumEntry::new("First", "First value."),
+                EnumEntry::new("Second", "Second value."),
+            ]))
+            .format_is_optional(true)
+            .schema();
+
+    assert_eq!(WITH_OTHER_SCHEMA, WithOther::API_SCHEMA);
+
+    let other: WithOther = serde_json::from_str("\"First\"").expect("failed to parse `WithOther`");
+    assert_eq!(other, WithOther::First);
+    let other: WithOther = serde_json::from_str("\"Second\"").expect("failed to parse `WithOther`");
+    assert_eq!(other, WithOther::Second);
+    let other: WithOther = serde_json::from_str("\"first\"").expect("failed to parse `WithOther`");
+    assert_eq!(other, WithOther::Other("first".into()));
+    let other: WithOther = serde_json::from_str("\"any\"").expect("failed to parse `WithOther`");
+    assert_eq!(other, WithOther::Other("any".into()));
+    let schema = const { WITH_OTHER_SCHEMA.unwrap_string_schema() };
+    schema
+        .check_constraints("any string")
+        .expect("check_constraints on 'other' value failed");
+}
+
+#[api]
+/// An enum with a configured-out fallback value.
+#[derive(Debug, PartialEq, Eq, Deserialize)]
+pub enum WithDisabledOther {
+    /// First value.
+    First,
+
+    /// Unknown values.
+    #[cfg(false)]
+    #[serde(untagged)]
+    Other(String),
+}
+
+#[api]
+/// An enum with a configured-in fallback value.
+#[derive(Debug, PartialEq, Eq, Deserialize)]
+pub enum WithEnabledOther {
+    /// First value.
+    First,
+
+    /// Unknown values.
+    #[rustfmt::skip] // keep the valid trailing comma
+    #[cfg(true,)]
+    #[cfg(not(false))]
+    #[serde(untagged)]
+    Other(String),
+}
+
+#[test]
+fn enum_with_cfg_other() {
+    const WITH_DISABLED_OTHER_SCHEMA: ::proxmox_schema::Schema =
+        ::proxmox_schema::StringSchema::new("An enum with a configured-out fallback value.")
+            .format(&::proxmox_schema::ApiStringFormat::Enum(&[EnumEntry::new(
+                "First",
+                "First value.",
+            )]))
+            .schema();
+
+    assert_eq!(WITH_DISABLED_OTHER_SCHEMA, WithDisabledOther::API_SCHEMA);
+    let schema = const { WithDisabledOther::API_SCHEMA.unwrap_string_schema() };
+    schema
+        .check_constraints("any string")
+        .expect_err("check_constraints accepted a value without fallback variant");
+
+    let schema = const { WithEnabledOther::API_SCHEMA.unwrap_string_schema() };
+    assert!(schema.format_is_optional);
+    schema
+        .check_constraints("any string")
+        .expect("check_constraints on 'other' value failed");
+}
+
+#[api(
+    properties: {
+        "verify-mode": {
+            description: "Verification mode.",
+            type: String,
+        },
+        verify: { alias: "verify-mode" },
+        legacy: { alias: "verify-mode" },
+    },
+)]
+#[derive(Debug, PartialEq, Eq, Deserialize)]
+/// Config with a deprecated property name.
+pub struct AliasedStruct {
+    #[serde(rename = "verify-mode")]
+    pub verify_mode: String,
+}
+
+#[test]
+fn aliased_struct_serde() {
+    // The auto-injected `#[serde(alias = "...")]` on the canonical field lets serde accept
+    // both the canonical name and every declared alias.
+    let parse = |body| {
+        serde_json::from_value::<AliasedStruct>(body)
+            .unwrap()
+            .verify_mode
+    };
+    assert_eq!(parse(serde_json::json!({"verify-mode": "fast"})), "fast");
+    assert_eq!(parse(serde_json::json!({"verify": "slow"})), "slow");
+    assert_eq!(parse(serde_json::json!({"legacy": "full"})), "full");
 }

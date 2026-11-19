@@ -81,6 +81,19 @@
 //! because running these operations concurrently is treated as a feature
 //! on its own.
 //!
+//! For datastores with S3 backend there are further restrictions since
+//! there are 3 types of locking mechanisms involved:
+//! - per-chunk file lock
+//! - chunk store mutex lock
+//! - lru cache mutex lock
+//!
+//! Locks must always be acquired in this specific order to avoid deadlocks.
+//! The per-chunk file lock is used to avoid holding a mutex lock during calls
+//! into async contexts, which can deadlock otherwise. It must be held for the
+//! whole time from starting an operation on the chunk until it is persisted
+//! to s3 backend, local datastore cache and in-memory LRU cache where
+//! required.
+//!
 //! ## Inter-process Locking
 //!
 //! We need to be able to restart the proxmox-backup service daemons, so
@@ -144,9 +157,6 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
-// Note: .pcat1 => Proxmox Catalog Format version 1
-pub const CATALOG_NAME: &str = "catalog.pcat1.didx";
-
 /// Directory path where active operations counters are saved.
 pub const ACTIVE_OPERATIONS_DIR: &str = concat!(
     pbs_buildcfg::PROXMOX_BACKUP_RUN_DIR_M!(),
@@ -179,13 +189,14 @@ pub mod crypt_reader;
 pub mod crypt_writer;
 pub mod data_blob;
 pub mod data_blob_reader;
-pub mod data_blob_writer;
 pub mod file_formats;
 pub mod index;
 pub mod manifest;
+pub mod move_journal;
 pub mod paperkey;
 pub mod prune;
 pub mod read_chunk;
+pub mod s3;
 pub mod store_progress;
 pub mod task_tracking;
 
@@ -196,17 +207,20 @@ pub use backup_info::{BackupDir, BackupGroup, BackupInfo};
 pub use checksum_reader::ChecksumReader;
 pub use checksum_writer::ChecksumWriter;
 pub use chunk_store::ChunkStore;
-pub use chunker::Chunker;
+pub use chunker::{Chunker, ChunkerImpl, PayloadChunker};
 pub use crypt_reader::CryptReader;
 pub use crypt_writer::CryptWriter;
 pub use data_blob::DataBlob;
 pub use data_blob_reader::DataBlobReader;
-pub use data_blob_writer::DataBlobWriter;
 pub use manifest::BackupManifest;
 pub use store_progress::StoreProgress;
 
 mod datastore;
-pub use datastore::{check_backup_owner, DataStore};
+pub use datastore::{
+    DataStore, DataStoreLookup, DatastoreBackend, S3_CLIENT_REQUEST_COUNTER_BASE_PATH,
+    S3_DATASTORE_IN_USE_MARKER, check_backup_owner, check_namespace_depth_limit,
+    ensure_datastore_is_mounted, get_datastore_mount_status,
+};
 
 mod hierarchy;
 pub use hierarchy::{
@@ -218,3 +232,6 @@ pub use snapshot_reader::SnapshotReader;
 
 mod local_chunk_reader;
 pub use local_chunk_reader::LocalChunkReader;
+
+mod local_datastore_lru_cache;
+pub use local_datastore_lru_cache::LocalDatastoreLruCache;

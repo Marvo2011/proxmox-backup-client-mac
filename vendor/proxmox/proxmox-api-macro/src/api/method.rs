@@ -3,19 +3,21 @@
 //! This has to perform quite a few things: infer types from parameters, deal with optional types
 //! and defaults, expose parameter and return value schema to the public, and finally create the
 //! wrapper function converting from a json Value hash to the parameters listed in the function
-//! signature, while recognizing specially handling `RPCEnvironment` and `ApiMethod` parameters.
+//! signature, while recognizing specially handling `RPCEnvironment` and `ApiMethod` parameters as
+//! well as parameters marked with `#[state]`.
 
+use std::collections::HashSet;
 use std::convert::{TryFrom, TryInto};
 use std::mem;
 
 use anyhow::Error;
 
 use proc_macro2::{Span, TokenStream};
-use quote::{quote, quote_spanned, ToTokens};
+use quote::{ToTokens, quote, quote_spanned};
+use syn::Ident;
 use syn::ext::IdentExt;
 use syn::spanned::Spanned;
 use syn::visit_mut::{self, VisitMut};
-use syn::Ident;
 
 use super::{ObjectEntry, Schema, SchemaItem, SchemaObject};
 use crate::util::{self, FieldName, JSONObject, JSONValue, Maybe};
@@ -30,7 +32,7 @@ pub enum ReturnType {
 impl ReturnType {
     fn as_mut_schema(&mut self) -> Option<&mut Schema> {
         match self {
-            ReturnType::Explicit(ReturnSchema { ref mut schema, .. }) => Some(schema),
+            ReturnType::Explicit(ReturnSchema { schema, .. }) => Some(schema),
             _ => None,
         }
     }
@@ -43,6 +45,7 @@ impl TryFrom<JSONValue> for ReturnType {
         Ok(match value {
             JSONValue::Object(obj) => ReturnType::Explicit(obj.try_into()?),
             JSONValue::Expr(ext) => ReturnType::Extern(ext),
+            JSONValue::Array(arr) => bail!(arr.span(), "return type cannot be an array"),
         })
     }
 }
@@ -93,11 +96,7 @@ impl TryFrom<JSONObject> for ReturnSchema {
             Some(value) => {
                 let span = value.span();
                 let is_optional: bool = value.try_into()?;
-                if is_optional {
-                    Some(span)
-                } else {
-                    None
-                }
+                if is_optional { Some(span) } else { None }
             }
             None => None,
         };
@@ -109,11 +108,28 @@ impl TryFrom<JSONObject> for ReturnSchema {
     }
 }
 
+#[derive(Clone, Copy)]
+enum MethodFlavor {
+    Normal,
+    Serializing,
+    Streaming,
+}
+
+struct MethodInfo {
+    input_schema: Schema,
+    return_type: Option<ReturnType>,
+    func: syn::ItemFn,
+    wrapper_ts: TokenStream,
+    default_consts: TokenStream,
+    flavor: MethodFlavor,
+    is_async: bool,
+}
+
 /// Parse `input`, `returns` and `protected` attributes out of an function annotated
 /// with an `#[api]` attribute and produce a `const ApiMethod` named after the function.
 ///
 /// See the top level macro documentation for a complete example.
-pub fn handle_method(mut attribs: JSONObject, mut func: syn::ItemFn) -> Result<TokenStream, Error> {
+pub fn handle_method(mut attribs: JSONObject, func: syn::ItemFn) -> Result<TokenStream, Error> {
     let input_schema: Schema = match attribs.remove("input") {
         Some(input) => input.into_object("input schema definition")?.try_into()?,
         None => Schema {
@@ -124,7 +140,7 @@ pub fn handle_method(mut attribs: JSONObject, mut func: syn::ItemFn) -> Result<T
         },
     };
 
-    let mut input_schema = if input_schema.as_object().is_some() {
+    let input_schema = if input_schema.as_object().is_some() {
         input_schema
     } else {
         error!(
@@ -137,10 +153,69 @@ pub fn handle_method(mut attribs: JSONObject, mut func: syn::ItemFn) -> Result<T
         schema
     };
 
-    let mut return_type: Option<ReturnType> = attribs
+    let return_type: Option<ReturnType> = attribs
         .remove("returns")
         .map(|ret| ret.try_into())
         .transpose()?;
+
+    /* FIXME: Once the deprecation period is over:
+    if let Some(streaming) = attribs.remove("streaming") {
+        error!(
+            streaming.span(),
+            "streaming attribute was renamed to 'serializing', as it did not actually stream"
+        );
+    }
+    */
+
+    let streaming: Option<syn::LitBool> = attribs
+        .remove("streaming")
+        .map(TryFrom::try_from)
+        .transpose()?;
+    let serializing: Option<syn::LitBool> = attribs
+        .remove("serializing")
+        .map(TryFrom::try_from)
+        .transpose()?;
+    let deprecation_warning = if let Some(streaming) = streaming.clone() {
+        let deprecation_name = Ident::new(
+            &format!("attribute_in_{}", func.sig.ident),
+            streaming.span(),
+        );
+        quote! {
+            mod #deprecation_name {
+                #[deprecated = "'streaming' attribute is being renamed to 'serializing'"]
+                fn streaming() {}
+                fn trigger_deprecation_warning() { streaming() }
+            }
+        }
+    } else {
+        TokenStream::new()
+    };
+    let serializing = streaming
+        .or(serializing)
+        .unwrap_or(syn::LitBool::new(false, Span::call_site()));
+    let streaming: syn::LitBool = attribs
+        .remove("stream")
+        .map(TryFrom::try_from)
+        .transpose()?
+        .unwrap_or(syn::LitBool::new(false, Span::call_site()));
+
+    let mut method_info = MethodInfo {
+        input_schema,
+        return_type,
+        wrapper_ts: TokenStream::new(),
+        default_consts: TokenStream::new(),
+        is_async: func.sig.asyncness.is_some(),
+        flavor: match (serializing.value(), streaming.value()) {
+            (false, false) => MethodFlavor::Normal,
+            (true, false) => MethodFlavor::Serializing,
+            (false, true) => MethodFlavor::Streaming,
+            (true, true) => {
+                error!(serializing => "'stream' and 'serializing' attributes are in conflict");
+                MethodFlavor::Normal
+            }
+        },
+        func,
+    };
 
     let access_setter = match attribs.remove("access") {
         Some(access) => {
@@ -169,8 +244,8 @@ pub fn handle_method(mut attribs: JSONObject, mut func: syn::ItemFn) -> Result<T
         .transpose()?
         .unwrap_or(false);
 
-    let streaming: bool = attribs
-        .remove("streaming")
+    let unstable: bool = attribs
+        .remove("unstable")
         .map(TryFrom::try_from)
         .transpose()?
         .unwrap_or(false);
@@ -183,29 +258,32 @@ pub fn handle_method(mut attribs: JSONObject, mut func: syn::ItemFn) -> Result<T
         );
     }
 
-    let (doc_comment, doc_span) = util::get_doc_comments(&func.attrs)?;
+    let (doc_comment, doc_span) = util::get_doc_comments(&method_info.func.attrs)?;
     util::derive_descriptions(
-        &mut input_schema,
-        return_type.as_mut().and_then(ReturnType::as_mut_schema),
+        &mut method_info.input_schema,
+        method_info
+            .return_type
+            .as_mut()
+            .and_then(ReturnType::as_mut_schema),
         &doc_comment,
         doc_span,
     )?;
 
-    let mut wrapper_ts = TokenStream::new();
-    let mut default_consts = TokenStream::new();
-
-    let is_async = func.sig.asyncness.is_some();
-    let api_func_name = handle_function_signature(
-        &mut input_schema,
-        &mut return_type,
-        &mut func,
-        &mut wrapper_ts,
-        &mut default_consts,
-        streaming,
-    )?;
+    let api_func_name = handle_function_signature(&mut method_info)?;
 
     // input schema is done, let's give the method body a chance to extract default parameters:
-    DefaultParameters(&input_schema).visit_item_fn_mut(&mut func);
+    DefaultParameters(&method_info.input_schema).visit_item_fn_mut(&mut method_info.func);
+
+    let MethodInfo {
+        input_schema,
+        func,
+        wrapper_ts,
+        default_consts,
+        return_type,
+        flavor,
+        is_async,
+        ..
+    } = method_info;
 
     let vis = &func.vis;
     let func_name = &func.sig.ident;
@@ -224,11 +302,25 @@ pub fn handle_method(mut attribs: JSONObject, mut func: syn::ItemFn) -> Result<T
         returns_schema_setter = quote! { .returns(#inner) };
     }
 
-    let api_handler = match (streaming, is_async) {
-        (true, true) => quote! { ::proxmox_router::ApiHandler::StreamingAsync(&#api_func_name) },
-        (true, false) => quote! { ::proxmox_router::ApiHandler::StreamingSync(&#api_func_name) },
-        (false, true) => quote! { ::proxmox_router::ApiHandler::Async(&#api_func_name) },
-        (false, false) => quote! { ::proxmox_router::ApiHandler::Sync(&#api_func_name) },
+    let api_handler = match (flavor, is_async) {
+        (MethodFlavor::Normal, true) => {
+            quote! { ::proxmox_router::ApiHandler::Async(&#api_func_name) }
+        }
+        (MethodFlavor::Normal, false) => {
+            quote! { ::proxmox_router::ApiHandler::Sync(&#api_func_name) }
+        }
+        (MethodFlavor::Serializing, true) => {
+            quote! { ::proxmox_router::ApiHandler::SerializingAsync(&#api_func_name) }
+        }
+        (MethodFlavor::Serializing, false) => {
+            quote! { ::proxmox_router::ApiHandler::SerializingSync(&#api_func_name) }
+        }
+        (MethodFlavor::Streaming, true) => {
+            quote! { ::proxmox_router::ApiHandler::StreamAsync(&#api_func_name) }
+        }
+        (MethodFlavor::Streaming, false) => {
+            quote! { ::proxmox_router::ApiHandler::StreamSync(&#api_func_name) }
+        }
     };
 
     Ok(quote_spanned! { func.sig.span() =>
@@ -242,27 +334,118 @@ pub fn handle_method(mut attribs: JSONObject, mut func: syn::ItemFn) -> Result<T
             #returns_schema_setter
             #access_setter
             .reload_timezone(#reload_timezone)
-            .protected(#protected);
+            .protected(#protected)
+            .unstable(#unstable);
 
         #default_consts
 
         #wrapper_ts
 
         #func
+
+        #deprecation_warning
     })
     //Ok(quote::quote!(#func))
 }
 
-enum ParameterType<'a> {
+enum ParameterType {
     Value,
     ApiMethod,
     RpcEnv,
-    Normal(NormalParameter<'a>),
+    State(StateParameter),
+    Normal(NormalParameter),
 }
 
-struct NormalParameter<'a> {
-    ty: &'a syn::Type,
-    entry: &'a ObjectEntry,
+struct NormalParameter {
+    ty: syn::Type,
+    entry: ObjectEntry,
+}
+
+/// A parameter marked with `#[state]`.
+#[derive(Debug)]
+struct StateParameter {
+    /// The type to look up in the shared state registry.
+    ty: syn::Type,
+
+    /// Whether the parameter is an `Option`, in which case an unavailable value is not an error.
+    optional: bool,
+}
+
+impl StateParameter {
+    /// The registry is keyed by type. `Option<T>` is not the same type as `T` itself, so it
+    /// is removed to get at the type to look up. `Option` parameters
+    /// gets `None` instead of failing if no value of the type is available.
+    fn new(pat_type: &syn::PatType) -> Self {
+        let (ty, optional) = match util::is_option_type(&pat_type.ty) {
+            Some(ty) => (ty, true),
+            None => (&*pat_type.ty, false),
+        };
+
+        if let syn::Type::Reference(r) = ty {
+            error!(r => "'state' parameters cannot be taken by reference");
+        }
+
+        Self {
+            ty: ty.clone(),
+            optional,
+        }
+    }
+}
+
+fn param_attributes_mut(input: &mut syn::FnArg) -> &mut Vec<syn::Attribute> {
+    match input {
+        syn::FnArg::Receiver(receiver) => &mut receiver.attrs,
+        syn::FnArg::Typed(pat_type) => &mut pat_type.attrs,
+    }
+}
+
+fn is_state_attribute(attr: &syn::Attribute) -> bool {
+    attr.style == syn::AttrStyle::Outer && attr.path().is_ident("state")
+}
+
+/// Removes `#[state]` attributes from the function's parameters and returns the
+/// positions of the parameters which had one.
+///
+/// The attribute only has meaning to this macro, so it has to be stripped before the function is
+/// emitted again. Other attributes are preserved.
+fn take_state_attributes(sig: &mut syn::Signature) -> HashSet<usize> {
+    let mut state_param_indices = HashSet::new();
+
+    for (index, input) in sig.inputs.iter_mut().enumerate() {
+        let attrs = param_attributes_mut(input);
+
+        for attr in mem::take(attrs) {
+            if !is_state_attribute(&attr) {
+                attrs.push(attr);
+                continue;
+            }
+
+            if !matches!(attr.meta, syn::Meta::Path(_)) {
+                error!(&attr.meta => "'state' attribute does not take any data");
+            }
+
+            state_param_indices.insert(index);
+        }
+    }
+
+    state_param_indices
+}
+
+/// Removes `#[state]` attributes from a function without any diagnostics.
+///
+/// Used for the copy of the original function which is emitted alongside a fatal error, where the
+/// leftover attributes would only add confusing follow-up errors due to `state` not being in
+/// scope.
+pub(crate) fn strip_state_attributes(item: TokenStream) -> TokenStream {
+    let Ok(mut func) = syn::parse2::<syn::ItemFn>(item.clone()) else {
+        return item;
+    };
+
+    for input in func.sig.inputs.iter_mut() {
+        param_attributes_mut(input).retain(|attr| !is_state_attribute(attr));
+    }
+
+    func.into_token_stream()
 }
 
 fn check_input_type(input: &syn::FnArg) -> Result<(&syn::PatType, &syn::PatIdent), syn::Error> {
@@ -281,16 +464,10 @@ fn check_input_type(input: &syn::FnArg) -> Result<(&syn::PatType, &syn::PatIdent
     Ok((pat_type, pat))
 }
 
-fn handle_function_signature(
-    input_schema: &mut Schema,
-    _return_type: &mut Option<ReturnType>,
-    func: &mut syn::ItemFn,
-    wrapper_ts: &mut TokenStream,
-    default_consts: &mut TokenStream,
-    streaming: bool,
-) -> Result<Ident, Error> {
-    let sig = &func.sig;
-    let is_async = sig.asyncness.is_some();
+fn handle_function_signature(method_info: &mut MethodInfo) -> Result<Ident, Error> {
+    let state_params = take_state_attributes(&mut method_info.func.sig);
+
+    let sig = &method_info.func.sig;
 
     let mut api_method_param = None;
     let mut rpc_env_param = None;
@@ -298,7 +475,11 @@ fn handle_function_signature(
 
     let mut param_list = Vec::<(FieldName, ParameterType)>::new();
 
-    for input in sig.inputs.iter() {
+    for (index, input) in sig.inputs.iter().enumerate() {
+        if state_params.contains(&index) {
+            continue;
+        }
+
         let (pat_type, pat) = match check_input_type(input) {
             Ok(input) => input,
             Err(err) => {
@@ -308,7 +489,10 @@ fn handle_function_signature(
         };
 
         // For any named type which exists on the function signature...
-        if let Some(entry) = input_schema.find_obj_property_by_ident_mut(&pat.ident.to_string()) {
+        if let Some(entry) = method_info
+            .input_schema
+            .find_obj_property_by_ident_mut(&pat.ident.to_string())
+        {
             // try to infer the type in the schema if it is not specified explicitly:
             let is_option = util::infer_type(&mut entry.schema, &pat_type.ty)?;
             let has_default = entry.schema.find_schema_property("default").is_some();
@@ -323,7 +507,7 @@ fn handle_function_signature(
         };
     }
 
-    for input in sig.inputs.iter() {
+    for (index, input) in sig.inputs.iter().enumerate() {
         let (pat_type, pat) = match check_input_type(input) {
             Ok(input) => input,
             Err(_err) => continue, // we already produced errors above,
@@ -334,17 +518,20 @@ fn handle_function_signature(
         // values, and our 2 fixed function parameters: `&ApiMethod` and `&mut dyn RpcEnvironment`.
         //
         // Our strategy is as follows:
-        //     1) See if the parameter name also appears in the input schema. In this case we
+        //     1) See if the parameter was marked with `#[state]`. Such parameters are filled in
+        //        from the environment's shared state registry and are not part of the schema.
+        //
+        //     2) See if the parameter name also appears in the input schema. In this case we
         //        assume that we want the parameter to be extracted from the `Value` and passed
         //        directly to the function.
         //
-        //     2) Check the parameter type for `&ApiMethod` and remember its position (since we may
+        //     3) Check the parameter type for `&ApiMethod` and remember its position (since we may
         //        need to reorder it!)
         //
-        //     3) Check the parameter type for `&dyn RpcEnvironment` and remember its position
+        //     4) Check the parameter type for `&dyn RpcEnvironment` and remember its position
         //        (since we may need to reorder it!).
         //
-        //     4) Check for a `Value` or `serde_json::Value` parameter. This becomes the
+        //     5) Check for a `Value` or `serde_json::Value` parameter. This becomes the
         //        "catch-all" parameter and only 1 may exist.
         //        Note that we may still use further `Value` parameters if they have been
         //        explicitly named in the `input_schema`. However, only 1 unnamed `Value` parameter
@@ -352,104 +539,90 @@ fn handle_function_signature(
         //        If no such parameter exists, we automatically fail the function if the `Value` is
         //        not empty after extracting the parameters.
         //
-        //     5) Finally, if none of the above conditions are met, we do not know what to do and
+        //     6) Finally, if none of the above conditions are met, we do not know what to do and
         //        bail out with an error.
         let pat_ident = pat.ident.unraw();
         let mut param_name: FieldName = pat_ident.clone().into();
-        let param_type =
-            if let Some(entry) = input_schema.find_obj_property_by_ident(&pat_ident.to_string()) {
-                if let SchemaItem::Inferred(span) = &entry.schema.item {
-                    bail!(*span, "failed to infer type");
-                }
-                param_name = entry.name.clone();
-                // Found an explicit parameter: extract it:
-                ParameterType::Normal(NormalParameter {
-                    ty: &pat_type.ty,
-                    entry,
-                })
-            } else if is_api_method_type(&pat_type.ty) {
-                if api_method_param.is_some() {
-                    error!(pat_type => "multiple ApiMethod parameters found");
-                    continue;
-                }
-                api_method_param = Some(param_list.len());
-                ParameterType::ApiMethod
-            } else if is_rpc_env_type(&pat_type.ty) {
-                if rpc_env_param.is_some() {
-                    error!(pat_type => "multiple RpcEnvironment parameters found");
-                    continue;
-                }
-                rpc_env_param = Some(param_list.len());
-                ParameterType::RpcEnv
-            } else if is_value_type(&pat_type.ty) {
-                if value_param.is_some() {
-                    error!(pat_type => "multiple additional Value parameters found");
-                    continue;
-                }
-                value_param = Some(param_list.len());
-                ParameterType::Value
-            } else {
-                error!(&pat_ident => "unexpected parameter {:?}", pat_ident.to_string());
+        let param_type = if state_params.contains(&index) {
+            if method_info
+                .input_schema
+                .find_obj_property_by_ident(&pat_ident.to_string())
+                .is_some()
+            {
+                error!(
+                    pat_type => "'state' parameter '{}' must not appear in the input schema",
+                    pat_ident,
+                );
                 continue;
-            };
+            }
+
+            ParameterType::State(StateParameter::new(pat_type))
+        } else if let Some(entry) = method_info
+            .input_schema
+            .find_obj_property_by_ident(&pat_ident.to_string())
+        {
+            if let SchemaItem::Inferred(span) = &entry.schema.item {
+                bail!(*span, "failed to infer type");
+            }
+            param_name = entry.name.clone();
+            // Found an explicit parameter: extract it:
+            ParameterType::Normal(NormalParameter {
+                ty: (*pat_type.ty).clone(),
+                entry: entry.clone(),
+            })
+        } else if is_api_method_type(&pat_type.ty) {
+            if api_method_param.is_some() {
+                error!(pat_type => "multiple ApiMethod parameters found");
+                continue;
+            }
+            api_method_param = Some(param_list.len());
+            ParameterType::ApiMethod
+        } else if is_rpc_env_type(&pat_type.ty) {
+            if rpc_env_param.is_some() {
+                error!(pat_type => "multiple RpcEnvironment parameters found");
+                continue;
+            }
+            rpc_env_param = Some(param_list.len());
+            ParameterType::RpcEnv
+        } else if is_value_type(&pat_type.ty) {
+            if value_param.is_some() {
+                error!(pat_type => "multiple additional Value parameters found");
+                continue;
+            }
+            value_param = Some(param_list.len());
+            ParameterType::Value
+        } else {
+            error!(&pat_ident => "unexpected parameter {:?}", pat_ident.to_string());
+            continue;
+        };
 
         param_list.push((param_name, param_type));
     }
 
-    /*
-     * Doing this is actually unreliable, since we cannot support aliased Result types, or all
-     * poassible combinations of paths like `result::Result<>` or `std::result::Result<>` or
-     * `ApiResult`.
-
-    // Secondly, take a look at the return type, and then decide what to do:
-    // If our function has the correct signature we may not even need a wrapper.
-    if is_default_return_type(&sig.output)
-        && (
-            param_list.len(),
-            value_param,
-            api_method_param,
-            rpc_env_param,
-        ) == (3, Some(0), Some(1), Some(2))
-    {
-        return Ok(sig.ident.clone());
-    }
-    */
-
-    create_wrapper_function(
-        //input_schema,
-        //return_type,
-        param_list,
-        func,
-        wrapper_ts,
-        default_consts,
-        is_async,
-        streaming,
-    )
+    create_wrapper_function(method_info, param_list)
 }
 
 fn is_api_method_type(ty: &syn::Type) -> bool {
-    if let syn::Type::Reference(r) = ty {
-        if let syn::Type::Path(p) = &*r.elem {
-            if p.qself.is_some() {
-                return false;
-            }
-            if let Some(ps) = p.path.segments.last() {
-                return ps.ident == "ApiMethod";
-            }
+    if let syn::Type::Reference(r) = ty
+        && let syn::Type::Path(p) = &*r.elem
+    {
+        if p.qself.is_some() {
+            return false;
+        }
+        if let Some(ps) = p.path.segments.last() {
+            return ps.ident == "ApiMethod";
         }
     }
     false
 }
 
 fn is_rpc_env_type(ty: &syn::Type) -> bool {
-    if let syn::Type::Reference(r) = ty {
-        if let syn::Type::TraitObject(t) = &*r.elem {
-            if let Some(syn::TypeParamBound::Trait(b)) = t.bounds.first() {
-                if let Some(ps) = b.path.segments.last() {
-                    return ps.ident == "RpcEnvironment";
-                }
-            }
-        }
+    if let syn::Type::Reference(r) = ty
+        && let syn::Type::TraitObject(t) = &*r.elem
+        && let Some(syn::TypeParamBound::Trait(b)) = t.bounds.first()
+        && let Some(ps) = b.path.segments.last()
+    {
+        return ps.ident == "RpcEnvironment";
     }
     false
 }
@@ -465,7 +638,7 @@ fn is_value_type(ty: &syn::Type) -> bool {
             1 => return segs.last().unwrap().ident == "Value",
             2 => {
                 return segs.first().unwrap().ident == "serde_json"
-                    && segs.last().unwrap().ident == "Value"
+                    && segs.last().unwrap().ident == "Value";
             }
             _ => return false,
         }
@@ -474,24 +647,18 @@ fn is_value_type(ty: &syn::Type) -> bool {
 }
 
 fn create_wrapper_function(
-    //_input_schema: &Schema,
-    //_returns_schema: &Option<ReturnType>,
+    method_info: &mut MethodInfo,
     param_list: Vec<(FieldName, ParameterType)>,
-    func: &syn::ItemFn,
-    wrapper_ts: &mut TokenStream,
-    default_consts: &mut TokenStream,
-    is_async: bool,
-    streaming: bool,
 ) -> Result<Ident, Error> {
     let api_func_name = Ident::new(
-        &format!("api_function_{}", &func.sig.ident),
-        func.sig.ident.span(),
+        &format!("api_function_{}", &method_info.func.sig.ident),
+        method_info.func.sig.ident.span(),
     );
 
     let mut body = TokenStream::new();
     let mut args = TokenStream::new();
 
-    let func_uc = func.sig.ident.to_string().to_uppercase();
+    let func_uc = method_info.func.sig.ident.to_string().to_uppercase();
 
     for (name, param) in param_list {
         let span = name.span();
@@ -507,69 +674,74 @@ fn create_wrapper_function(
                     &func_uc,
                     name,
                     span,
-                    default_consts,
+                    &mut method_info.default_consts,
                 )?;
+            }
+            ParameterType::State(param) => {
+                extract_state_parameter(param, &mut body, &mut args, name, span)?;
             }
         }
     }
 
     // build the wrapping function:
-    let func_name = &func.sig.ident;
+    let func_name = &method_info.func.sig.ident;
 
-    let await_keyword = if is_async { Some(quote!(.await)) } else { None };
+    let await_keyword = if method_info.is_async {
+        Some(quote!(.await))
+    } else {
+        None
+    };
 
-    let question_mark = match func.sig.output {
+    let question_mark = match method_info.func.sig.output {
         syn::ReturnType::Default => None,
         _ => Some(quote!(?)),
     };
 
-    let body = if streaming {
-        quote! {
-            if let ::serde_json::Value::Object(ref mut input_map) = &mut input_params {
-                #body
-                let res = #func_name(#args) #await_keyword #question_mark;
-                let res: ::std::boxed::Box<dyn ::proxmox_router::SerializableReturn + Send> = ::std::boxed::Box::new(res);
-                Ok(res)
-            } else {
-                ::anyhow::bail!("api function wrapper called with a non-object json value");
+    let body = match method_info.flavor {
+        MethodFlavor::Normal => {
+            quote! {
+                if let ::serde_json::Value::Object(input_map) = &mut input_params {
+                    #body
+                    Ok(::serde_json::to_value(#func_name(#args) #await_keyword #question_mark)?)
+                } else {
+                    ::anyhow::bail!("api function wrapper called with a non-object json value");
+                }
             }
         }
-    } else {
-        quote! {
-            if let ::serde_json::Value::Object(ref mut input_map) = &mut input_params {
-                #body
-                Ok(::serde_json::to_value(#func_name(#args) #await_keyword #question_mark)?)
+        MethodFlavor::Serializing => {
+            quote! {
+                if let ::serde_json::Value::Object(input_map) = &mut input_params {
+                    #body
+                    let res = #func_name(#args) #await_keyword #question_mark;
+                    let res: ::std::boxed::Box<dyn ::proxmox_router::SerializableReturn + Send> = ::std::boxed::Box::new(res);
+                    Ok(res)
+                } else {
+                    ::anyhow::bail!("api function wrapper called with a non-object json value");
+                }
+            }
+        }
+        MethodFlavor::Streaming => {
+            let ty = if method_info.is_async {
+                quote! { ::proxmox_router::Stream }
             } else {
-                ::anyhow::bail!("api function wrapper called with a non-object json value");
+                quote! { ::proxmox_router::SyncStream }
+            };
+            quote! {
+                if let ::serde_json::Value::Object(input_map) = &mut input_params {
+                    #body
+                    let res = #func_name(#args) #await_keyword #question_mark;
+                    let res = #ty::from(res);
+                    Ok(res)
+                } else {
+                    ::anyhow::bail!("api function wrapper called with a non-object json value");
+                }
             }
         }
     };
 
-    match (streaming, is_async) {
-        (true, true) => {
-            wrapper_ts.extend(quote! {
-                fn #api_func_name<'a>(
-                    mut input_params: ::serde_json::Value,
-                    api_method_param: &'static ::proxmox_router::ApiMethod,
-                    rpc_env_param: &'a mut dyn ::proxmox_router::RpcEnvironment,
-                ) -> ::proxmox_router::StreamingApiFuture<'a> {
-                    ::std::boxed::Box::pin(async move { #body })
-                }
-            });
-        }
-        (true, false) => {
-            wrapper_ts.extend(quote! {
-                fn #api_func_name(
-                    mut input_params: ::serde_json::Value,
-                    api_method_param: &::proxmox_router::ApiMethod,
-                    rpc_env_param: &mut dyn ::proxmox_router::RpcEnvironment,
-                ) -> ::std::result::Result<::std::boxed::Box<dyn ::proxmox_router::SerializableReturn + Send>, ::anyhow::Error> {
-                    #body
-                }
-            });
-        }
-        (false, true) => {
-            wrapper_ts.extend(quote! {
+    match (method_info.flavor, method_info.is_async) {
+        (MethodFlavor::Normal, true) => {
+            method_info.wrapper_ts.extend(quote! {
                 fn #api_func_name<'a>(
                     mut input_params: ::serde_json::Value,
                     api_method_param: &'static ::proxmox_router::ApiMethod,
@@ -589,13 +761,57 @@ fn create_wrapper_function(
                 }
             });
         }
-        (false, false) => {
-            wrapper_ts.extend(quote! {
+        (MethodFlavor::Normal, false) => {
+            method_info.wrapper_ts.extend(quote! {
                 fn #api_func_name(
                     mut input_params: ::serde_json::Value,
                     api_method_param: &::proxmox_router::ApiMethod,
                     rpc_env_param: &mut dyn ::proxmox_router::RpcEnvironment,
                 ) -> ::std::result::Result<::serde_json::Value, ::anyhow::Error> {
+                    #body
+                }
+            });
+        }
+        (MethodFlavor::Serializing, true) => {
+            method_info.wrapper_ts.extend(quote! {
+                fn #api_func_name<'a>(
+                    mut input_params: ::serde_json::Value,
+                    api_method_param: &'static ::proxmox_router::ApiMethod,
+                    rpc_env_param: &'a mut dyn ::proxmox_router::RpcEnvironment,
+                ) -> ::proxmox_router::SerializingApiFuture<'a> {
+                    ::std::boxed::Box::pin(async move { #body })
+                }
+            });
+        }
+        (MethodFlavor::Serializing, false) => {
+            method_info.wrapper_ts.extend(quote! {
+                fn #api_func_name(
+                    mut input_params: ::serde_json::Value,
+                    api_method_param: &::proxmox_router::ApiMethod,
+                    rpc_env_param: &mut dyn ::proxmox_router::RpcEnvironment,
+                ) -> ::std::result::Result<::std::boxed::Box<dyn ::proxmox_router::SerializableReturn + Send>, ::anyhow::Error> {
+                    #body
+                }
+            });
+        }
+        (MethodFlavor::Streaming, true) => {
+            method_info.wrapper_ts.extend(quote! {
+                fn #api_func_name<'a>(
+                    mut input_params: ::serde_json::Value,
+                    api_method_param: &'static ::proxmox_router::ApiMethod,
+                    rpc_env_param: &'a mut dyn ::proxmox_router::RpcEnvironment,
+                ) -> ::proxmox_router::StreamApiFuture<'a> {
+                    ::std::boxed::Box::pin(async move { #body })
+                }
+            });
+        }
+        (MethodFlavor::Streaming, false) => {
+            method_info.wrapper_ts.extend(quote! {
+                fn #api_func_name(
+                    mut input_params: ::serde_json::Value,
+                    api_method_param: &::proxmox_router::ApiMethod,
+                    rpc_env_param: &mut dyn ::proxmox_router::RpcEnvironment,
+                ) -> ::std::result::Result<::proxmox_router::SyncStream, ::anyhow::Error> {
                     #body
                 }
             });
@@ -648,18 +864,19 @@ fn extract_normal_parameter(
                 });
             }
 
-            let no_option_type = util::is_option_type(param.ty).is_none();
+            let no_option_type = util::is_option_type(&param.ty).is_none();
 
             if let Some(def) = &default_value {
                 let name_uc = name.as_ident().to_string().to_uppercase();
                 let name = Ident::new(
-                    &format!("API_METHOD_{}_PARAM_DEFAULT_{}", func_uc, name_uc),
+                    &format!("API_METHOD_{func_uc}_PARAM_DEFAULT_{name_uc}"),
                     span,
                 );
 
                 // strip possible Option<> from this type:
-                let ty = util::is_option_type(param.ty).unwrap_or(param.ty);
+                let ty = util::is_option_type(&param.ty).unwrap_or(&param.ty);
                 default_consts.extend(quote_spanned! { span =>
+                    #[allow(dead_code)]
                     pub const #name: #ty = #def;
                 });
 
@@ -683,7 +900,7 @@ fn extract_normal_parameter(
             body.extend(quote_spanned! { span => ; });
         }
         Some(flatten_span) => {
-            // Flattened parameter, we need ot use our special partial-object deserializer.
+            // Flattened parameter, we need to use our special partial-object deserializer.
             // Also note that we do not support simply nesting schemas. We need a referenced type.
             // Otherwise the expanded code here gets ugly and we'd need to make sure we pull out
             // nested schemas into named variables first... No thanks.
@@ -718,6 +935,51 @@ fn extract_normal_parameter(
             }
         }
     }
+
+    args.extend(quote_spanned! { span => #arg_name, });
+
+    Ok(())
+}
+
+fn extract_state_parameter(
+    param: StateParameter,
+    body: &mut TokenStream,
+    args: &mut TokenStream,
+    name: FieldName,
+    span: Span,
+) -> Result<(), Error> {
+    let name_str = syn::LitStr::new(name.as_str(), span);
+    let arg_name = Ident::new(&format!("state_arg_{}", name.as_ident()), span);
+    let ty = param.ty;
+
+    let lookup = if param.optional {
+        // an unavailable value is not an error here, which includes an environment without any
+        // registry at all.
+        quote_spanned! { span =>
+            let #arg_name = rpc_env_param
+                .shared_state()
+                .and_then(|shared_state| shared_state.lookup::<#ty>());
+        }
+    } else {
+        quote_spanned! { span =>
+            let #arg_name = rpc_env_param
+                .shared_state()
+                .ok_or_else(|| ::anyhow::format_err!(
+                    "router has no shared state set up",
+                ))?
+                .lookup::<#ty>()
+                .ok_or_else(|| ::anyhow::format_err!(
+                    "shared state type '{}' for parameter '{}' not registered",
+                    ::std::any::type_name::<#ty>(),
+                    #name_str,
+                ))?;
+        }
+    };
+
+    body.extend(quote_spanned! { span =>
+        #[allow(non_snake_case)]
+        #lookup
+    });
 
     args.extend(quote_spanned! { span => #arg_name, });
 
@@ -837,18 +1099,18 @@ fn serialize_input_schema(
 
 struct DefaultParameters<'a>(&'a Schema);
 
-impl<'a> VisitMut for DefaultParameters<'a> {
+impl VisitMut for DefaultParameters<'_> {
     fn visit_expr_mut(&mut self, i: &mut syn::Expr) {
-        if let syn::Expr::Macro(exprmac) = i {
-            if exprmac.mac.path.is_ident("api_get_default") {
-                // replace api_get_default macros with the actual default found in the #[api]
-                // macro.
-                match self.get_default(mem::take(&mut exprmac.mac.tokens)) {
-                    Ok(expr) => *i = expr,
-                    Err(err) => {
-                        *i = syn::Expr::Verbatim(err.to_compile_error());
-                        return;
-                    }
+        if let syn::Expr::Macro(exprmac) = i
+            && exprmac.mac.path.is_ident("api_get_default")
+        {
+            // replace api_get_default macros with the actual default found in the #[api]
+            // macro.
+            match self.get_default(mem::take(&mut exprmac.mac.tokens)) {
+                Ok(expr) => *i = expr,
+                Err(err) => {
+                    *i = syn::Expr::Verbatim(err.to_compile_error());
+                    return;
                 }
             }
         }
@@ -857,7 +1119,7 @@ impl<'a> VisitMut for DefaultParameters<'a> {
     }
 }
 
-impl<'a> DefaultParameters<'a> {
+impl DefaultParameters<'_> {
     fn get_default(&self, param_tokens: TokenStream) -> Result<syn::Expr, syn::Error> {
         let param_name: syn::LitStr = syn::parse2(param_tokens)?;
         match self.0.find_obj_property_by_ident(&param_name.value()) {

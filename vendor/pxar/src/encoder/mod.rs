@@ -4,6 +4,7 @@
 
 #![deny(missing_docs)]
 
+use std::future::poll_fn;
 use std::io;
 use std::mem::{forget, size_of, size_of_val, take};
 use std::os::unix::ffi::OsStrExt;
@@ -16,9 +17,8 @@ use endian_trait::Endian;
 
 use crate::binary_tree_array;
 use crate::decoder::{self, SeqRead};
-use crate::format::{self, GoodbyeItem};
-use crate::poll_fn::poll_fn;
-use crate::Metadata;
+use crate::format::{self, FormatVersion, GoodbyeItem, PayloadRef};
+use crate::{Metadata, PxarVariant};
 
 pub mod aio;
 pub mod sync;
@@ -35,6 +35,24 @@ impl LinkOffset {
     #[inline]
     pub fn raw(self) -> u64 {
         self.0
+    }
+}
+
+/// File reference used to create payload references.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd)]
+pub struct PayloadOffset(u64);
+
+impl PayloadOffset {
+    /// Get the raw byte offset of this link.
+    #[inline]
+    pub fn raw(self) -> u64 {
+        self.0
+    }
+
+    /// Return a new PayloadOffset, positively shifted by offset
+    #[inline]
+    pub fn add(&self, offset: u64) -> Self {
+        Self(self.0 + offset)
     }
 }
 
@@ -166,7 +184,7 @@ where
     seq_write_all(output, &[0u8], position).await
 }
 
-/// Write a pxar entry consiting of an endian-swappable struct.
+/// Write a pxar entry consisting of an endian-swappable struct.
 async fn seq_write_pxar_struct_entry<E, T>(
     output: &mut T,
     htype: u64,
@@ -186,10 +204,10 @@ where
 /// Error conditions caused by wrong usage of this crate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EncodeError {
-    /// The user dropped a `File` without without finishing writing all of its contents.
+    /// The user dropped a `File` without finishing writing all of its contents.
     ///
-    /// This is required because the payload lengths is written out at the begining and decoding
-    /// requires there to follow the right amount of data.
+    /// Completely writing the contents is required because the payload length is written out first
+    /// and decoding requires the the encoded length and the following data to match.
     IncompleteFile,
 
     /// The user dropped a directory without finalizing it.
@@ -221,9 +239,68 @@ struct EncoderState {
 
     /// We need to keep track how much we have written to get offsets.
     write_position: u64,
+
+    /// Track the bytes written to the payload writer
+    payload_write_position: u64,
+
+    /// Previously generated payload offset.
+    previous_payload_offset: Option<PayloadOffset>,
+
+    /// Mark the encoder state as correctly finished, ready to be dropped
+    finished: bool,
 }
 
 impl EncoderState {
+    #[inline]
+    fn position(&self) -> u64 {
+        self.write_position
+    }
+
+    #[inline]
+    fn payload_position(&self) -> u64 {
+        self.payload_write_position
+    }
+
+    #[inline]
+    fn previous_payload_offset(&self) -> Option<PayloadOffset> {
+        self.previous_payload_offset
+    }
+
+    /// Generate a [`PayloadRef`] from the given payload offset and file size.
+    ///
+    /// Checks if the provided payload offset is greater than the current payload writer position
+    /// and larger than the previously checked payload offset. Both are required for the sequential
+    /// decoder to be able to restore contents.
+    fn payload_ref_from(
+        &mut self,
+        payload_offset: PayloadOffset,
+        size: u64,
+    ) -> io::Result<PayloadRef> {
+        let payload_position = self.payload_position();
+        if payload_offset.raw() < payload_position {
+            io_bail!(
+                "offset smaller than current position: {} < {payload_position}",
+                payload_offset.raw()
+            );
+        }
+
+        if let Some(previous_payload_offset) = self.previous_payload_offset()
+            && payload_offset <= previous_payload_offset
+        {
+            io_bail!(
+                "unexpected payload offset {} not larger than previous offset {}",
+                payload_offset.raw(),
+                previous_payload_offset.raw(),
+            );
+        }
+        self.previous_payload_offset = Some(payload_offset);
+
+        Ok(PayloadRef {
+            offset: payload_offset.raw(),
+            size,
+        })
+    }
+
     fn merge_error(&mut self, error: Option<EncodeError>) {
         // one error is enough:
         if self.encode_error.is_none() {
@@ -234,6 +311,23 @@ impl EncoderState {
     fn add_error(&mut self, error: EncodeError) {
         self.merge_error(Some(error));
     }
+
+    fn finish(&mut self) -> Option<EncodeError> {
+        self.finished = true;
+        self.encode_error.take()
+    }
+}
+
+impl Drop for EncoderState {
+    fn drop(&mut self) {
+        if !self.finished {
+            eprintln!("unfinished encoder state dropped");
+        }
+
+        if self.encode_error.is_some() {
+            eprintln!("finished encoder state with errors");
+        }
+    }
 }
 
 pub(crate) enum EncoderOutput<'a, T> {
@@ -241,17 +335,7 @@ pub(crate) enum EncoderOutput<'a, T> {
     Borrowed(&'a mut T),
 }
 
-impl<'a, T> EncoderOutput<'a, T> {
-    #[inline]
-    fn to_borrowed_mut<'s>(&'s mut self) -> EncoderOutput<'s, T>
-    where
-        'a: 's,
-    {
-        EncoderOutput::Borrowed(self.as_mut())
-    }
-}
-
-impl<'a, T> std::convert::AsMut<T> for EncoderOutput<'a, T> {
+impl<T> std::convert::AsMut<T> for EncoderOutput<'_, T> {
     fn as_mut(&mut self) -> &mut T {
         match self {
             EncoderOutput::Owned(o) => o,
@@ -260,7 +344,7 @@ impl<'a, T> std::convert::AsMut<T> for EncoderOutput<'a, T> {
     }
 }
 
-impl<'a, T> std::convert::From<T> for EncoderOutput<'a, T> {
+impl<T> std::convert::From<T> for EncoderOutput<'_, T> {
     fn from(t: T) -> Self {
         EncoderOutput::Owned(t)
     }
@@ -277,61 +361,109 @@ impl<'a, T> std::convert::From<&'a mut T> for EncoderOutput<'a, T> {
 /// We use `async fn` to implement the encoder state machine so that we can easily plug in both
 /// synchronous or `async` I/O objects in as output.
 pub(crate) struct EncoderImpl<'a, T: SeqWrite + 'a> {
-    output: EncoderOutput<'a, T>,
-    state: EncoderState,
-    parent: Option<&'a mut EncoderState>,
+    output: PxarVariant<EncoderOutput<'a, T>, T>,
+    /// EncoderState stack storing the state for each directory level
+    state: Vec<EncoderState>,
     finished: bool,
 
     /// Since only the "current" entry can be actively writing files, we share the file copy
     /// buffer.
     file_copy_buffer: Arc<Mutex<Vec<u8>>>,
+    /// Pxar format version to encode
+    version: format::FormatVersion,
 }
 
 impl<'a, T: SeqWrite + 'a> Drop for EncoderImpl<'a, T> {
     fn drop(&mut self) {
-        if let Some(ref mut parent) = self.parent {
-            // propagate errors:
-            parent.merge_error(self.state.encode_error);
-            if !self.finished {
-                parent.add_error(EncodeError::IncompleteDirectory);
-            }
-        } else if !self.finished {
-            // FIXME: how do we deal with this?
-            // eprintln!("Encoder dropped without finishing!");
+        if !self.finished {
+            eprintln!("unclosed encoder dropped");
+        }
+
+        if !self.state.is_empty() {
+            eprintln!("closed encoder dropped with state");
         }
     }
 }
 
 impl<'a, T: SeqWrite + 'a> EncoderImpl<'a, T> {
     pub async fn new(
-        output: EncoderOutput<'a, T>,
+        mut output: PxarVariant<EncoderOutput<'a, T>, T>,
         metadata: &Metadata,
+        prelude: Option<&[u8]>,
     ) -> io::Result<EncoderImpl<'a, T>> {
         if !metadata.is_dir() {
             io_bail!("directory metadata must contain the directory mode flag");
         }
+
+        let mut state = EncoderState::default();
+        let version = if let Some(payload_output) = output.payload_mut() {
+            let header = format::Header::with_content_size(format::PXAR_PAYLOAD_START_MARKER, 0);
+            header.check_header_size()?;
+            seq_write_struct(payload_output, header, &mut state.payload_write_position).await?;
+            format::FormatVersion::Version2
+        } else {
+            format::FormatVersion::Version1
+        };
+
         let mut this = Self {
             output,
-            state: EncoderState::default(),
-            parent: None,
+            state: vec![state],
             finished: false,
             file_copy_buffer: Arc::new(Mutex::new(unsafe {
                 crate::util::vec_new_uninitialized(1024 * 1024)
             })),
+            version,
         };
 
+        this.encode_format_version().await?;
+        if let Some(prelude) = prelude {
+            this.encode_prelude(prelude).await?;
+        }
         this.encode_metadata(metadata).await?;
-        this.state.files_offset = this.position();
+        let state = this.state_mut()?;
+        state.files_offset = state.position();
 
         Ok(this)
     }
 
     fn check(&self) -> io::Result<()> {
-        match self.state.encode_error {
+        if self.finished {
+            io_bail!("unexpected encoder finished state");
+        }
+        let state = self.state()?;
+        match state.encode_error {
             Some(EncodeError::IncompleteFile) => io_bail!("incomplete file"),
             Some(EncodeError::IncompleteDirectory) => io_bail!("directory not finalized"),
             None => Ok(()),
         }
+    }
+
+    fn state(&self) -> io::Result<&EncoderState> {
+        self.state
+            .last()
+            .ok_or_else(|| io_format_err!("encoder state stack underflow"))
+    }
+
+    fn state_mut(&mut self) -> io::Result<&mut EncoderState> {
+        self.state
+            .last_mut()
+            .ok_or_else(|| io_format_err!("encoder state stack underflow"))
+    }
+
+    fn output_state(&mut self) -> io::Result<(PxarVariant<&mut T, &mut T>, &mut EncoderState)> {
+        let output = match &mut self.output {
+            PxarVariant::Unified(output) => PxarVariant::Unified(output.as_mut()),
+            PxarVariant::Split(output, payload_output) => {
+                PxarVariant::Split(output.as_mut(), payload_output)
+            }
+        };
+
+        Ok((
+            output,
+            self.state
+                .last_mut()
+                .ok_or_else(|| io_format_err!("encoder state stack underflow"))?,
+        ))
     }
 
     pub async fn create_file<'b>(
@@ -358,27 +490,46 @@ impl<'a, T: SeqWrite + 'a> EncoderImpl<'a, T> {
     {
         self.check()?;
 
-        let file_offset = self.position();
+        let file_offset = self.state()?.position();
         self.start_file_do(Some(metadata), file_name).await?;
 
-        let header = format::Header::with_content_size(format::PXAR_PAYLOAD, file_size);
-        header.check_header_size()?;
+        let (mut output, state) = self.output_state()?;
+        if let Some(payload_output) = output.payload_mut() {
+            // payload references must point to the position prior to the payload header,
+            // separating payload entries in the payload stream
+            let payload_position = PayloadOffset(state.payload_position());
+            let payload_ref = state.payload_ref_from(payload_position, file_size)?;
 
-        seq_write_struct(self.output.as_mut(), header, &mut self.state.write_position).await?;
+            let header = format::Header::with_content_size(format::PXAR_PAYLOAD, file_size);
+            header.check_header_size()?;
+            seq_write_struct(payload_output, header, &mut state.payload_write_position).await?;
 
-        let payload_data_offset = self.position();
+            seq_write_pxar_entry(
+                output.archive_mut(),
+                format::PXAR_PAYLOAD_REF,
+                &payload_ref.data(),
+                &mut state.write_position,
+            )
+            .await?;
+        } else {
+            let header = format::Header::with_content_size(format::PXAR_PAYLOAD, file_size);
+            header.check_header_size()?;
+            seq_write_struct(output.archive_mut(), header, &mut state.write_position).await?;
+        }
+
+        let payload_data_offset = state.position();
 
         let meta_size = payload_data_offset - file_offset;
 
         Ok(FileImpl {
-            output: self.output.as_mut(),
+            output,
             goodbye_item: GoodbyeItem {
                 hash: format::hash_filename(file_name),
                 offset: file_offset,
                 size: file_size + meta_size,
             },
             remaining_size: file_size,
-            parent: &mut self.state,
+            parent: state,
         })
     }
 
@@ -431,6 +582,49 @@ impl<'a, T: SeqWrite + 'a> EncoderImpl<'a, T> {
         Ok(offset)
     }
 
+    pub fn payload_position(&self) -> io::Result<PayloadOffset> {
+        Ok(PayloadOffset(self.state()?.payload_position()))
+    }
+
+    /// Encode a payload reference pointing to given offset in the separate payload output
+    ///
+    /// Returns a file offset usable with `add_hardlink` or with error if the encoder instance has
+    /// no separate payload output or encoding failed.
+    pub async fn add_payload_ref(
+        &mut self,
+        metadata: &Metadata,
+        file_name: &Path,
+        file_size: u64,
+        payload_offset: PayloadOffset,
+    ) -> io::Result<LinkOffset> {
+        if self.version == FormatVersion::Version1 {
+            io_bail!("payload references not supported in format version 1");
+        }
+
+        if self.output.payload().is_none() {
+            io_bail!("unable to add payload reference");
+        }
+
+        let payload_ref = self
+            .state_mut()?
+            .payload_ref_from(payload_offset, file_size)?;
+        let this_offset: LinkOffset = self
+            .add_file_entry(
+                Some(metadata),
+                file_name,
+                Some((format::PXAR_PAYLOAD_REF, &payload_ref.data())),
+            )
+            .await?;
+
+        Ok(this_offset)
+    }
+
+    /// Add size to payload stream
+    pub fn advance(&mut self, size: PayloadOffset) -> io::Result<()> {
+        self.state_mut()?.payload_write_position += size.raw();
+        Ok(())
+    }
+
     /// Return a file offset usable with `add_hardlink`.
     pub async fn add_symlink(
         &mut self,
@@ -459,7 +653,7 @@ impl<'a, T: SeqWrite + 'a> EncoderImpl<'a, T> {
         target: &Path,
         target_offset: LinkOffset,
     ) -> io::Result<()> {
-        let current_offset = self.position();
+        let current_offset = self.state()?.position();
         if current_offset <= target_offset.0 {
             io_bail!("invalid hardlink offset, can only point to prior files");
         }
@@ -533,24 +727,26 @@ impl<'a, T: SeqWrite + 'a> EncoderImpl<'a, T> {
     ) -> io::Result<LinkOffset> {
         self.check()?;
 
-        let file_offset = self.position();
+        let file_offset = self.state()?.position();
 
         let file_name = file_name.as_os_str().as_bytes();
 
         self.start_file_do(metadata, file_name).await?;
+
+        let (mut output, state) = self.output_state()?;
         if let Some((htype, entry_data)) = entry_htype_data {
             seq_write_pxar_entry(
-                self.output.as_mut(),
+                output.archive_mut(),
                 htype,
                 entry_data,
-                &mut self.state.write_position,
+                &mut state.write_position,
             )
             .await?;
         }
 
-        let end_offset = self.position();
+        let end_offset = state.position();
 
-        self.state.items.push(GoodbyeItem {
+        state.items.push(GoodbyeItem {
             hash: format::hash_filename(file_name),
             offset: file_offset,
             size: end_offset - file_offset,
@@ -559,16 +755,11 @@ impl<'a, T: SeqWrite + 'a> EncoderImpl<'a, T> {
         Ok(LinkOffset(file_offset))
     }
 
-    #[inline]
-    fn position(&mut self) -> u64 {
-        self.state.write_position
-    }
-
     pub async fn create_directory(
         &mut self,
         file_name: &Path,
         metadata: &Metadata,
-    ) -> io::Result<EncoderImpl<'_, T>> {
+    ) -> io::Result<()> {
         self.check()?;
 
         if !metadata.is_dir() {
@@ -578,34 +769,34 @@ impl<'a, T: SeqWrite + 'a> EncoderImpl<'a, T> {
         let file_name = file_name.as_os_str().as_bytes();
         let file_hash = format::hash_filename(file_name);
 
-        let file_offset = self.position();
+        let file_offset = self.state()?.position();
         self.encode_filename(file_name).await?;
 
-        let entry_offset = self.position();
+        let entry_offset = self.state()?.position();
         self.encode_metadata(metadata).await?;
 
-        let files_offset = self.position();
+        let state = self.state_mut()?;
+        let files_offset = state.position();
 
         // the child will write to OUR state now:
-        let write_position = self.position();
+        let write_position = state.position();
+        let payload_write_position = state.payload_position();
+        let previous_payload_offset = state.previous_payload_offset();
 
-        let file_copy_buffer = Arc::clone(&self.file_copy_buffer);
-
-        Ok(EncoderImpl {
-            // always forward as Borrowed(), to avoid stacking references on nested calls
-            output: self.output.to_borrowed_mut(),
-            state: EncoderState {
-                entry_offset,
-                files_offset,
-                file_offset: Some(file_offset),
-                file_hash,
-                write_position,
-                ..Default::default()
-            },
-            parent: Some(&mut self.state),
+        self.state.push(EncoderState {
+            items: Vec::new(),
+            encode_error: None,
+            entry_offset,
+            files_offset,
+            file_offset: Some(file_offset),
+            file_hash,
+            write_position,
+            payload_write_position,
+            previous_payload_offset,
             finished: false,
-            file_copy_buffer,
-        })
+        });
+
+        Ok(())
     }
 
     async fn start_file_do(
@@ -620,12 +811,54 @@ impl<'a, T: SeqWrite + 'a> EncoderImpl<'a, T> {
         Ok(())
     }
 
+    async fn encode_prelude(&mut self, prelude: &[u8]) -> io::Result<()> {
+        if self.version == FormatVersion::Version1 {
+            io_bail!("encoding prelude not supported in format version 1");
+        }
+
+        let (mut output, state) = self.output_state()?;
+        if state.write_position != (size_of::<u64>() + size_of::<format::Header>()) as u64 {
+            io_bail!(
+                "prelude must be encoded following the version header, current position {}",
+                state.write_position,
+            );
+        }
+
+        seq_write_pxar_entry(
+            output.archive_mut(),
+            format::PXAR_PRELUDE,
+            prelude,
+            &mut state.write_position,
+        )
+        .await
+    }
+
+    async fn encode_format_version(&mut self) -> io::Result<()> {
+        if let Some(version_bytes) = self.version.serialize() {
+            let (mut output, state) = self.output_state()?;
+            if state.write_position != 0 {
+                io_bail!("format version must be encoded at the beginning of an archive");
+            }
+
+            return seq_write_pxar_entry(
+                output.archive_mut(),
+                format::PXAR_FORMAT_VERSION,
+                &version_bytes,
+                &mut state.write_position,
+            )
+            .await;
+        }
+
+        Ok(())
+    }
+
     async fn encode_metadata(&mut self, metadata: &Metadata) -> io::Result<()> {
+        let (mut output, state) = self.output_state()?;
         seq_write_pxar_struct_entry(
-            self.output.as_mut(),
+            output.archive_mut(),
             format::PXAR_ENTRY,
             metadata.stat.clone(),
-            &mut self.state.write_position,
+            &mut state.write_position,
         )
         .await?;
 
@@ -647,72 +880,74 @@ impl<'a, T: SeqWrite + 'a> EncoderImpl<'a, T> {
     }
 
     async fn write_xattr(&mut self, xattr: &format::XAttr) -> io::Result<()> {
+        let (mut output, state) = self.output_state()?;
         seq_write_pxar_entry(
-            self.output.as_mut(),
+            output.archive_mut(),
             format::PXAR_XATTR,
             &xattr.data,
-            &mut self.state.write_position,
+            &mut state.write_position,
         )
         .await
     }
 
     async fn write_acls(&mut self, acl: &crate::Acl) -> io::Result<()> {
+        let (mut output, state) = self.output_state()?;
         for acl in &acl.users {
             seq_write_pxar_struct_entry(
-                self.output.as_mut(),
+                output.archive_mut(),
                 format::PXAR_ACL_USER,
                 acl.clone(),
-                &mut self.state.write_position,
+                &mut state.write_position,
             )
             .await?;
         }
 
         for acl in &acl.groups {
             seq_write_pxar_struct_entry(
-                self.output.as_mut(),
+                output.archive_mut(),
                 format::PXAR_ACL_GROUP,
                 acl.clone(),
-                &mut self.state.write_position,
+                &mut state.write_position,
             )
             .await?;
         }
 
         if let Some(acl) = &acl.group_obj {
             seq_write_pxar_struct_entry(
-                self.output.as_mut(),
+                output.archive_mut(),
                 format::PXAR_ACL_GROUP_OBJ,
                 acl.clone(),
-                &mut self.state.write_position,
+                &mut state.write_position,
             )
             .await?;
         }
 
         if let Some(acl) = &acl.default {
             seq_write_pxar_struct_entry(
-                self.output.as_mut(),
+                output.archive_mut(),
                 format::PXAR_ACL_DEFAULT,
                 acl.clone(),
-                &mut self.state.write_position,
+                &mut state.write_position,
             )
             .await?;
         }
 
         for acl in &acl.default_users {
             seq_write_pxar_struct_entry(
-                self.output.as_mut(),
+                output.archive_mut(),
                 format::PXAR_ACL_DEFAULT_USER,
                 acl.clone(),
-                &mut self.state.write_position,
+                &mut state.write_position,
             )
             .await?;
         }
 
         for acl in &acl.default_groups {
             seq_write_pxar_struct_entry(
-                self.output.as_mut(),
+                output.archive_mut(),
                 format::PXAR_ACL_DEFAULT_GROUP,
                 acl.clone(),
-                &mut self.state.write_position,
+                &mut state.write_position,
             )
             .await?;
         }
@@ -721,11 +956,12 @@ impl<'a, T: SeqWrite + 'a> EncoderImpl<'a, T> {
     }
 
     async fn write_file_capabilities(&mut self, fcaps: &format::FCaps) -> io::Result<()> {
+        let (mut output, state) = self.output_state()?;
         seq_write_pxar_entry(
-            self.output.as_mut(),
+            output.archive_mut(),
             format::PXAR_FCAPS,
             &fcaps.data,
-            &mut self.state.write_position,
+            &mut state.write_position,
         )
         .await
     }
@@ -734,66 +970,103 @@ impl<'a, T: SeqWrite + 'a> EncoderImpl<'a, T> {
         &mut self,
         quota_project_id: &format::QuotaProjectId,
     ) -> io::Result<()> {
+        let (mut output, state) = self.output_state()?;
         seq_write_pxar_struct_entry(
-            self.output.as_mut(),
+            output.archive_mut(),
             format::PXAR_QUOTA_PROJID,
             *quota_project_id,
-            &mut self.state.write_position,
+            &mut state.write_position,
         )
         .await
     }
 
     async fn encode_filename(&mut self, file_name: &[u8]) -> io::Result<()> {
         crate::util::validate_filename(file_name)?;
+        let (mut output, state) = self.output_state()?;
         seq_write_pxar_entry_zero(
-            self.output.as_mut(),
+            output.archive_mut(),
             format::PXAR_FILENAME,
             file_name,
-            &mut self.state.write_position,
+            &mut state.write_position,
         )
         .await
     }
 
-    pub async fn finish(mut self) -> io::Result<()> {
-        let tail_bytes = self.finish_goodbye_table().await?;
-        seq_write_pxar_entry(
-            self.output.as_mut(),
-            format::PXAR_GOODBYE,
-            &tail_bytes,
-            &mut self.state.write_position,
-        )
-        .await?;
+    pub async fn close(mut self) -> io::Result<()> {
+        if !self.state.is_empty() {
+            io_bail!("unexpected state on encoder close");
+        }
 
-        if let EncoderOutput::Owned(output) = &mut self.output {
+        if let Some(output) = self.output.payload_mut() {
+            let mut dummy_writer = 0;
+            seq_write_pxar_entry(
+                output,
+                format::PXAR_PAYLOAD_TAIL_MARKER,
+                &[],
+                &mut dummy_writer,
+            )
+            .await?;
             flush(output).await?;
         }
 
-        // done up here because of the self-borrow and to propagate
-        let end_offset = self.position();
+        if let EncoderOutput::Owned(output) = self.output.archive_mut() {
+            flush(output).await?;
+        }
 
-        if let Some(parent) = &mut self.parent {
+        self.finished = true;
+
+        Ok(())
+    }
+
+    pub async fn finish(&mut self) -> io::Result<()> {
+        let tail_bytes = self.finish_goodbye_table().await?;
+        let mut state = self
+            .state
+            .pop()
+            .ok_or_else(|| io_format_err!("encoder state stack underflow"))?;
+        seq_write_pxar_entry(
+            self.output.archive_mut().as_mut(),
+            format::PXAR_GOODBYE,
+            &tail_bytes,
+            &mut state.write_position,
+        )
+        .await?;
+
+        let end_offset = state.position();
+        let payload_end_offset = state.payload_position();
+
+        let encode_error = state.finish();
+        if let Some(parent) = self.state.last_mut() {
             parent.write_position = end_offset;
+            parent.payload_write_position = payload_end_offset;
 
-            let file_offset = self
-                .state
+            let file_offset = state
                 .file_offset
                 .expect("internal error: parent set but no file_offset?");
 
             parent.items.push(GoodbyeItem {
-                hash: self.state.file_hash,
+                hash: state.file_hash,
                 offset: file_offset,
                 size: end_offset - file_offset,
             });
+            // propagate errors
+            parent.merge_error(encode_error);
+            Ok(())
+        } else {
+            match encode_error {
+                Some(EncodeError::IncompleteFile) => io_bail!("incomplete file"),
+                Some(EncodeError::IncompleteDirectory) => io_bail!("directory not finalized"),
+                None => Ok(()),
+            }
         }
-        self.finished = true;
-        Ok(())
     }
 
     async fn finish_goodbye_table(&mut self) -> io::Result<Vec<u8>> {
-        let goodbye_offset = self.position();
+        let state = self.state_mut()?;
+        let goodbye_offset = state.position();
 
         // "take" out the tail (to not leave an array of endian-swapped structs in `self`)
-        let mut tail = take(&mut self.state.items);
+        let mut tail = take(&mut state.items);
         let tail_size = (tail.len() + 1) * size_of::<GoodbyeItem>();
         let goodbye_size = tail_size as u64 + size_of::<format::Header>() as u64;
 
@@ -818,7 +1091,7 @@ impl<'a, T: SeqWrite + 'a> EncoderImpl<'a, T> {
         bst.push(
             GoodbyeItem {
                 hash: format::PXAR_GOODBYE_TAIL_MARKER,
-                offset: goodbye_offset - self.state.entry_offset,
+                offset: goodbye_offset - state.entry_offset,
                 size: goodbye_size,
             }
             .to_le(),
@@ -835,7 +1108,8 @@ impl<'a, T: SeqWrite + 'a> EncoderImpl<'a, T> {
 
 /// Writer for a file object in a directory.
 pub(crate) struct FileImpl<'a, S: SeqWrite> {
-    output: &'a mut S,
+    /// Optional write redirection of file payloads to this sequential stream
+    output: PxarVariant<&'a mut S, &'a mut S>,
 
     /// This file's `GoodbyeItem`. FIXME: We currently don't touch this, can we just push it
     /// directly instead of on Drop of FileImpl?
@@ -845,12 +1119,12 @@ pub(crate) struct FileImpl<'a, S: SeqWrite> {
     /// exactly zero.
     remaining_size: u64,
 
-    /// The directory containing this file. This is where we propagate the `IncompleteFile` error
-    /// to, and where we insert our `GoodbyeItem`.
+    /// The directory stack with the last item being the directory containing this file. This is
+    /// where we propagate the `IncompleteFile` error to, and where we insert our `GoodbyeItem`.
     parent: &'a mut EncoderState,
 }
 
-impl<'a, S: SeqWrite> Drop for FileImpl<'a, S> {
+impl<S: SeqWrite> Drop for FileImpl<'_, S> {
     fn drop(&mut self) {
         if self.remaining_size != 0 {
             self.parent.add_error(EncodeError::IncompleteFile);
@@ -860,7 +1134,7 @@ impl<'a, S: SeqWrite> Drop for FileImpl<'a, S> {
     }
 }
 
-impl<'a, S: SeqWrite> FileImpl<'a, S> {
+impl<S: SeqWrite> FileImpl<'_, S> {
     /// Get the file offset to be able to reference it with `add_hardlink`.
     pub fn file_offset(&self) -> LinkOffset {
         LinkOffset(self.goodbye_item.offset)
@@ -883,7 +1157,7 @@ impl<'a, S: SeqWrite> FileImpl<'a, S> {
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
         this.check_remaining(data.len())?;
-        let output = unsafe { Pin::new_unchecked(&mut *this.output) };
+        let output = unsafe { Pin::new_unchecked(&mut *this.output.archive_mut()) };
         match output.poll_seq_write(cx, data) {
             Poll::Ready(Ok(put)) => {
                 this.remaining_size -= put as u64;
@@ -897,7 +1171,10 @@ impl<'a, S: SeqWrite> FileImpl<'a, S> {
     /// Poll flush interface to more easily connect to tokio/futures.
     #[cfg(feature = "tokio-io")]
     pub fn poll_flush(self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
-        unsafe { self.map_unchecked_mut(|this| this.output).poll_flush(cx) }
+        unsafe {
+            self.map_unchecked_mut(|this| this.output.archive_mut())
+                .poll_flush(cx)
+        }
     }
 
     /// Poll close/shutdown interface to more easily connect to tokio/futures.
@@ -906,7 +1183,10 @@ impl<'a, S: SeqWrite> FileImpl<'a, S> {
     /// provided by our encoder.
     #[cfg(feature = "tokio-io")]
     pub fn poll_close(self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
-        unsafe { self.map_unchecked_mut(|this| this.output).poll_flush(cx) }
+        unsafe {
+            self.map_unchecked_mut(|this| this.output.archive_mut())
+                .poll_flush(cx)
+        }
     }
 
     /// Write file data for the current file entry in a pxar archive.
@@ -916,26 +1196,45 @@ impl<'a, S: SeqWrite> FileImpl<'a, S> {
     /// for convenience.
     pub async fn write(&mut self, data: &[u8]) -> io::Result<usize> {
         self.check_remaining(data.len())?;
-        let put =
-            poll_fn(|cx| unsafe { Pin::new_unchecked(&mut self.output).poll_seq_write(cx, data) })
-                .await?;
-        //let put = seq_write(self.output.as_mut().unwrap(), data).await?;
+        let put = if let Some(mut output) = self.output.payload_mut() {
+            let put =
+                poll_fn(|cx| unsafe { Pin::new_unchecked(&mut output).poll_seq_write(cx, data) })
+                    .await?;
+            self.parent.payload_write_position += put as u64;
+            put
+        } else {
+            let put = poll_fn(|cx| unsafe {
+                Pin::new_unchecked(self.output.archive_mut()).poll_seq_write(cx, data)
+            })
+            .await?;
+            self.parent.write_position += put as u64;
+            put
+        };
+
         self.remaining_size -= put as u64;
-        self.parent.write_position += put as u64;
         Ok(put)
     }
 
     /// Completely write file data for the current file entry in a pxar archive.
     pub async fn write_all(&mut self, data: &[u8]) -> io::Result<()> {
         self.check_remaining(data.len())?;
-        seq_write_all(self.output, data, &mut self.parent.write_position).await?;
+        if let Some(ref mut output) = self.output.payload_mut() {
+            seq_write_all(output, data, &mut self.parent.payload_write_position).await?;
+        } else {
+            seq_write_all(
+                self.output.archive_mut(),
+                data,
+                &mut self.parent.write_position,
+            )
+            .await?;
+        }
         self.remaining_size -= data.len() as u64;
         Ok(())
     }
 }
 
 #[cfg(feature = "tokio-io")]
-impl<'a, S: SeqWrite> tokio::io::AsyncWrite for FileImpl<'a, S> {
+impl<S: SeqWrite> tokio::io::AsyncWrite for FileImpl<'_, S> {
     fn poll_write(self: Pin<&mut Self>, cx: &mut Context, buf: &[u8]) -> Poll<io::Result<usize>> {
         FileImpl::poll_write(self, cx, buf)
     }

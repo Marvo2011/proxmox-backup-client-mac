@@ -6,6 +6,7 @@ use crate::PatternFlag;
 #[rustfmt::skip]
 bitflags! {
     /// These flags influence what kind of paths should be matched.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub struct MatchFlag: u16 {
         /// Match only a complete entry. The pattern `bar` will not match `/foo/bar`.
         const ANCHORED            = 0x00_01;
@@ -404,11 +405,10 @@ impl MatchListEntry for &'_ &'_ MatchEntry {
 /// This provides [`matches`](MatchList::matches) and [`matches_exact`](MatchList::matches_exact)
 /// methods to lists of [`MatchEntry`] items.
 ///
-/// Technically this is implemented for anything that you can turn into a
-/// [`DoubleEndedIterator`](std::iter::DoubleEndedIterator) over [`MatchEntry`] or
-/// [`&MatchEntry`](MatchEntry).
+/// Technically this is implemented for anything that you can turn into a [`DoubleEndedIterator`]
+/// over [`MatchEntry`] or [`&MatchEntry`](MatchEntry).
 ///
-/// In practice this means you can use it with slices or references to [`Vec`](std::vec::Vec) or
+/// In practice this means you can use it with slices or references to [`Vec`] or
 /// [`VecDeque`](std::collections::VecDeque) etc.
 ///
 /// This makes it easier to use slices over entries or references to entries.

@@ -1,17 +1,37 @@
 use std::collections::HashMap;
+use std::fs;
+use std::io::ErrorKind;
+use std::sync::LazyLock;
+use std::time::SystemTime;
 
-use anyhow::{bail, format_err, Error};
+use anyhow::{Error, bail, format_err};
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use serde_json::{from_value, Value};
+use serde_json::{Value, from_value};
 
-use proxmox_sys::fs::CreateOptions;
+use proxmox_time::epoch_i64;
 
 use pbs_api_types::Authid;
 //use crate::auth;
-use crate::{open_backup_lockfile, BackupLockGuard};
+use crate::{BackupLockGuard, open_backup_lockfile};
 
 const LOCK_FILE: &str = pbs_buildcfg::configdir!("/token.shadow.lock");
 const CONF_FILE: &str = pbs_buildcfg::configdir!("/token.shadow");
+
+/// Global in-memory cache for successfully verified API token secrets.
+/// The cache stores plain text secrets for token Authids that have already been
+/// verified against the hashed values in `token.shadow`. This allows for cheap
+/// subsequent authentications for the same token+secret combination, avoiding
+/// recomputing the password hash on every request.
+static TOKEN_SECRET_CACHE: LazyLock<RwLock<ApiTokenSecretCache>> = LazyLock::new(|| {
+    RwLock::new(ApiTokenSecretCache {
+        secrets: HashMap::new(),
+        cached_gen: 0,
+        file_info: None,
+    })
+});
+/// Max age in seconds of the token secret cache before checking for file changes.
+const TOKEN_SECRET_CACHE_TTL_SECS: i64 = 60;
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -38,14 +58,87 @@ fn read_file() -> Result<HashMap<Authid, String>, Error> {
 }
 
 fn write_file(data: HashMap<Authid, String>) -> Result<(), Error> {
-    let backup_user = crate::backup_user()?;
-    let options = CreateOptions::new()
-        .perm(nix::sys::stat::Mode::from_bits_truncate(0o0640))
-        .owner(backup_user.uid)
-        .group(backup_user.gid);
-
+    let options = proxmox_product_config::default_create_options();
     let json = serde_json::to_vec(&data)?;
     proxmox_sys::fs::replace_file(CONF_FILE, &json, options, true)
+}
+
+/// Tries to match the given token secret against the cached secret.
+///
+/// Verifies the generation/version before doing the constant-time
+/// comparison to reduce TOCTOU risk. During token rotation or deletion
+/// tokens for in-flight requests may still validate against the previous
+/// generation.
+///
+/// If the cache file metadata's TTL has expired, will revalidate and invalidate the cache if
+/// needed.
+///
+/// Returns true if secret is cached and cache is still valid
+fn cached_secret_valid(tokenid: &Authid, secret: &str) -> bool {
+    let now = epoch_i64();
+
+    // Fast path: cache is fresh if generation matches and TTL not expired.
+    if let (Some(cache), Some(read_gen)) =
+        (TOKEN_SECRET_CACHE.try_read(), token_shadow_generation())
+    {
+        if cache.cached_gen == read_gen && cache.shadow_check_within_ttl(now) {
+            return cache.secret_matches(tokenid, secret);
+        }
+        // read lock drops here
+    } else {
+        return false;
+    }
+
+    // Slow path: best-effort refresh under write lock.
+    let Some(mut cache) = TOKEN_SECRET_CACHE.try_write() else {
+        return false;
+    };
+
+    // Re-read generation after acquiring the lock (may have changed meanwhile).
+    let Some(current_gen) = token_shadow_generation() else {
+        return false;
+    };
+
+    // If another process bumped the generation, we don't know what changed -> clear cache
+    if cache.cached_gen != current_gen {
+        cache.reset_and_set_gen(current_gen);
+    }
+
+    // TTL check again after acquiring the lock
+    let now = epoch_i64();
+    if cache.shadow_check_within_ttl(now) {
+        return cache.secret_matches(tokenid, secret);
+    }
+
+    // Stat the file to detect manual edits.
+    let Ok((new_mtime, new_len)) = shadow_mtime_len() else {
+        return false;
+    };
+
+    // If the file didn't change, only update last_checked
+    if let Some(shadow) = cache.file_info.as_mut() {
+        if shadow.mtime == new_mtime && shadow.len == new_len {
+            shadow.last_checked = now;
+            return cache.secret_matches(tokenid, secret);
+        }
+    }
+
+    cache.secrets.clear();
+
+    let prev = cache.file_info.replace(ShadowFileInfo {
+        mtime: new_mtime,
+        len: new_len,
+        last_checked: now,
+    });
+
+    if prev.is_some() {
+        // Best-effort propagation to other processes if a change was detected
+        if let Some(new_gen) = bump_token_shadow_generation() {
+            cache.cached_gen = new_gen;
+        }
+    }
+
+    false
 }
 
 /// Verifies that an entry for given tokenid / API token secret exists
@@ -54,40 +147,231 @@ pub fn verify_secret(tokenid: &Authid, secret: &str) -> Result<(), Error> {
         bail!("not an API token ID");
     }
 
+    // Fast path
+    if cached_secret_valid(tokenid, secret) {
+        return Ok(());
+    }
+
+    // Slow path
+    // First, capture the generation before doing the hash verification.
+    let gen_before = token_shadow_generation();
+
     let data = read_file()?;
     match data.get(tokenid) {
-        Some(hashed_secret) => proxmox_sys::crypt::verify_crypt_pw(secret, hashed_secret),
+        Some(hashed_secret) => {
+            proxmox_sys::crypt::verify_crypt_pw(secret, hashed_secret)?;
+
+            // Try to cache only if nothing changed while verifying the secret.
+            if let Some(gen_before) = gen_before {
+                cache_try_insert_secret(tokenid.clone(), secret.to_owned(), gen_before);
+            }
+
+            Ok(())
+        }
         None => bail!("invalid API token"),
     }
 }
 
-/// Adds a new entry for the given tokenid / API token secret. The secret is stored as salted hash.
-pub fn set_secret(tokenid: &Authid, secret: &str) -> Result<(), Error> {
-    if !tokenid.is_token() {
-        bail!("not an API token ID");
-    }
-
-    let _guard = lock_config()?;
-
-    let mut data = read_file()?;
-    let hashed_secret = proxmox_sys::crypt::encrypt_pw(secret)?;
-    data.insert(tokenid.clone(), hashed_secret);
-    write_file(data)?;
-
-    Ok(())
+/// Generates a new secret for the given tokenid / API token, sets it then returns it.
+/// The secret is stored as salted hash.
+pub fn generate_and_set_secret(tokenid: &Authid) -> Result<String, Error> {
+    apply_api_mutation(tokenid, true)?
+        .ok_or_else(|| format_err!("Failed to generate API token secret"))
 }
 
 /// Deletes the entry for the given tokenid.
 pub fn delete_secret(tokenid: &Authid) -> Result<(), Error> {
+    apply_api_mutation(tokenid, false)?;
+
+    Ok(())
+}
+
+/// Cached secret.
+struct CachedSecret {
+    secret: String,
+}
+
+struct ApiTokenSecretCache {
+    /// Keys are token Authids, values are the corresponding plain text secrets.
+    /// Entries are added after a successful on-disk verification in
+    /// `verify_secret` or when a new token secret is generated by
+    /// `generate_and_set_secret`. Used to avoid repeated
+    /// password-hash computation on subsequent authentications.
+    secrets: HashMap<Authid, CachedSecret>,
+    /// token.shadow generation of cached secrets.
+    cached_gen: usize,
+    /// Shadow file info to detect changes
+    file_info: Option<ShadowFileInfo>,
+}
+
+impl ApiTokenSecretCache {
+    /// Resets all local cache contents and sets/updates the cached generation.
+    fn reset_and_set_gen(&mut self, new_gen: usize) {
+        self.secrets.clear();
+        self.cached_gen = new_gen;
+        self.file_info = None;
+    }
+
+    /// Caches a secret and sets/updates the cache generation.
+    fn insert_and_set_gen(&mut self, tokenid: Authid, secret: CachedSecret, new_gen: usize) {
+        self.secrets.insert(tokenid, secret);
+        self.cached_gen = new_gen;
+    }
+
+    /// Evicts a cached secret and sets/updates the cached generation.
+    fn evict_and_set_gen(&mut self, tokenid: &Authid, new_gen: usize) {
+        self.secrets.remove(tokenid);
+        self.cached_gen = new_gen;
+    }
+
+    /// Returns true if cached token.shadow metadata exists and was checked within the TTL window.
+    fn shadow_check_within_ttl(&self, now: i64) -> bool {
+        self.file_info.as_ref().is_some_and(|cached| {
+            now >= cached.last_checked && (now - cached.last_checked) < TOKEN_SECRET_CACHE_TTL_SECS
+        })
+    }
+
+    /// Returns true if there is a matching cached entry
+    fn secret_matches(&self, tokenid: &Authid, secret: &str) -> bool {
+        let Some(entry) = self.secrets.get(tokenid) else {
+            return false;
+        };
+        let cached_secret_bytes = entry.secret.as_bytes();
+        let secret_bytes = secret.as_bytes();
+
+        cached_secret_bytes.len() == secret_bytes.len()
+            && openssl::memcmp::eq(cached_secret_bytes, secret_bytes)
+    }
+}
+
+/// Shadow file info
+struct ShadowFileInfo {
+    // shadow file mtime to detect changes
+    mtime: Option<SystemTime>,
+    // shadow file length to detect changes
+    len: Option<u64>,
+    // last time the file metadata was checked
+    last_checked: i64,
+}
+
+fn cache_try_insert_secret(tokenid: Authid, secret: String, gen_before: usize) {
+    let Some(mut cache) = TOKEN_SECRET_CACHE.try_write() else {
+        return;
+    };
+
+    let Some(gen_now) = token_shadow_generation() else {
+        return;
+    };
+
+    // If this process missed a generation bump, its cache is stale.
+    if cache.cached_gen != gen_now {
+        cache.reset_and_set_gen(gen_now);
+    }
+
+    // If a mutation happened while we were verifying the secret, do not insert.
+    if gen_now == gen_before {
+        cache.insert_and_set_gen(tokenid, CachedSecret { secret }, gen_now);
+    }
+}
+
+fn apply_api_mutation(tokenid: &Authid, generate: bool) -> Result<Option<String>, Error> {
     if !tokenid.is_token() {
         bail!("not an API token ID");
     }
 
     let _guard = lock_config()?;
 
+    // Capture state before we write to detect external edits.
+    let pre_write_meta = shadow_mtime_len().unwrap_or((None, None));
+
     let mut data = read_file()?;
-    data.remove(tokenid);
+    let secret = if generate {
+        let secret = format!("{:x}", proxmox_uuid::Uuid::generate());
+        let hashed_secret = proxmox_sys::crypt::encrypt_pw(&secret)?;
+        data.insert(tokenid.clone(), hashed_secret);
+        Some(secret)
+    } else {
+        data.remove(tokenid);
+        None
+    };
     write_file(data)?;
 
-    Ok(())
+    let now = epoch_i64();
+
+    // Signal cache invalidation to other processes (best-effort).
+    let bumped_gen = bump_token_shadow_generation();
+    let mut cache = TOKEN_SECRET_CACHE.write();
+
+    // If we cannot get the current generation, we cannot trust the cache
+    let Some(current_gen) = token_shadow_generation() else {
+        cache.reset_and_set_gen(0);
+        return Ok(secret);
+    };
+
+    // If we cannot bump the generation, or if it changed after
+    // obtaining the cache write lock, we cannot trust the cache
+    if bumped_gen != Some(current_gen) {
+        cache.reset_and_set_gen(current_gen);
+        return Ok(secret);
+    }
+
+    // If our cached file metadata does not match the on-disk state before our write,
+    // we likely missed an external/manual edit. We can no longer trust any cached secrets.
+    if cache
+        .file_info
+        .as_ref()
+        .is_some_and(|s| (s.mtime, s.len) != pre_write_meta)
+    {
+        cache.secrets.clear();
+    }
+
+    // Apply the new mutation.
+    match &secret {
+        Some(secret) => {
+            let cached_secret = CachedSecret {
+                secret: secret.to_owned(),
+            };
+            cache.insert_and_set_gen(tokenid.clone(), cached_secret, current_gen);
+        }
+        None => cache.evict_and_set_gen(tokenid, current_gen),
+    }
+
+    // Update our view of the file metadata to the post-write state (best-effort).
+    // (If this fails, drop local cache so callers fall back to slow path until refreshed.)
+    match shadow_mtime_len() {
+        Ok((mtime, len)) => {
+            cache.file_info = Some(ShadowFileInfo {
+                mtime,
+                len,
+                last_checked: now,
+            });
+        }
+        Err(_) => {
+            // If we cannot validate state, do not trust cache.
+            cache.reset_and_set_gen(current_gen);
+        }
+    }
+    Ok(secret)
+}
+
+/// Get the current generation.
+fn token_shadow_generation() -> Option<usize> {
+    crate::ConfigVersionCache::new()
+        .ok()
+        .map(|cvc| cvc.token_shadow_generation())
+}
+
+/// Bump and return the new generation.
+fn bump_token_shadow_generation() -> Option<usize> {
+    crate::ConfigVersionCache::new()
+        .ok()
+        .map(|cvc| cvc.increase_token_shadow_generation() + 1)
+}
+
+fn shadow_mtime_len() -> Result<(Option<SystemTime>, Option<u64>), Error> {
+    match fs::metadata(CONF_FILE) {
+        Ok(meta) => Ok((meta.modified().ok(), Some(meta.len()))),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok((None, None)),
+        Err(e) => Err(e.into()),
+    }
 }

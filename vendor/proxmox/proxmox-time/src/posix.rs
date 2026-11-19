@@ -2,7 +2,7 @@
 
 use std::ffi::{CStr, CString};
 
-use anyhow::{bail, format_err, Error};
+use anyhow::{Error, bail, format_err};
 
 /// Safe bindings to libc timelocal
 ///
@@ -124,7 +124,7 @@ pub fn epoch_i64() -> i64 {
 
 /// Returns Unix Epoch (now) as f64 with subseconds resolution
 ///
-/// Note: This can be inacurrate for values greater the 2^53. But this
+/// Note: This can be inaccurate for values greater the 2^53. But this
 /// should never happen.
 pub fn epoch_f64() -> f64 {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -172,7 +172,7 @@ pub fn strftime(format: &str, t: &libc::tm) -> Result<String, Error> {
 
 //  The `libc` crate does not yet contain bindings for `strftime_l`
 #[link(name = "c")]
-extern "C" {
+unsafe extern "C" {
     #[link_name = "strftime_l"]
     fn libc_strftime_l(
         s: *mut libc::c_char,
@@ -298,7 +298,7 @@ pub fn epoch_to_rfc3339(epoch: i64) -> Result<String, Error> {
         bail!("epoch_to_rfc3339: wrong year '{year}'");
     }
 
-    // Note: We cannot use strftime %z because of missing collon
+    // Note: We cannot use strftime %z because of missing colon
 
     let mut offset = localtime.tm_gmtoff;
 
@@ -421,6 +421,15 @@ pub fn epoch_to_rfc2822(epoch: i64) -> Result<String, Error> {
     Ok(rfc2822_date)
 }
 
+/// Convert an epoch to an RFC9110 preferred HTTP Date format.
+///
+/// see: <https://httpwg.org/specs/rfc9110.html#http.date>
+pub fn epoch_to_http_date(epoch: i64) -> Result<String, Error> {
+    let gmtime = gmtime(epoch)?;
+    let locale = Locale::new(libc::LC_ALL, Locale::C)?;
+    strftime_l("%a, %d %b %Y %H:%M:%S GMT", &gmtime, &locale)
+}
+
 #[test]
 fn test_leap_seconds() {
     let convert_reconvert = |epoch| {
@@ -485,16 +494,16 @@ fn test_rfc3339_range() {
         parse_rfc3339(first_century_str).expect("parsing first century string should work");
     assert_eq!(parsed, first_century);
 
-    let first_millenium = -59011459200;
-    let first_millenium_str = "0100-01-01T00:00:00Z";
+    let first_millennium = -59011459200;
+    let first_millennium_str = "0100-01-01T00:00:00Z";
 
-    let converted = epoch_to_rfc3339_utc(first_millenium)
-        .expect("converting epoch representing first millenium year should work");
-    assert_eq!(converted, first_millenium_str);
+    let converted = epoch_to_rfc3339_utc(first_millennium)
+        .expect("converting epoch representing first millennium year should work");
+    assert_eq!(converted, first_millennium_str);
 
     let parsed =
-        parse_rfc3339(first_millenium_str).expect("parsing first millenium string should work");
-    assert_eq!(parsed, first_millenium);
+        parse_rfc3339(first_millennium_str).expect("parsing first millennium string should work");
+    assert_eq!(parsed, first_millennium);
 }
 
 #[test]

@@ -3,11 +3,11 @@ use std::ffi::OsStr;
 use std::path::Path;
 use std::{io, mem};
 
-use anyhow::{bail, format_err, Error};
+use anyhow::{Error, bail, format_err};
 use futures::future::FutureExt;
 use futures::select;
 use futures::stream::TryStreamExt;
-use tokio::signal::unix::{signal, SignalKind};
+use tokio::signal::unix::{SignalKind, signal};
 
 use proxmox_fuse::requests::{self, FuseRequest, SetTime};
 use proxmox_fuse::{EntryParam, Fuse, ReplyBufState, Request};
@@ -56,8 +56,8 @@ fn to_entry_param(stat: &libc::stat) -> EntryParam {
         inode: stat.st_ino,
         generation: 1,
         attr: *stat,
-        attr_timeout: std::f64::MAX,
-        entry_timeout: std::f64::MAX,
+        attr_timeout: f64::MAX,
+        entry_timeout: f64::MAX,
     }
 }
 
@@ -90,11 +90,11 @@ async fn handle_fuse(mut fuse: Fuse) -> Result<(), Error> {
     while let Some(request) = fuse.try_next().await? {
         match request {
             Request::Getattr(request) => match fs.lookup(request.inode) {
-                Ok(node) => request.reply(&node.leak().stat.read().unwrap(), std::f64::MAX)?,
+                Ok(node) => request.reply(&node.leak().stat.read().unwrap(), f64::MAX)?,
                 Err(err) => handle_io_err(err, |err| request.io_fail(err))?,
             },
             Request::Setattr(mut request) => match handle_setattr(&fs, &mut request) {
-                Ok(node) => request.reply(&node.stat.read().unwrap(), std::f64::MAX)?,
+                Ok(node) => request.reply(&node.stat.read().unwrap(), f64::MAX)?,
                 Err(err) => handle_err(err, |err| request.io_fail(err))?,
             },
             Request::Lookup(request) => match fs.lookup_at(request.parent, &request.file_name) {
@@ -151,7 +151,7 @@ async fn handle_fuse(mut fuse: Fuse) -> Result<(), Error> {
                 }
             }
             Request::Open(request) => match fs.lookup(request.inode) {
-                Ok(node) => request.reply(0)?,
+                Ok(_node) => request.reply(0)?,
                 Err(err) => handle_io_err(err, |err| request.io_fail(err))?,
             },
             Request::Release(request) => match fs.forget(request.inode, 1) {
@@ -180,17 +180,12 @@ async fn handle_fuse(mut fuse: Fuse) -> Result<(), Error> {
             Request::Read(request) => {
                 // For simplicity we just limit reads to 1 MiB for now...
                 let size = request.size.min(1024 * 1024);
-                let mut buf = Vec::with_capacity(size);
-                unsafe {
-                    buf.set_len(size);
-                }
+                let mut buf = unsafe {
+                    let data = std::alloc::alloc(std::alloc::Layout::array::<u8>(size).unwrap());
+                    Box::from_raw(std::ptr::slice_from_raw_parts_mut(data, size))
+                };
                 match fs.read(request.inode, &mut buf, request.offset) {
-                    Ok(got) => {
-                        unsafe {
-                            buf.set_len(got);
-                        }
-                        request.reply(&buf)?;
-                    }
+                    Ok(got) => request.reply(&buf[..got])?,
                     Err(err) => handle_io_err(err, |err| request.io_fail(err))?,
                 }
             }
@@ -217,7 +212,7 @@ fn handle_readdir(fs: &Fs, request: &mut requests::Readdir) -> Result<(), Error>
                 next += 1;
                 let inode = fs.lookup(inode)?;
                 let stat = inode.stat.read().unwrap();
-                match request.add_entry(&name, &stat, next)? {
+                match request.add_entry(name, &stat, next)? {
                     ReplyBufState::Ok => (),
                     ReplyBufState::Full => return Ok(()),
                 }

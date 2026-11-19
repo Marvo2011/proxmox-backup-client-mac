@@ -6,9 +6,9 @@
 use std::convert::TryFrom;
 
 use proc_macro2::Span;
+use syn::Token;
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
-use syn::Token;
 
 /// Serde name types.
 #[allow(clippy::enum_variant_names)]
@@ -128,6 +128,8 @@ impl RenameAll {
 #[derive(Default)]
 pub struct ContainerAttrib {
     pub rename_all: Option<RenameAll>,
+    pub tag: Option<syn::LitStr>,
+    pub content: Option<syn::LitStr>,
 }
 
 impl TryFrom<&[syn::Attribute]> for ContainerAttrib {
@@ -147,18 +149,38 @@ impl TryFrom<&[syn::Attribute]> for ContainerAttrib {
 
             for arg in args {
                 if let syn::Meta::NameValue(var) = arg {
-                    if !var.path.is_ident("rename_all") {
-                        continue;
-                    }
-                    match &var.value {
-                        syn::Expr::Lit(lit) => {
-                            let rename_all = RenameAll::try_from(&lit.lit)?;
-                            if this.rename_all.is_some() && this.rename_all != Some(rename_all) {
-                                error!(var.value => "multiple conflicting 'rename_all' attributes");
+                    if var.path.is_ident("rename_all") {
+                        match &var.value {
+                            syn::Expr::Lit(lit) => {
+                                let rename_all = RenameAll::try_from(&lit.lit)?;
+                                if this.rename_all.is_some() && this.rename_all != Some(rename_all)
+                                {
+                                    error!(var.value => "multiple conflicting 'rename_all' attributes");
+                                }
+                                this.rename_all = Some(rename_all);
                             }
-                            this.rename_all = Some(rename_all);
+                            _ => error!(var.value => "invalid 'rename_all' value type"),
                         }
-                        _ => error!(var.value => "invalid 'rename_all' value type"),
+                    } else if var.path.is_ident("tag") {
+                        match &var.value {
+                            syn::Expr::Lit(syn::ExprLit {
+                                lit: syn::Lit::Str(lit),
+                                ..
+                            }) => {
+                                this.tag = Some(lit.clone());
+                            }
+                            _ => error!(var.value => "invalid 'tag' value type"),
+                        }
+                    } else if var.path.is_ident("content") {
+                        match &var.value {
+                            syn::Expr::Lit(syn::ExprLit {
+                                lit: syn::Lit::Str(lit),
+                                ..
+                            }) => {
+                                this.content = Some(lit.clone());
+                            }
+                            _ => error!(var.value => "invalid 'content' value type"),
+                        }
                     }
                 }
             }
@@ -218,10 +240,10 @@ impl FieldAttrib {
     }
 
     pub fn check_non_option_type(&self) {
-        if let Some(span) = self.has_skip_serializing_if {
-            if !self.has_default {
-                error!(span, "`skip_serializing_if` without `default`");
-            }
+        if let Some(span) = self.has_skip_serializing_if
+            && !self.has_default
+        {
+            error!(span, "`skip_serializing_if` without `default`");
         }
     }
 }
@@ -243,6 +265,7 @@ impl TryFrom<&[syn::Attribute]> for FieldAttrib {
 /// `serde` variant attributes we support
 #[derive(Default)]
 pub struct VariantAttrib {
+    pub untagged: Option<Span>,
     pub rename: Option<syn::LitStr>,
 }
 
@@ -270,6 +293,14 @@ impl VariantAttrib {
                     }
                     value => error!(value => "'rename' value must be a string literal"),
                 }
+            } else if path.is_ident("untagged") {
+                self.untagged = Some(match arg.require_path_only() {
+                    Ok(path) => path.span(),
+                    Err(_) => {
+                        error!(arg => "'untagged' attribute with value not supported");
+                        Span::call_site()
+                    }
+                });
             }
         }
 

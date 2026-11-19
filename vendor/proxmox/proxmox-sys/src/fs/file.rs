@@ -1,19 +1,17 @@
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
-use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 #[cfg(feature = "timer")]
 use std::time::Duration;
 
-use anyhow::{bail, format_err, Error};
+use anyhow::{Context as _, Error, bail, format_err};
+use nix::NixPath;
 use nix::errno::Errno;
-use nix::fcntl::OFlag;
+use nix::fcntl::{FcntlArg, OFlag, fcntl};
 use nix::sys::stat;
 use nix::unistd;
-use nix::NixPath;
 use serde_json::Value;
-
-use proxmox_lang::try_block;
 
 use crate::error::SysError;
 
@@ -37,7 +35,7 @@ pub fn file_get_contents<P: AsRef<Path>>(path: P) -> Result<Vec<u8>, Error> {
 /// Read the entire contents of a file into a bytes vector if the file exists
 ///
 /// Same as file_get_contents(), but returns 'Ok(None)' instead of
-/// 'Err' if the file dose not exist.
+/// 'Err' if the file does not exist.
 pub fn file_get_optional_contents<P: AsRef<Path>>(path: P) -> Result<Option<Vec<u8>>, Error> {
     let path = path.as_ref();
 
@@ -66,7 +64,7 @@ pub fn file_read_string<P: AsRef<Path>>(path: P) -> Result<String, Error> {
 /// Read the entire contents of a file into a String if the file exists
 ///
 /// Same as file_read_string(), but returns 'Ok(None)' instead of
-/// 'Err' if the file dose not exist.
+/// 'Err' if the file does not exist.
 pub fn file_read_optional_string<P: AsRef<Path>>(path: P) -> Result<Option<String>, Error> {
     let path = path.as_ref();
 
@@ -88,8 +86,9 @@ pub fn file_read_optional_string<P: AsRef<Path>>(path: P) -> Result<Option<Strin
 pub fn file_get_json<P: AsRef<Path>>(path: P, default: Option<Value>) -> Result<Value, Error> {
     let path = path.as_ref();
 
-    let raw = match std::fs::read(path) {
-        Ok(v) => v,
+    match std::fs::read(path) {
+        Ok(data) => serde_json::from_slice(&data)
+            .with_context(|| format!("unable to parse json from {path:?}")),
         Err(err) => {
             if err.kind() == std::io::ErrorKind::NotFound {
                 if let Some(v) = default {
@@ -98,14 +97,7 @@ pub fn file_get_json<P: AsRef<Path>>(path: P, default: Option<Value>) -> Result<
             }
             bail!("unable to read json {:?} - {}", path, err);
         }
-    };
-
-    try_block!({
-        let data = String::from_utf8(raw)?;
-        let json = serde_json::from_str(&data)?;
-        Ok(json)
-    })
-    .map_err(|err: Error| format_err!("unable to parse json from {:?} - {}", path, err))
+    }
 }
 
 /// Read the first line of a file as String in std IO error context
@@ -126,6 +118,38 @@ pub fn file_read_firstline<P: AsRef<Path>>(path: P) -> Result<String, Error> {
     read_firstline(path).map_err(|err| format_err!("unable to read {path:?} - {err}"))
 }
 
+#[inline]
+/// Creates a tmpfile like [`nix::unistd::mkstemp`], but with [`OFlag`] set.
+///
+/// Note that some flags are masked out since they can produce an error, see mkostemp(2) for details.
+// code is mostly copied from nix mkstemp
+fn mkostemp<P: ?Sized + NixPath>(
+    template: &P,
+    oflag: OFlag,
+) -> nix::Result<(std::os::fd::RawFd, PathBuf)> {
+    use std::os::unix::ffi::OsStringExt;
+    let mut path = template.with_nix_path(|path| path.to_bytes_with_nul().to_owned())?;
+    let p = path.as_mut_ptr().cast();
+
+    let flags = OFlag::intersection(OFlag::O_APPEND | OFlag::O_CLOEXEC | OFlag::O_SYNC, oflag);
+
+    #[cfg(target_os = "linux")]
+    let fd = unsafe { libc::mkostemp(p, flags.bits()) };
+    // part of libSystem, but the libc crate has no binding for it on macOS
+    #[cfg(target_os = "macos")]
+    let fd = {
+        unsafe extern "C" {
+            fn mkostemp(template: *mut libc::c_char, flags: libc::c_int) -> libc::c_int;
+        }
+        unsafe { mkostemp(p, flags.bits()) }
+    };
+    let last = path.pop(); // drop the trailing nul
+    debug_assert!(last == Some(b'\0'));
+    let pathname = std::ffi::OsString::from_vec(path);
+    Errno::result(fd)?;
+    Ok((fd, PathBuf::from(pathname)))
+}
+
 /// Takes a Path and CreateOptions, creates a tmpfile from it and returns
 /// a RawFd and PathBuf for it
 pub fn make_tmp_file<P: AsRef<Path>>(
@@ -136,8 +160,8 @@ pub fn make_tmp_file<P: AsRef<Path>>(
 
     // use mkstemp here, because it works with different processes, threads, even tokio tasks
     let mut template = path.to_owned();
-    template.set_extension("tmp_XXXXXX");
-    let (mut file, tmp_path) = match unistd::mkstemp(&template) {
+    template.add_extension("tmp_XXXXXX");
+    let (mut file, tmp_path) = match mkostemp(&template, OFlag::O_CLOEXEC) {
         Ok((fd, path)) => (unsafe { File::from_raw_fd(fd) }, path),
         Err(err) => bail!("mkstemp {:?} failed: {}", template, err),
     };
@@ -164,11 +188,10 @@ pub fn replace_file<P: AsRef<Path>>(
     options: CreateOptions,
     fsync: bool,
 ) -> Result<(), Error> {
-    let (fd, tmp_path) = make_tmp_file(&path, options)?;
-
-    let mut file = unsafe { File::from_raw_fd(fd.into_raw_fd()) };
+    let (mut file, tmp_path) = make_tmp_file(&path, options)?;
 
     if let Err(err) = file.write_all(data) {
+        drop(file);
         let _ = unistd::unlink(&tmp_path);
         bail!("write failed: {}", err);
     }
@@ -176,10 +199,15 @@ pub fn replace_file<P: AsRef<Path>>(
     if fsync {
         // make sure data is on disk
         if let Err(err) = nix::unistd::fsync(file.as_raw_fd()) {
+            drop(file);
             let _ = unistd::unlink(&tmp_path);
             bail!("fsync failed: {}", err);
         }
     }
+
+    // Allow WORM file systems to commit the contents before the rename
+    // and prevent temporary .fuse_hidden* files created by unlink.
+    drop(file);
 
     if let Err(err) = std::fs::rename(&tmp_path, &path) {
         let _ = unistd::unlink(&tmp_path);
@@ -221,13 +249,13 @@ pub fn atomic_open_or_create_file<P: AsRef<Path>>(
     }
 
     let exclusive = if oflag.contains(OFlag::O_EXCL) {
-        oflag.remove(OFlag::O_EXCL); // we nned to handle that ourselfes
+        oflag.remove(OFlag::O_EXCL); // we need to handle that ourselves
         true
     } else {
         false
     };
 
-    oflag.remove(OFlag::O_CREAT); // we want to handle CREAT ourselfes
+    oflag.remove(OFlag::O_CREAT); // we want to handle CREAT ourselves
 
     if !exclusive {
         // Note: 'mode' is ignored, because oflag does not contain O_CREAT or O_TMPFILE
@@ -235,7 +263,7 @@ pub fn atomic_open_or_create_file<P: AsRef<Path>>(
             Ok(fd) => return Ok(unsafe { File::from_raw_fd(fd) }),
             Err(err) => {
                 if err.not_found() {
-                    // fall thrue -  try to create the file
+                    // fall through -  try to create the file
                 } else {
                     bail!("open {:?} failed - {}", path, err);
                 }
@@ -264,6 +292,19 @@ pub fn atomic_open_or_create_file<P: AsRef<Path>>(
                     err,
                 )
             }
+        }
+    }
+
+    if oflag.contains(OFlag::O_APPEND) {
+        let result = fcntl(file.as_raw_fd(), FcntlArg::F_GETFL).and_then(|flags| {
+            fcntl(
+                file.as_raw_fd(),
+                FcntlArg::F_SETFL(OFlag::from_bits_truncate(flags) | OFlag::O_APPEND),
+            )
+        });
+        if let Err(err) = result {
+            let _ = unistd::unlink(&temp_file_name);
+            bail!("setting append mode on {:?} failed - {}", path, err);
         }
     }
 
@@ -511,4 +552,92 @@ pub fn file_get_non_comment_lines<P: AsRef<Path>>(
         }
         Err(err) => Some(Err(err)),
     }))
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn atomic_open_or_create_file_keeps_append_mode() {
+        use std::io::Seek;
+
+        struct TestDir(PathBuf);
+        impl Drop for TestDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let dir = TestDir(crate::fs::make_tmp_dir("./tests", None).unwrap());
+        for (index, initial_data) in [b"".as_slice(), b"seed-"].into_iter().enumerate() {
+            for append in [false, true] {
+                let path = dir.0.join(format!("{index}-{append}"));
+                let mut flags = OFlag::O_RDWR | OFlag::O_CLOEXEC;
+                if append {
+                    flags |= OFlag::O_APPEND;
+                }
+                let mut created = atomic_open_or_create_file(
+                    &path,
+                    flags,
+                    initial_data,
+                    CreateOptions::new(),
+                    false,
+                )
+                .unwrap();
+                let actual = fcntl(created.as_raw_fd(), FcntlArg::F_GETFL).unwrap();
+                assert_eq!(
+                    OFlag::from_bits_truncate(actual).contains(OFlag::O_APPEND),
+                    append
+                );
+
+                let mut reopened = atomic_open_or_create_file(
+                    &path,
+                    flags | OFlag::O_APPEND,
+                    b"ignored",
+                    CreateOptions::new(),
+                    false,
+                )
+                .unwrap();
+                reopened.write_all(b"second").unwrap();
+                created.rewind().unwrap();
+                created.write_all(b"first").unwrap();
+
+                let mut expected = [initial_data, b"second"].concat();
+                if append {
+                    expected.extend_from_slice(b"first");
+                } else {
+                    expected[..5].copy_from_slice(b"first");
+                }
+                assert_eq!(std::fs::read(&path).unwrap(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn make_tmp_file_does_not_replace_extension() {
+        let (_, path) = make_tmp_file("/tmp/proxmox-sys-test.json", CreateOptions::new()).unwrap();
+
+        assert!(
+            &path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains("proxmox-sys-test.json")
+        );
+
+        let (_, path) = make_tmp_file(
+            "/tmp/proxmox-sys-test.archive.1000.zst",
+            CreateOptions::new(),
+        )
+        .unwrap();
+
+        assert!(
+            &path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains("archive.1000.zst")
+        );
+    }
 }

@@ -1,9 +1,25 @@
+use std::sync::mpsc::Receiver;
+
 /// Note: window size 32 or 64, is faster because we can
 /// speedup modulo operations, but always computes hash 0
 /// for constant data streams .. 0,0,0,0,0,0
 /// so we use a modified the chunk boundary test too not
 /// use hash value 0 to detect a boundary.
 const CA_CHUNKER_WINDOW_SIZE: usize = 64;
+
+/// Additional context for chunker to find possible boundaries in payload streams
+#[derive(Default)]
+pub struct Context {
+    /// Already consumed bytes of the chunk stream consumer
+    pub base: u64,
+    /// Total size currently buffered
+    pub total: u64,
+}
+
+pub trait Chunker {
+    fn scan(&mut self, data: &[u8], ctx: &Context) -> usize;
+    fn reset(&mut self);
+}
 
 /// Sliding window chunker (Buzhash)
 ///
@@ -14,8 +30,7 @@ const CA_CHUNKER_WINDOW_SIZE: usize = 64;
 /// information please take a look at the [Rolling
 /// Hash](https://en.wikipedia.org/wiki/Rolling_hash) article from
 /// Wikipedia.
-
-pub struct Chunker {
+pub struct ChunkerImpl {
     h: u32,
     window_size: usize,
     chunk_size: usize,
@@ -30,6 +45,16 @@ pub struct Chunker {
     break_test_minimum: u32,
 
     window: [u8; CA_CHUNKER_WINDOW_SIZE],
+}
+
+/// Sliding window chunker (Buzhash) with boundary suggestions
+///
+/// Suggest to chunk at a given boundary instead of the regular chunk boundary for better alignment
+/// with file payload boundaries.
+pub struct PayloadChunker {
+    chunker: ChunkerImpl,
+    current_suggested: Option<u64>,
+    suggested_boundaries: Receiver<u64>,
 }
 
 const BUZHASH_TABLE: [u32; 256] = [
@@ -67,7 +92,7 @@ const BUZHASH_TABLE: [u32; 256] = [
     0x5eff22f4, 0x6027f4cc, 0x77178b3c, 0xae507131, 0x7bf7cabc, 0xf9c18d66, 0x593ade65, 0xd95ddf11,
 ];
 
-impl Chunker {
+impl ChunkerImpl {
     /// Create a new Chunker instance, which produces and average
     /// chunk size of `chunk_size_avg` (need to be a power of two). We
     /// allow variation from `chunk_size_avg/4` up to a maximum of
@@ -105,11 +130,44 @@ impl Chunker {
         }
     }
 
+    // fast implementation avoiding modulo
+    // #[inline(always)]
+    fn shall_break(&self) -> bool {
+        if self.chunk_size >= self.chunk_size_max {
+            return true;
+        }
+
+        if self.chunk_size < self.chunk_size_min {
+            return false;
+        }
+
+        //(self.h & 0x1ffff) <= 2 //THIS IS SLOW!!!
+
+        //(self.h & self.break_test_mask) <= 2 // Bad on 0 streams
+
+        (self.h & self.break_test_mask) >= self.break_test_minimum
+    }
+
+    // This is the original implementation from casync
+    /*
+    #[inline(always)]
+    fn shall_break_orig(&self) -> bool {
+
+        if self.chunk_size >= self.chunk_size_max { return true; }
+
+        if self.chunk_size < self.chunk_size_min { return false; }
+
+        (self.h % self.discriminator) == (self.discriminator - 1)
+    }
+     */
+}
+
+impl Chunker for ChunkerImpl {
     /// Scans the specified data for a chunk border. Returns 0 if none
     /// was found (and the function should be called with more data
     /// later on), or another value indicating the position of a
     /// border.
-    pub fn scan(&mut self, data: &[u8]) -> usize {
+    fn scan(&mut self, data: &[u8], _ctx: &Context) -> usize {
         let window_len = self.window.len();
         let data_len = data.len();
 
@@ -167,36 +225,89 @@ impl Chunker {
         0
     }
 
-    // fast implementation avoiding modulo
-    // #[inline(always)]
-    fn shall_break(&self) -> bool {
-        if self.chunk_size >= self.chunk_size_max {
-            return true;
+    fn reset(&mut self) {
+        self.h = 0;
+        self.chunk_size = 0;
+        self.window_size = 0;
+    }
+}
+
+impl PayloadChunker {
+    /// Create a new PayloadChunker instance, which produces and average
+    /// chunk size of `chunk_size_avg` (need to be a power of two), if no
+    /// suggested boundaries are provided.
+    /// Use suggested boundaries instead,  whenever the chunk size is within
+    /// the min - max range.
+    pub fn new(chunk_size_avg: usize, suggested_boundaries: Receiver<u64>) -> Self {
+        Self {
+            chunker: ChunkerImpl::new(chunk_size_avg),
+            current_suggested: None,
+            suggested_boundaries,
         }
+    }
+}
 
-        if self.chunk_size < self.chunk_size_min {
-            return false;
+impl Chunker for PayloadChunker {
+    fn scan(&mut self, data: &[u8], ctx: &Context) -> usize {
+        assert!(ctx.total >= data.len() as u64);
+        let pos = ctx.total - data.len() as u64;
+
+        loop {
+            if let Some(boundary) = self.current_suggested {
+                if boundary < ctx.base + pos {
+                    log::debug!("Boundary {boundary} in past");
+                    // ignore passed boundaries
+                    self.current_suggested = None;
+                    continue;
+                }
+
+                if boundary > ctx.base + ctx.total {
+                    log::debug!("Boundary {boundary} in future");
+                    // boundary in future, cannot decide yet
+                    return self.chunker.scan(data, ctx);
+                }
+
+                let chunk_size = (boundary - ctx.base) as usize;
+                if chunk_size < self.chunker.chunk_size_min {
+                    log::debug!("Chunk size {chunk_size} below minimum chunk size");
+                    // chunk to small, ignore boundary
+                    self.current_suggested = None;
+                    continue;
+                }
+
+                if chunk_size <= self.chunker.chunk_size_max {
+                    self.current_suggested = None;
+                    // calculate boundary relative to start of given data buffer
+                    let len = chunk_size - pos as usize;
+                    if len == 0 {
+                        // passed this one, previous scan did not know about boundary just yet
+                        return self.chunker.scan(data, ctx);
+                    }
+                    self.chunker.reset();
+                    log::debug!(
+                        "Chunk at suggested boundary: {boundary}, chunk size: {chunk_size}"
+                    );
+                    return len;
+                }
+
+                log::debug!("Chunk {chunk_size} to big, regular scan");
+                // chunk to big, cannot decide yet
+                // scan for hash based chunk boundary instead
+                return self.chunker.scan(data, ctx);
+            }
+
+            if let Ok(boundary) = self.suggested_boundaries.try_recv() {
+                self.current_suggested = Some(boundary);
+            } else {
+                log::debug!("No suggested boundary, regular scan");
+                return self.chunker.scan(data, ctx);
+            }
         }
-
-        //(self.h & 0x1ffff) <= 2 //THIS IS SLOW!!!
-
-        //(self.h & self.break_test_mask) <= 2 // Bad on 0 streams
-
-        (self.h & self.break_test_mask) >= self.break_test_minimum
     }
 
-    // This is the original implementation from casync
-    /*
-    #[inline(always)]
-    fn shall_break_orig(&self) -> bool {
-
-        if self.chunk_size >= self.chunk_size_max { return true; }
-
-        if self.chunk_size < self.chunk_size_min { return false; }
-
-        (self.h % self.discriminator) == (self.discriminator - 1)
+    fn reset(&mut self) {
+        self.chunker.reset();
     }
-     */
 }
 
 #[test]
@@ -209,17 +320,18 @@ fn test_chunker1() {
             buffer.push(byte);
         }
     }
-    let mut chunker = Chunker::new(64 * 1024);
+    let mut chunker = ChunkerImpl::new(64 * 1024);
 
     let mut pos = 0;
     let mut last = 0;
 
     let mut chunks1: Vec<(usize, usize)> = vec![];
     let mut chunks2: Vec<(usize, usize)> = vec![];
+    let ctx = Context::default();
 
     // test1: feed single bytes
     while pos < buffer.len() {
-        let k = chunker.scan(&buffer[pos..pos + 1]);
+        let k = chunker.scan(&buffer[pos..pos + 1], &ctx);
         pos += 1;
         if k != 0 {
             let prev = last;
@@ -229,13 +341,13 @@ fn test_chunker1() {
     }
     chunks1.push((last, buffer.len() - last));
 
-    let mut chunker = Chunker::new(64 * 1024);
+    let mut chunker = ChunkerImpl::new(64 * 1024);
 
     let mut pos = 0;
 
     // test2: feed with whole buffer
     while pos < buffer.len() {
-        let k = chunker.scan(&buffer[pos..]);
+        let k = chunker.scan(&buffer[pos..], &ctx);
         if k != 0 {
             chunks2.push((pos, k));
             pos += k;
@@ -251,13 +363,13 @@ fn test_chunker1() {
         for (_offset, len) in &chunks1 {
             size1 += len;
         }
-        println!("Chunks1:{}\n{:?}\n", size1, chunks1);
+        println!("Chunks1:{size1}\n{chunks1:?}\n");
 
         let mut size2 = 0;
         for (_offset, len) in &chunks2 {
             size2 += len;
         }
-        println!("Chunks2:{}\n{:?}\n", size2, chunks2);
+        println!("Chunks2:{size2}\n{chunks2:?}\n");
 
         if size1 != 256 * 4 * 1024 {
             panic!("wrong size for chunks1");
@@ -267,5 +379,101 @@ fn test_chunker1() {
         }
 
         panic!("got different chunks");
+    }
+}
+
+#[test]
+fn test_suggested_boundary() {
+    let mut buffer = Vec::new();
+
+    for i in 0..(256 * 1024) {
+        for j in 0..4 {
+            let byte = ((i >> (j << 3)) & 0xff) as u8;
+            buffer.push(byte);
+        }
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut chunker = PayloadChunker::new(64 * 1024, rx);
+
+    // Suggest chunk boundary within regular chunk
+    tx.send(32 * 1024).unwrap();
+    // Suggest chunk boundary within regular chunk, resulting chunk being 0
+    tx.send(32 * 1024).unwrap();
+    // Suggest chunk boundary in the past, must be ignored
+    tx.send(0).unwrap();
+    // Suggest chunk boundary aligned with regular boundary
+    tx.send(405521).unwrap();
+
+    let mut pos = 0;
+    let mut last = 0;
+
+    let mut chunks1: Vec<(usize, usize)> = vec![];
+    let mut chunks2: Vec<(usize, usize)> = vec![];
+    let mut ctx = Context::default();
+
+    // test1: feed single bytes with suggeset boundary
+    while pos < buffer.len() {
+        ctx.total += 1;
+        let k = chunker.scan(&buffer[pos..pos + 1], &ctx);
+        pos += 1;
+        if k != 0 {
+            let prev = last;
+            last = pos;
+            ctx.base += pos as u64;
+            ctx.total = 0;
+            chunks1.push((prev, pos - prev));
+        }
+    }
+    chunks1.push((last, buffer.len() - last));
+
+    let mut pos = 0;
+    let mut ctx = Context {
+        total: buffer.len() as u64,
+        ..Default::default()
+    };
+    chunker.reset();
+    // Suggest chunk boundary within regular chunk
+    tx.send(32 * 1024).unwrap();
+    // Suggest chunk boundary within regular chunk,
+    // resulting chunk being to small and therefore ignored
+    tx.send(32 * 1024).unwrap();
+    // Suggest chunk boundary in the past, must be ignored
+    tx.send(0).unwrap();
+    // Suggest chunk boundary aligned with regular boundary
+    tx.send(405521).unwrap();
+
+    while pos < buffer.len() {
+        let k = chunker.scan(&buffer[pos..], &ctx);
+        if k != 0 {
+            chunks2.push((pos, k));
+            pos += k;
+            ctx.base += pos as u64;
+            ctx.total = (buffer.len() - pos) as u64;
+        } else {
+            break;
+        }
+    }
+
+    chunks2.push((pos, buffer.len() - pos));
+
+    if chunks1 != chunks2 {
+        let mut size1 = 0;
+        for (_offset, len) in &chunks1 {
+            size1 += len;
+        }
+        println!("Chunks1: {size1}\n{chunks1:?}\n");
+
+        let mut size2 = 0;
+        for (_offset, len) in &chunks2 {
+            size2 += len;
+        }
+        println!("Chunks2: {size2}\n{chunks2:?}\n");
+
+        panic!("got different chunks");
+    }
+
+    let expected_sizes = [32768, 110609, 229376, 32768, 262144, 262144, 118767];
+    for ((_, chunk_size), expected) in chunks1.iter().zip(expected_sizes.iter()) {
+        assert_eq!(chunk_size, expected);
     }
 }

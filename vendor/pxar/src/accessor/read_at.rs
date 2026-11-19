@@ -73,7 +73,7 @@ pub struct ReadAtOperation<'a> {
     _marker: PhantomData<&'a mut [u8]>,
 }
 
-impl<'a> ReadAtOperation<'a> {
+impl ReadAtOperation<'_> {
     /// Create a new [`ReadAtOperation`].
     pub fn new<T: Into<Box<dyn Any + Send + Sync>>>(cookie: T) -> Self {
         Self {
@@ -112,7 +112,7 @@ impl<'a, T: ReadAt> ReadAtImpl<'a, T> {
     }
 }
 
-impl<'a, T: ReadAt> Future for ReadAtImpl<'a, T> {
+impl<T: ReadAt> Future for ReadAtImpl<'_, T> {
     type Output = io::Result<usize>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
@@ -132,7 +132,7 @@ impl<T: ReadAt> ReadAtState<'_, T> {
     }
 }
 
-impl<'a, T: ReadAt> Future for ReadAtState<'a, T> {
+impl<T: ReadAt> Future for ReadAtState<'_, T> {
     type Output = io::Result<usize>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {

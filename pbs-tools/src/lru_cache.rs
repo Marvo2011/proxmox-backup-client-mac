@@ -4,7 +4,7 @@
 //! A HashMap is used for fast access by a given key and a doubly linked list
 //! is used to keep track of the cache access order.
 
-use std::collections::{hash_map::Entry, HashMap};
+use std::collections::{HashMap, hash_map::Entry};
 use std::marker::PhantomData;
 
 /// Interface for getting values on cache misses.
@@ -60,10 +60,10 @@ impl<K, V> CacheNode<K, V> {
 /// assert_eq!(cache.get_mut(1), None);
 /// assert_eq!(cache.len(), 0);
 ///
-/// cache.insert(1, 1);
-/// cache.insert(2, 2);
-/// cache.insert(3, 3);
-/// cache.insert(4, 4);
+/// cache.insert(1, 1, |_| Ok(()));
+/// cache.insert(2, 2, |_| Ok(()));
+/// cache.insert(3, 3, |_| Ok(()));
+/// cache.insert(4, 4, |_| Ok(()));
 /// assert_eq!(cache.len(), 3);
 ///
 /// assert_eq!(cache.get_mut(1), None);
@@ -77,9 +77,9 @@ impl<K, V> CacheNode<K, V> {
 /// assert_eq!(cache.len(), 0);
 /// assert_eq!(cache.get_mut(2), None);
 /// // access will fill in missing cache entry by fetching from LruCacher
-/// assert_eq!(cache.access(2, &mut LruCacher {}).unwrap(), Some(&mut 2));
+/// assert_eq!(cache.access(2, &mut LruCacher {}, |_| Ok(())).unwrap(), Some(&mut 2));
 ///
-/// cache.insert(1, 1);
+/// cache.insert(1, 1, |_| Ok(()));
 /// assert_eq!(cache.get_mut(1), Some(&mut 1));
 ///
 /// cache.clear();
@@ -121,6 +121,8 @@ impl<K, V> LruCache<K, V> {
 
 impl<K: std::cmp::Eq + std::hash::Hash + Copy, V> LruCache<K, V> {
     /// Create LRU cache instance which holds up to `capacity` nodes at once.
+    ///
+    /// Forces a minimum `capacity` of 1 in case of the given value being 0.
     pub fn new(capacity: usize) -> Self {
         let capacity = capacity.max(1);
         Self {
@@ -133,7 +135,10 @@ impl<K: std::cmp::Eq + std::hash::Hash + Copy, V> LruCache<K, V> {
 
     /// Insert or update an entry identified by `key` with the given `value`.
     /// This entry is placed as the most recently used node at the head.
-    pub fn insert(&mut self, key: K, value: V) {
+    pub fn insert<F>(&mut self, key: K, value: V, removed: F) -> Result<bool, anyhow::Error>
+    where
+        F: Fn(K) -> Result<(), anyhow::Error>,
+    {
         match self.map.entry(key) {
             Entry::Occupied(mut o) => {
                 // Node present, update value
@@ -142,6 +147,7 @@ impl<K: std::cmp::Eq + std::hash::Hash + Copy, V> LruCache<K, V> {
                 let mut node = unsafe { Box::from_raw(node_ptr) };
                 node.value = value;
                 let _node_ptr = Box::into_raw(node);
+                Ok(true)
             }
             Entry::Vacant(v) => {
                 // Node not present, insert a new one
@@ -157,8 +163,11 @@ impl<K: std::cmp::Eq + std::hash::Hash + Copy, V> LruCache<K, V> {
                 // avoid borrow conflict. This means there are temporarily
                 // self.capacity + 1 cache nodes.
                 if self.map.len() > self.capacity {
-                    self.pop_tail();
+                    if let Some(removed_node) = self.pop_tail() {
+                        removed(removed_node)?;
+                    }
                 }
+                Ok(false)
             }
         }
     }
@@ -172,11 +181,12 @@ impl<K: std::cmp::Eq + std::hash::Hash + Copy, V> LruCache<K, V> {
     }
 
     /// Remove the least recently used node from the cache.
-    fn pop_tail(&mut self) {
+    fn pop_tail(&mut self) -> Option<K> {
         if let Some(old_tail) = self.list.pop_tail() {
             // Remove HashMap entry for old tail
-            self.map.remove(&old_tail.key);
+            return self.map.remove(&old_tail.key).map(|_| old_tail.key);
         }
+        None
     }
 
     /// Get a mutable reference to the value identified by `key`.
@@ -204,11 +214,15 @@ impl<K: std::cmp::Eq + std::hash::Hash + Copy, V> LruCache<K, V> {
     /// value.
     /// If fetch returns a value, it is inserted as the most recently used entry
     /// in the cache.
-    pub fn access<'a>(
+    pub fn access<'a, F>(
         &'a mut self,
         key: K,
         cacher: &mut dyn Cacher<K, V>,
-    ) -> Result<Option<&'a mut V>, anyhow::Error> {
+        removed: F,
+    ) -> Result<Option<&'a mut V>, anyhow::Error>
+    where
+        F: Fn(K) -> Result<(), anyhow::Error>,
+    {
         match self.map.entry(key) {
             Entry::Occupied(mut o) => {
                 // Cache hit, birng node to front of list
@@ -232,7 +246,9 @@ impl<K: std::cmp::Eq + std::hash::Hash + Copy, V> LruCache<K, V> {
                         // avoid borrow conflict. This means there are temporarily
                         // self.capacity + 1 cache nodes.
                         if self.map.len() > self.capacity {
-                            self.pop_tail();
+                            if let Some(removed_node) = self.pop_tail() {
+                                removed(removed_node)?;
+                            }
                         }
                     }
                 }

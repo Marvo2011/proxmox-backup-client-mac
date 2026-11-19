@@ -1,3 +1,5 @@
+#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+
 use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::fmt::Display;
@@ -5,22 +7,21 @@ use std::str::FromStr;
 
 use context::context;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use serde_json::Value;
+use serde_json::json;
+use tracing::{error, info};
 
 use proxmox_schema::api;
 use proxmox_section_config::SectionConfigData;
 use proxmox_uuid::Uuid;
 
 pub mod matcher;
-use matcher::{MatcherConfig, MATCHER_TYPENAME};
+use matcher::{MATCHER_TYPENAME, MatcherConfig};
 
 pub mod api;
 pub mod config;
 pub mod context;
 pub mod endpoints;
-pub mod filter;
-pub mod group;
 pub mod renderer;
 pub mod schema;
 
@@ -136,6 +137,7 @@ impl FromStr for Severity {
 #[api()]
 #[derive(Clone, Debug, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd)]
 #[serde(rename_all = "kebab-case")]
+/// The origin of a notification configuration entry.
 pub enum Origin {
     /// User-created config entry
     UserCreated,
@@ -228,7 +230,8 @@ impl Notification {
     }
     #[cfg(feature = "mail-forwarder")]
     pub fn new_forwarded_mail(raw_mail: &[u8], uid: Option<u32>) -> Result<Self, Error> {
-        let message = mail_parser::Message::parse(raw_mail)
+        let message = mail_parser::MessageParser::default()
+            .parse(raw_mail)
             .ok_or_else(|| Error::Generic("could not parse forwarded email".to_string()))?;
 
         let title = message.subject().unwrap_or_default().into();
@@ -296,9 +299,7 @@ impl Config {
                     if let Some(obj) = value.as_object_mut() {
                         obj.insert("origin".to_string(), Value::String("builtin".into()));
                     } else {
-                        log::error!(
-                            "section config entry is not an object. This should not happen"
-                        );
+                        error!("section config entry is not an object. This should not happen");
                     }
                 } else {
                     // Entry is built-in, but it has been modified by the user.
@@ -308,9 +309,7 @@ impl Config {
                             Value::String("modified-builtin".into()),
                         );
                     } else {
-                        log::error!(
-                            "section config entry is not an object. This should not happen"
-                        );
+                        error!("section config entry is not an object. This should not happen");
                     }
                 }
             } else {
@@ -319,7 +318,7 @@ impl Config {
                 if let Some(obj) = val.as_object_mut() {
                     obj.insert("origin".to_string(), Value::String("builtin".into()));
                 } else {
-                    log::error!("section config entry is not an object. This should not happen");
+                    error!("section config entry is not an object. This should not happen");
                 }
                 config
                     .set_data(key, builtin_typename, val)
@@ -353,7 +352,7 @@ impl Config {
             if let Some(obj) = value.as_object_mut() {
                 obj.remove("origin");
             } else {
-                log::error!("section config entry is not an object. This should not happen");
+                error!("section config entry is not an object. This should not happen");
             }
         }
 
@@ -394,7 +393,7 @@ macro_rules! parse_endpoints_with_private_config {
                 match $config.private_config.sections.get(&config.name) {
                     Some((section_type_name, private_config)) => {
                         if $type_name != section_type_name {
-                            log::error!(
+                            error!(
                                 "Could not instantiate endpoint '{name}': \
                                 private config has wrong type",
                                 name = config.name
@@ -408,7 +407,7 @@ macro_rules! parse_endpoints_with_private_config {
                             private_config: private_config.clone(),
                         }));
                     }
-                    None => log::error!(
+                    None => error!(
                         "Could not instantiate endpoint '{name}': \
                             private config does not exist",
                         name = config.name
@@ -497,6 +496,23 @@ impl Bus {
             );
         }
 
+        #[cfg(feature = "webhook")]
+        {
+            use endpoints::webhook::WEBHOOK_TYPENAME;
+            use endpoints::webhook::{WebhookConfig, WebhookEndpoint, WebhookPrivateConfig};
+            endpoints.extend(
+                parse_endpoints_with_private_config!(
+                    config,
+                    WebhookConfig,
+                    WebhookPrivateConfig,
+                    WebhookEndpoint,
+                    WEBHOOK_TYPENAME
+                )?
+                .into_iter()
+                .map(|e| (e.name().into(), e)),
+            );
+        }
+
         let matchers = config
             .config
             .convert_to_typed_array(MATCHER_TYPENAME)
@@ -531,21 +547,21 @@ impl Bus {
 
                 if endpoint.disabled() {
                     // Skip this target if it is disabled
-                    log::info!("skipping disabled target '{name}'");
+                    info!("skipping disabled target '{name}'");
                     continue;
                 }
 
                 match endpoint.send(notification) {
                     Ok(_) => {
-                        log::info!("notified via target `{name}`");
+                        info!("notified via target `{name}`");
                     }
                     Err(e) => {
                         // Only log on errors, do not propagate fail to the caller.
-                        log::error!("could not notify via target `{name}`: {e}");
+                        error!("could not notify via target `{name}`: {e}");
                     }
                 }
             } else {
-                log::error!("could not notify via target '{target}', it does not exist");
+                error!("could not notify via target '{target}', it does not exist");
             }
         }
     }
@@ -582,6 +598,10 @@ impl Bus {
 #[cfg(test)]
 mod tests {
     use std::{cell::RefCell, rc::Rc};
+
+    use proxmox_match_expression::Expression;
+
+    use crate::matcher::{expression::NotificationMatcher, severity::SeverityMatcher};
 
     use super::*;
 
@@ -622,6 +642,10 @@ mod tests {
         }
     }
 
+    fn expression_to_string(expression: Expression<NotificationMatcher>) -> String {
+        serde_json::to_string(&expression).unwrap()
+    }
+
     #[test]
     fn test_add_mock_endpoint() -> Result<(), Error> {
         let mock = MockEndpoint::new("endpoint");
@@ -631,6 +655,7 @@ mod tests {
 
         let matcher = MatcherConfig {
             target: vec!["endpoint".into()],
+            expression: Some(expression_to_string(Expression::Constant(true))),
             ..Default::default()
         };
 
@@ -661,14 +686,24 @@ mod tests {
 
         bus.add_matcher(MatcherConfig {
             name: "matcher1".into(),
-            match_severity: vec!["warning,error".parse()?],
+            expression: Some(expression_to_string(
+                SeverityMatcher {
+                    severities: vec![Severity::Error, Severity::Warning],
+                }
+                .into(),
+            )),
             target: vec!["mock1".into()],
             ..Default::default()
         });
 
         bus.add_matcher(MatcherConfig {
             name: "matcher2".into(),
-            match_severity: vec!["error".parse()?],
+            expression: Some(expression_to_string(
+                SeverityMatcher {
+                    severities: vec![Severity::Error],
+                }
+                .into(),
+            )),
             target: vec!["mock2".into()],
             ..Default::default()
         });

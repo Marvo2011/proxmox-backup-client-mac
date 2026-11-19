@@ -5,7 +5,7 @@ use std::io::Write;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use anyhow::{bail, format_err, Error};
+use anyhow::{Error, bail, format_err};
 
 use proxmox_auth_api::api::Authenticator;
 use proxmox_auth_api::types::Username;
@@ -25,7 +25,7 @@ async fn run() -> Result<(), Error> {
         None => bail!("missing username or --check parameter"),
         Some(ck) if ck == "--check" => (
             args.next()
-                .ok_or_else(|| format_err!("expected username as paramter"))?
+                .ok_or_else(|| format_err!("expected username as parameter"))?
                 .try_into()?,
             false,
         ),

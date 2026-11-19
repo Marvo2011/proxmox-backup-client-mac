@@ -1,41 +1,126 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
+#[cfg(target_os = "linux")]
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, SystemTime};
 
-use anyhow::{bail, format_err, Error};
-use lazy_static::lazy_static;
-use nix::unistd::{unlinkat, UnlinkatFlags};
+use anyhow::{Context, Error, bail, format_err};
+use http_body_util::BodyExt;
+use hyper::Method;
+use hyper::body::Bytes;
+use nix::unistd::{UnlinkatFlags, unlinkat};
+use pbs_tools::lru_cache::LruCache;
+use tokio::io::AsyncWriteExt;
+use tracing::{info, warn};
 
 use proxmox_human_byte::HumanByte;
+use proxmox_s3_client::{
+    RequestCounterThresholds, S3Client, S3ClientConf, S3ClientOptions, S3ObjectKey, S3PathPrefix,
+    S3RateLimiterOptions, S3RequestCounterConfig, SharedRequestCounters,
+};
 use proxmox_schema::ApiType;
 
 use proxmox_sys::error::SysError;
-use proxmox_sys::fs::{file_read_optional_string, replace_file, CreateOptions};
-use proxmox_sys::fs::{lock_dir_noblock, DirLockGuard};
-use proxmox_sys::process_locker::ProcessLockSharedGuard;
-use proxmox_sys::WorkerTaskContext;
-use proxmox_sys::{task_log, task_warn};
+use proxmox_sys::fs::{CreateOptions, file_read_optional_string, replace_file};
+#[cfg(target_os = "linux")]
+use proxmox_sys::linux::procfs::MountInfo;
+use proxmox_sys::process_locker::{ProcessLockExclusiveGuard, ProcessLockSharedGuard};
+use proxmox_time::{TimeSpan, epoch_i64};
+use proxmox_worker_task::WorkerTaskContext;
 
 use pbs_api_types::{
-    Authid, BackupNamespace, BackupType, ChunkOrder, DataStoreConfig, DatastoreFSyncLevel,
-    DatastoreTuning, GarbageCollectionStatus, MaintenanceMode, MaintenanceType, Operation, UPID,
+    ArchiveType, Authid, BackupGroupDeleteStats, BackupNamespace, BackupType, ChunkOrder,
+    DEFAULT_SNAPSHOT_TIME_SKEW_SECS, DataStoreConfig, DatastoreBackendConfig, DatastoreBackendType,
+    GarbageCollectionCacheStats, GarbageCollectionStatus, MAX_NAMESPACE_DEPTH, MaintenanceMode,
+    MaintenanceType, Operation, S3Statistics, UPID,
 };
+use pbs_config::s3::S3_CFG_TYPE_ID;
+use pbs_config::{BackupLockGuard, ConfigVersionCache};
+use proxmox_section_config::SectionConfigData;
 
-use crate::backup_info::{BackupDir, BackupGroup, BackupGroupDeleteStats};
-use crate::chunk_store::ChunkStore;
+use crate::backup_info::{
+    BackupDir, BackupGroup, BackupInfo, OLD_LOCKING, PROTECTED_MARKER_FILENAME,
+};
+use crate::chunk_store::{ChunkStore, is_bad_chunk_suffix};
 use crate::dynamic_index::{DynamicIndexReader, DynamicIndexWriter};
 use crate::fixed_index::{FixedIndexReader, FixedIndexWriter};
 use crate::hierarchy::{ListGroups, ListGroupsType, ListNamespaces, ListNamespacesRecursive};
 use crate::index::IndexFile;
-use crate::manifest::{archive_type, ArchiveType};
+use crate::s3::{S3_CONTENT_PREFIX, digest_from_object_key};
 use crate::task_tracking::{self, update_active_operations};
-use crate::DataBlob;
+use crate::{DataBlob, LocalDatastoreLruCache};
 
-lazy_static! {
-    static ref DATASTORE_MAP: Mutex<HashMap<String, Arc<DataStoreImpl>>> =
-        Mutex::new(HashMap::new());
+// Cache for fully parsed datastore.cfg
+struct DatastoreConfigCache {
+    // Parsed datastore.cfg file
+    config: Arc<SectionConfigData>,
+    // Digest of the datastore.cfg file
+    digest: [u8; 32],
+    // Generation number from ConfigVersionCache
+    last_generation: usize,
+    // Last update time (epoch seconds)
+    last_update: i64,
+}
+
+static DATASTORE_CONFIG_CACHE: LazyLock<Mutex<Option<DatastoreConfigCache>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+static DATASTORE_MAP: LazyLock<Mutex<HashMap<String, Arc<DataStoreImpl>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Max age in seconds to reuse the cached datastore config.
+const DATASTORE_CONFIG_CACHE_TTL_SECS: i64 = 60;
+/// Filename to store backup group notes
+pub const GROUP_NOTES_FILE_NAME: &str = "notes";
+/// Filename to store backup group owner
+pub const GROUP_OWNER_FILE_NAME: &str = "owner";
+/// Filename for in-use marker stored on S3 object store backend
+pub const S3_DATASTORE_IN_USE_MARKER: &str = ".in-use";
+/// Base directory for storing shared memory mapped s3 request counters
+pub const S3_CLIENT_REQUEST_COUNTER_BASE_PATH: &str = "/var/lib/proxmox-backup/s3-statistics";
+pub(crate) const NAMESPACE_MARKER_FILENAME: &str = ".namespace";
+const S3_CLIENT_RATE_LIMITER_BASE_PATH: &str = pbs_buildcfg::rundir!("/s3/shmem/tbf");
+// s3 put request times out after upload_size / 1 Kib/s, so about 2.3 hours for 8 MiB
+const CHUNK_LOCK_TIMEOUT: Duration = Duration::from_secs(3 * 60 * 60);
+// s3 deletion batch size to avoid 1024 open files soft limit
+const S3_DELETE_BATCH_LIMIT: usize = 100;
+// max defer time for s3 batch deletions
+const S3_DELETE_DEFER_LIMIT_SECONDS: Duration = Duration::from_secs(60 * 5);
+// upper bound on concurrent snapshot locks during move operations to avoid exhausting FDs
+const MAX_SNAPSHOT_LOCKS: usize = 512;
+
+/// Error from a locked per-group operation. Soft errors (e.g. lock conflicts)
+/// are retryable, hard errors are not.
+pub(crate) enum BackupGroupOpError {
+    Soft(Error),
+    Hard(Error),
+}
+
+/// Check that moving/syncing `namespaces` from `source` to `target` stays within
+/// `MAX_NAMESPACE_DEPTH`.
+pub fn check_namespace_depth_limit(
+    source: &BackupNamespace,
+    target: &BackupNamespace,
+    namespaces: &[BackupNamespace],
+) -> Result<(), Error> {
+    let target_depth = target.depth();
+    let sub_depth = namespaces
+        .iter()
+        .map(BackupNamespace::depth)
+        .max()
+        .map_or(0, |v| v - source.depth());
+
+    if sub_depth + target_depth > MAX_NAMESPACE_DEPTH {
+        bail!(
+            "namespace depth limit exceeded: source subtree depth ({sub_depth}) + target \
+            depth ({target_depth}) would exceed max ({MAX_NAMESPACE_DEPTH})",
+        );
+    }
+    Ok(())
 }
 
 /// checks if auth_id is owner, or, if owner is a token, if
@@ -49,18 +134,94 @@ pub fn check_backup_owner(owner: &Authid, auth_id: &Authid) -> Result<(), Error>
     Ok(())
 }
 
+/// Removable datastores are a server feature, which requires Linux.
+#[cfg(not(target_os = "linux"))]
+fn is_datastore_mounted_at(_store_mount_point: String, _device_uuid: &str) -> bool {
+    false
+}
+
+/// Check if a device with a given UUID is currently mounted at store_mount_point by
+/// comparing the `st_rdev` values of `/dev/disk/by-uuid/<uuid>` and the source device in
+/// /proc/self/mountinfo.
+///
+/// If we can't check if it is mounted, we treat that as not mounted,
+/// returning false.
+///
+/// Reasons it could fail other than not being mounted where expected:
+///  - could not read `/proc/self/mountinfo`
+///  - could not stat `/dev/disk/by-uuid/<uuid>`
+///  - `/dev/disk/by-uuid/<uuid>` is not a block device
+///
+/// Since these are very much out of our control, there is no real value in distinguishing
+/// between them, so for this function they all are treated as 'device not mounted'
+#[cfg(target_os = "linux")]
+fn is_datastore_mounted_at(store_mount_point: String, device_uuid: &str) -> bool {
+    use nix::sys::stat::SFlag;
+
+    let store_mount_point = Path::new(&store_mount_point);
+
+    let dev_node = match nix::sys::stat::stat(format!("/dev/disk/by-uuid/{device_uuid}").as_str()) {
+        Ok(stat) if SFlag::from_bits_truncate(stat.st_mode) == SFlag::S_IFBLK => stat.st_rdev,
+        _ => return false,
+    };
+
+    let Ok(mount_info) = MountInfo::read() else {
+        return false;
+    };
+
+    for (_, entry) in mount_info {
+        let Some(source) = entry.mount_source else {
+            continue;
+        };
+
+        if entry.mount_point != store_mount_point || !source.as_bytes().starts_with(b"/") {
+            continue;
+        }
+
+        if let Ok(stat) = nix::sys::stat::stat(source.as_os_str()) {
+            let sflag = SFlag::from_bits_truncate(stat.st_mode);
+
+            if sflag == SFlag::S_IFBLK && stat.st_rdev == dev_node {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+pub fn get_datastore_mount_status(config: &DataStoreConfig) -> Option<bool> {
+    let device_uuid = config.backing_device.as_ref()?;
+    Some(is_datastore_mounted_at(config.absolute_path(), device_uuid))
+}
+
+pub fn ensure_datastore_is_mounted(config: &DataStoreConfig) -> Result<(), Error> {
+    match get_datastore_mount_status(config) {
+        Some(true) => Ok(()),
+        Some(false) => Err(format_err!("Datastore '{}' is not mounted", config.name)),
+        None => Ok(()),
+    }
+}
+
 /// Datastore Management
 ///
 /// A Datastore can store severals backups, and provides the
 /// management interface for backup.
 pub struct DataStoreImpl {
     chunk_store: Arc<ChunkStore>,
-    gc_mutex: Mutex<()>,
+    gc_mutex: Mutex<Option<ProcessLockExclusiveGuard>>,
     last_gc_status: Mutex<GarbageCollectionStatus>,
     verify_new: bool,
     chunk_order: ChunkOrder,
-    last_digest: Option<[u8; 32]>,
-    sync_level: DatastoreFSyncLevel,
+    backend_config: DatastoreBackendConfig,
+    lru_store_caching: Option<LocalDatastoreLruCache>,
+    thread_settings: DatastoreThreadSettings,
+    /// datastore.cfg cache generation number at lookup time, used to
+    /// invalidate this cached `DataStoreImpl`
+    config_generation: Option<usize>,
+    request_counters: Option<Arc<SharedRequestCounters>>,
+    thresholds_exceeded_callback: Option<ThresholdsExceededCallback>,
+    max_snapshot_time_skew: i64,
 }
 
 impl DataStoreImpl {
@@ -69,13 +230,40 @@ impl DataStoreImpl {
     pub(crate) unsafe fn new_test() -> Arc<Self> {
         Arc::new(Self {
             chunk_store: Arc::new(unsafe { ChunkStore::panic_store() }),
-            gc_mutex: Mutex::new(()),
+            gc_mutex: Mutex::new(None),
             last_gc_status: Mutex::new(GarbageCollectionStatus::default()),
             verify_new: false,
             chunk_order: Default::default(),
-            last_digest: None,
-            sync_level: Default::default(),
+            backend_config: Default::default(),
+            lru_store_caching: None,
+            thread_settings: Default::default(),
+            config_generation: None,
+            request_counters: None,
+            thresholds_exceeded_callback: None,
+            max_snapshot_time_skew: i64::try_from(DEFAULT_SNAPSHOT_TIME_SKEW_SECS).unwrap(),
         })
+    }
+}
+
+pub type ThresholdsExceededCallback = fn(&str, &str, u64, u64) -> Result<(), Error>;
+
+pub struct DataStoreLookup<'a> {
+    name: &'a str,
+    operation: Operation,
+    thresholds_exceeded_callback: Option<ThresholdsExceededCallback>,
+}
+
+impl<'a> DataStoreLookup<'a> {
+    pub fn with(
+        name: &'a str,
+        operation: Operation,
+        thresholds_exceeded_callback: Option<ThresholdsExceededCallback>,
+    ) -> Self {
+        Self {
+            name,
+            operation,
+            thresholds_exceeded_callback,
+        }
     }
 }
 
@@ -114,18 +302,170 @@ impl Drop for DataStore {
 
             // remove datastore from cache iff
             //  - last task finished, and
-            //  - datastore is in a maintenance mode that mandates it
-            let remove_from_cache = last_task
-                && pbs_config::datastore::config()
-                    .and_then(|(s, _)| s.lookup::<DataStoreConfig>("datastore", self.name()))
-                    .map_or(false, |c| {
-                        c.get_maintenance_mode().map_or(false, |m| m.is_offline())
-                    });
+            //  - datastore is in a maintenance mode that mandates it, or the datastore was removed from datastore.cfg
+
+            // first check: check if last task finished
+            if !last_task {
+                return;
+            }
+
+            // determine whether we should evict from DATASTORE_MAP.
+            let remove_from_cache = match datastore_section_config_cached(false) {
+                Ok((section_config, _gen)) => {
+                    match section_config.lookup::<DataStoreConfig>("datastore", self.name()) {
+                        // second check: check if maintenance mode requires closing FDs
+                        Ok(config) => config
+                            .get_maintenance_mode()
+                            .is_some_and(|m| m.clear_from_cache()),
+                        Err(err) => {
+                            // datastore removed from config; evict cached entry if available (without checking maintenance mode)
+                            log::warn!(
+                                "DataStore::drop: datastore '{}' missing from datastore.cfg; evicting cached instance: {err}",
+                                self.name()
+                            );
+                            true
+                        }
+                    }
+                }
+                Err(err) => {
+                    log::warn!(
+                        "DataStore::drop: failed to load datastore.cfg for '{}'; skipping cache-eviction: {err}",
+                        self.name()
+                    );
+                    false
+                }
+            };
 
             if remove_from_cache {
                 DATASTORE_MAP.lock().unwrap().remove(self.name());
             }
         }
+    }
+}
+
+#[derive(Clone)]
+/// Storage backend type for a datastore.
+pub enum DatastoreBackend {
+    /// Storage is located on local filesystem.
+    Filesystem,
+    /// Storage is located on S3 compatible object store.
+    S3(Arc<S3Client>),
+}
+
+impl DatastoreBackend {
+    /// Reads the index file and uploads it to the backend.
+    ///
+    /// Returns with true if the backend was updated, false if no action needed to be performed
+    pub async fn upload_index_to_backend(
+        &self,
+        backup_dir: &BackupDir,
+        name: &str,
+    ) -> Result<bool, Error> {
+        match self {
+            Self::Filesystem => Ok(false),
+            Self::S3(s3_client) => {
+                let object_key = crate::s3::object_key_from_path(&backup_dir.relative_path(), name)
+                    .context("invalid index file object key")?;
+
+                let mut full_path = backup_dir.full_path();
+                full_path.push(name);
+                let data = tokio::fs::read(&full_path)
+                    .await
+                    .context("failed to read index contents")?;
+                let contents = hyper::body::Bytes::from(data);
+                let _is_duplicate = s3_client
+                    .upload_replace_with_retry(object_key, contents)
+                    .await?;
+                Ok(true)
+            }
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+/// Amount of threads to use for certain jobs in a datastore.
+pub struct DatastoreThreadSettings {
+    /// # of threads to use to verify in verify job
+    pub verify_job_verify_threads: Option<usize>,
+    /// # of threads to use to read in verify job
+    pub verify_job_read_threads: Option<usize>,
+}
+
+impl DatastoreThreadSettings {
+    fn new(
+        verify_job_verify_threads: Option<usize>,
+        verify_job_read_threads: Option<usize>,
+    ) -> Self {
+        Self {
+            verify_job_verify_threads,
+            verify_job_read_threads,
+        }
+    }
+}
+
+/// Returns the parsed datastore config (`datastore.cfg`) and its
+/// generation.
+///
+/// Uses `ConfigVersionCache` to detect stale entries:
+/// - If the cached generation matches the current generation and TTL is
+///   OK, the cached config is returned.
+/// - Otherwise the config is re-read from disk. If `update_cache` is
+///   `true` and a previous cached entry exists with the same generation
+///   but a different digest, this indicates the config has changed
+///   (e.g. manual edit) and the generation must be bumped. Callers
+///   that set `update_cache = true` must hold the datastore config lock
+///   to avoid racing with concurrent config changes.
+/// - If `update_cache` is `false`, the freshly read config is returned
+///   but the cache and generation are left unchanged.
+///
+/// If `ConfigVersionCache` is not available, the config is always read
+/// from disk and `None` is returned as the generation.
+fn datastore_section_config_cached(
+    update_cache: bool,
+) -> Result<(Arc<SectionConfigData>, Option<usize>), Error> {
+    let mut config_cache = DATASTORE_CONFIG_CACHE.lock().unwrap();
+
+    if let Ok(version_cache) = ConfigVersionCache::new() {
+        let now = epoch_i64();
+        let current_gen = version_cache.datastore_generation();
+        if let Some(cached) = config_cache.as_ref() {
+            // Fast path: re-use cached datastore.cfg if generation matches and TTL not expired
+            if cached.last_generation == current_gen
+                && now - cached.last_update < DATASTORE_CONFIG_CACHE_TTL_SECS
+            {
+                return Ok((cached.config.clone(), Some(cached.last_generation)));
+            }
+        }
+        // Slow path: re-read datastore.cfg
+        let (config_raw, digest) = pbs_config::datastore::config()?;
+        let config = Arc::new(config_raw);
+
+        let mut effective_gen = current_gen;
+        if update_cache {
+            // Bump the generation if the config has been changed manually.
+            // This ensures that Drop handlers will detect that a newer config exists
+            // and will not rely on a stale cached entry for maintenance mandate.
+            if let Some(cached) = config_cache.as_ref() {
+                if cached.last_generation == current_gen && cached.digest != digest {
+                    effective_gen = version_cache.increase_datastore_generation() + 1;
+                }
+            }
+
+            // Persist
+            *config_cache = Some(DatastoreConfigCache {
+                config: config.clone(),
+                digest,
+                last_generation: effective_gen,
+                last_update: now,
+            });
+        }
+
+        Ok((config, Some(effective_gen)))
+    } else {
+        // Fallback path, no config version cache: read datastore.cfg and return None as generation
+        *config_cache = None;
+        let (config_raw, _digest) = pbs_config::datastore::config()?;
+        Ok((Arc::new(config_raw), None))
     }
 }
 
@@ -139,65 +479,183 @@ impl DataStore {
         })
     }
 
-    pub fn lookup_datastore(
-        name: &str,
-        operation: Option<Operation>,
-    ) -> Result<Arc<DataStore>, Error> {
+    /// Get the backend for this datastore based on it's configuration
+    pub fn backend(&self) -> Result<DatastoreBackend, Error> {
+        let backend = match self.backend_type() {
+            DatastoreBackendType::Filesystem => DatastoreBackend::Filesystem,
+            DatastoreBackendType::S3 => {
+                let s3_client_id = self
+                    .inner
+                    .backend_config
+                    .client
+                    .as_ref()
+                    .ok_or_else(|| format_err!("missing client for s3 backend"))?;
+                let bucket = self
+                    .inner
+                    .backend_config
+                    .bucket
+                    .clone()
+                    .ok_or_else(|| format_err!("missing bucket for s3 backend"))?;
+
+                let (config, _config_digest) = pbs_config::s3::config()?;
+                let config: S3ClientConf = config.lookup(S3_CFG_TYPE_ID, s3_client_id)?;
+                let backup_user = proxmox_product_config::get_api_user();
+                let rate_limiter_options = S3RateLimiterOptions {
+                    id: s3_client_id.to_string(),
+                    user: backup_user.clone(),
+                    base_path: S3_CLIENT_RATE_LIMITER_BASE_PATH.into(),
+                };
+                let request_counter_config = S3RequestCounterConfig {
+                    id: format!("{s3_client_id}-{bucket}-{}", self.name()),
+                    user: backup_user.clone(),
+                    base_path: S3_CLIENT_REQUEST_COUNTER_BASE_PATH.into(),
+                };
+                let http_proxy = if config.config.use_node_proxy.unwrap_or(false) {
+                    pbs_config::node::node_http_proxy_config()?
+                } else {
+                    None
+                };
+
+                let mut options = S3ClientOptions::from_config(
+                    config.config,
+                    config.secret_key,
+                    Some(bucket),
+                    self.name().to_owned(),
+                    Some(rate_limiter_options),
+                    http_proxy,
+                    Some(request_counter_config),
+                );
+                if let Some(notify) = self.inner.thresholds_exceeded_callback {
+                    let name = self.name().to_owned();
+                    options.threshold_callback =
+                        Some(Box::new(move |counter_id, threshold, value| {
+                            if let Err(err) = notify(&name, counter_id, threshold, value) {
+                                log::error!("failed to send notification: {err:?}");
+                            }
+                        }));
+                }
+                let s3_client = S3Client::new(options)?;
+                DatastoreBackend::S3(Arc::new(s3_client))
+            }
+        };
+
+        Ok(backend)
+    }
+
+    pub fn backend_type(&self) -> DatastoreBackendType {
+        self.inner.backend_config.ty.unwrap_or_default()
+    }
+
+    /// Get the s3 statistics for this datastore
+    pub fn s3_statistics(&self) -> Option<S3Statistics> {
+        self.inner
+            .request_counters
+            .as_ref()
+            .map(|counters| S3Statistics {
+                get: counters.load(Method::GET, Ordering::Acquire),
+                put: counters.load(Method::PUT, Ordering::Acquire),
+                post: counters.load(Method::POST, Ordering::Acquire),
+                delete: counters.load(Method::DELETE, Ordering::Acquire),
+                head: counters.load(Method::HEAD, Ordering::Acquire),
+                uploaded: counters.get_upload_traffic(Ordering::Acquire),
+                downloaded: counters.get_download_traffic(Ordering::Acquire),
+            })
+    }
+
+    pub fn cache(&self) -> Option<&LocalDatastoreLruCache> {
+        self.inner.lru_store_caching.as_ref()
+    }
+
+    /// Check if the digest is present in the local datastore cache.
+    /// Always returns false if there is no cache configured for this datastore.
+    pub fn cache_contains(&self, digest: &[u8; 32]) -> bool {
+        if let Some(cache) = self.inner.lru_store_caching.as_ref() {
+            return cache.contains(digest);
+        }
+        false
+    }
+
+    /// Insert digest as most recently used on in the cache.
+    /// Returns with success if there is no cache configured for this datastore.
+    pub fn cache_insert(&self, digest: &[u8; 32], chunk: &DataBlob) -> Result<(), Error> {
+        if let Some(cache) = self.inner.lru_store_caching.as_ref() {
+            return cache.insert(digest, chunk);
+        }
+        Ok(())
+    }
+
+    pub fn lookup_datastore(lookup: DataStoreLookup) -> Result<Arc<DataStore>, Error> {
         // Avoid TOCTOU between checking maintenance mode and updating active operation counter, as
         // we use it to decide whether it is okay to delete the datastore.
-        let config_lock = pbs_config::datastore::lock_config()?;
+        let _config_lock = pbs_config::datastore::lock_config()?;
 
-        // we could use the ConfigVersionCache's generation for staleness detection, but  we load
-        // the config anyway -> just use digest, additional benefit: manual changes get detected
-        let (config, digest) = pbs_config::datastore::config()?;
-        let config: DataStoreConfig = config.lookup("datastore", name)?;
+        // Get the current datastore.cfg generation number and cached config
+        let (section_config, gen_num) = datastore_section_config_cached(true)?;
+        let config: DataStoreConfig = section_config.lookup("datastore", lookup.name)?;
 
         if let Some(maintenance_mode) = config.get_maintenance_mode() {
-            if let Err(error) = maintenance_mode.check(operation) {
-                bail!("datastore '{name}' is in {error}");
+            if let Err(error) = maintenance_mode.check(lookup.operation) {
+                bail!("datastore '{}' is unavailable: {error}", lookup.name);
             }
         }
-
-        if let Some(operation) = operation {
-            update_active_operations(name, operation, 1)?;
-        }
-
-        // Our operation is registered, unlock the config.
-        drop(config_lock);
 
         let mut datastore_cache = DATASTORE_MAP.lock().unwrap();
-        let entry = datastore_cache.get(name);
+
+        if get_datastore_mount_status(&config) == Some(false) {
+            datastore_cache.remove(&config.name);
+            bail!("datastore '{}' is not mounted", config.name);
+        }
+
+        let entry = datastore_cache.get(lookup.name);
 
         // reuse chunk store so that we keep using the same process locker instance!
-        let chunk_store = if let Some(datastore) = &entry {
-            let last_digest = datastore.last_digest.as_ref();
-            if let Some(true) = last_digest.map(|last_digest| last_digest == &digest) {
+        let chunk_store = if let Some(datastore) = entry {
+            // Re-use DataStoreImpl
+            if datastore.config_generation == gen_num && gen_num.is_some() {
+                update_active_operations(lookup.name, lookup.operation, 1)?;
                 return Ok(Arc::new(Self {
                     inner: Arc::clone(datastore),
-                    operation,
+                    operation: Some(lookup.operation),
                 }));
             }
+
+            let tuning = pbs_config::datastore::parse_datastore_tuning_options(&config)?;
+            let sync_level = tuning.sync_level.unwrap_or_default();
+
+            let mutex_guard = datastore.chunk_store.mutex().lock().unwrap();
+            if mutex_guard.sync_level != sync_level {
+                datastore
+                    .chunk_store
+                    .try_ensure_sync_level_with_update(mutex_guard, Some(sync_level))?;
+            } else {
+                drop(mutex_guard);
+            }
+
             Arc::clone(&datastore.chunk_store)
         } else {
-            let tuning: DatastoreTuning = serde_json::from_value(
-                DatastoreTuning::API_SCHEMA
-                    .parse_property_string(config.tuning.as_deref().unwrap_or(""))?,
-            )?;
+            let tuning = pbs_config::datastore::parse_datastore_tuning_options(&config)?;
             Arc::new(ChunkStore::open(
-                name,
-                &config.path,
+                lookup.name,
+                config.absolute_path(),
                 tuning.sync_level.unwrap_or_default(),
             )?)
         };
 
-        let datastore = DataStore::with_store_and_config(chunk_store, config, Some(digest))?;
+        let datastore = DataStore::with_store_and_config(
+            chunk_store,
+            config,
+            gen_num,
+            lookup.thresholds_exceeded_callback,
+        )?;
 
         let datastore = Arc::new(datastore);
-        datastore_cache.insert(name.to_string(), datastore.clone());
+        datastore_cache.insert(lookup.name.to_string(), datastore.clone());
+
+        update_active_operations(lookup.name, lookup.operation, 1)?;
 
         Ok(Arc::new(Self {
             inner: datastore,
-            operation,
+            operation: Some(lookup.operation),
         }))
     }
 
@@ -219,11 +677,12 @@ impl DataStore {
         let datastore: DataStoreConfig = config.lookup("datastore", name)?;
         if datastore
             .get_maintenance_mode()
-            .map_or(false, |m| m.is_offline())
+            .is_some_and(|m| m.clear_from_cache())
         {
             // the datastore drop handler does the checking if tasks are running and clears the
             // cache entry, so we just have to trigger it here
-            let _ = DataStore::lookup_datastore(name, Some(Operation::Lookup));
+            let lookup = DataStoreLookup::with(name, Operation::Lookup, None);
+            let _ = DataStore::lookup_datastore(lookup);
         }
 
         Ok(())
@@ -261,15 +720,18 @@ impl DataStore {
     ) -> Result<Arc<Self>, Error> {
         let name = config.name.clone();
 
-        let tuning: DatastoreTuning = serde_json::from_value(
-            DatastoreTuning::API_SCHEMA
-                .parse_property_string(config.tuning.as_deref().unwrap_or(""))?,
+        ensure_datastore_is_mounted(&config)?;
+
+        let tuning = pbs_config::datastore::parse_datastore_tuning_options(&config)?;
+        let chunk_store = ChunkStore::open(
+            &name,
+            config.absolute_path(),
+            tuning.sync_level.unwrap_or_default(),
         )?;
-        let chunk_store =
-            ChunkStore::open(&name, &config.path, tuning.sync_level.unwrap_or_default())?;
         let inner = Arc::new(Self::with_store_and_config(
             Arc::new(chunk_store),
             config,
+            None,
             None,
         )?);
 
@@ -283,7 +745,8 @@ impl DataStore {
     fn with_store_and_config(
         chunk_store: Arc<ChunkStore>,
         config: DataStoreConfig,
-        last_digest: Option<[u8; 32]>,
+        generation: Option<usize>,
+        thresholds_exceeded_callback: Option<ThresholdsExceededCallback>,
     ) -> Result<DataStoreImpl, Error> {
         let mut gc_status_path = chunk_store.base_path();
         gc_status_path.push(".gc-status");
@@ -300,45 +763,120 @@ impl DataStore {
             GarbageCollectionStatus::default()
         };
 
-        let tuning: DatastoreTuning = serde_json::from_value(
-            DatastoreTuning::API_SCHEMA
-                .parse_property_string(config.tuning.as_deref().unwrap_or(""))?,
-        )?;
+        let tuning = pbs_config::datastore::parse_datastore_tuning_options(&config)?;
+        let backend_config = pbs_config::datastore::parse_backend_config(&config)?;
+
+        let (lru_store_caching, request_counters) =
+            if DatastoreBackendType::S3 == backend_config.ty.unwrap_or_default() {
+                let mut cache_capacity = 0;
+                if let Ok(fs_info) = proxmox_sys::fs::fs_info(&chunk_store.base_path()) {
+                    cache_capacity = fs_info.available / (16 * 1024 * 1024);
+                }
+                if let Some(max_cache_size) = backend_config.max_cache_size {
+                    info!(
+                        "Got requested max cache size {max_cache_size} for store {}",
+                        config.name
+                    );
+                    let max_cache_capacity = max_cache_size.as_u64() / (16 * 1024 * 1024);
+                    cache_capacity = cache_capacity.min(max_cache_capacity);
+                }
+                let cache_capacity = usize::try_from(cache_capacity).unwrap_or_default();
+
+                info!(
+                    "Using datastore cache with capacity {cache_capacity} for store {}",
+                    config.name
+                );
+
+                let cache = LocalDatastoreLruCache::new(cache_capacity, chunk_store.clone());
+
+                let mut request_counters = Self::request_counters(&config, &backend_config)?;
+
+                Self::update_notification_thresholds(&mut request_counters, &config)?;
+
+                (Some(cache), Some(Arc::new(request_counters)))
+            } else {
+                (None, None)
+            };
+
+        let thread_settings = DatastoreThreadSettings::new(
+            tuning.default_verification_workers,
+            tuning.default_verification_readers,
+        );
+
+        let max_snapshot_time_skew = if let Some(ts) = &config.max_snapshot_time_skew {
+            let ts: TimeSpan = ts.parse()?;
+            i64::try_from(ts.as_secs())?
+        } else {
+            i64::try_from(DEFAULT_SNAPSHOT_TIME_SKEW_SECS)?
+        };
 
         Ok(DataStoreImpl {
             chunk_store,
-            gc_mutex: Mutex::new(()),
+            gc_mutex: Mutex::new(None),
             last_gc_status: Mutex::new(gc_status),
             verify_new: config.verify_new.unwrap_or(false),
             chunk_order: tuning.chunk_order.unwrap_or_default(),
-            last_digest,
-            sync_level: tuning.sync_level.unwrap_or_default(),
+            backend_config,
+            lru_store_caching,
+            thread_settings,
+            config_generation: generation,
+            request_counters,
+            thresholds_exceeded_callback,
+            max_snapshot_time_skew,
         })
     }
 
-    pub fn get_chunk_iterator(
-        &self,
-    ) -> Result<
-        impl Iterator<Item = (Result<proxmox_sys::fs::ReadDirEntry, Error>, usize, bool)>,
-        Error,
-    > {
-        self.inner.chunk_store.get_chunk_iterator()
+    /// Load the shared s3 request counters for given datastore and backend config
+    pub fn request_counters(
+        config: &DataStoreConfig,
+        backend_config: &DatastoreBackendConfig,
+    ) -> Result<SharedRequestCounters, Error> {
+        let path = format!(
+            "{}/{}-{}-{}.shmem",
+            S3_CLIENT_REQUEST_COUNTER_BASE_PATH,
+            backend_config
+                .client
+                .as_ref()
+                .ok_or(format_err!("missing s3 endpoint id"))?,
+            backend_config
+                .bucket
+                .as_ref()
+                .ok_or(format_err!("missing s3 bucket"))?,
+            config.name,
+        );
+        let backup_user = proxmox_product_config::get_api_user();
+        let request_counters =
+            SharedRequestCounters::open_shared_memory_mapped(path, backup_user.clone())?;
+        Ok(request_counters)
     }
 
+    /// Update the notification threshold values on the counters by given config
+    pub fn update_notification_thresholds(
+        counters: &mut SharedRequestCounters,
+        config: &DataStoreConfig,
+    ) -> Result<(), Error> {
+        let thresholds: RequestCounterThresholds =
+            if let Some(thresholds) = &config.notification_thresholds {
+                serde_json::from_value(
+                    RequestCounterThresholds::API_SCHEMA.parse_property_string(thresholds)?,
+                )?
+            } else {
+                RequestCounterThresholds::default()
+            };
+
+        counters.update_thresholds(&thresholds);
+        Ok(())
+    }
+
+    // Requires obtaining a shared chunk store lock beforehand
     pub fn create_fixed_writer<P: AsRef<Path>>(
         &self,
         filename: P,
-        size: usize,
-        chunk_size: usize,
+        size: Option<u64>,
+        chunk_size: u32,
     ) -> Result<FixedIndexWriter, Error> {
-        let index = FixedIndexWriter::create(
-            self.inner.chunk_store.clone(),
-            filename.as_ref(),
-            size,
-            chunk_size,
-        )?;
-
-        Ok(index)
+        let full_path = self.inner.chunk_store.relative_path(filename.as_ref());
+        FixedIndexWriter::create(full_path, size, chunk_size)
     }
 
     pub fn open_fixed_reader<P: AsRef<Path>>(
@@ -352,13 +890,13 @@ impl DataStore {
         Ok(index)
     }
 
+    // Requires obtaining a shared chunk store lock beforehand
     pub fn create_dynamic_writer<P: AsRef<Path>>(
         &self,
         filename: P,
     ) -> Result<DynamicIndexWriter, Error> {
-        let index = DynamicIndexWriter::create(self.inner.chunk_store.clone(), filename.as_ref())?;
-
-        Ok(index)
+        let full_path = self.inner.chunk_store.relative_path(filename.as_ref());
+        DynamicIndexWriter::create(full_path)
     }
 
     pub fn open_dynamic_reader<P: AsRef<Path>>(
@@ -377,7 +915,7 @@ impl DataStore {
         P: AsRef<Path>,
     {
         let filename = filename.as_ref();
-        let out: Box<dyn IndexFile + Send> = match archive_type(filename)? {
+        let out: Box<dyn IndexFile + Send> = match ArchiveType::from_path(filename)? {
             ArchiveType::DynamicIndex => Box::new(self.open_dynamic_reader(filename)?),
             ArchiveType::FixedIndex => Box::new(self.open_fixed_reader(filename)?),
             _ => bail!("cannot open index file of unknown type: {:?}", filename),
@@ -419,6 +957,11 @@ impl DataStore {
         self.inner.chunk_store.base_path()
     }
 
+    /// Returns the thread settings for this datastore
+    pub fn thread_settings(&self) -> &DatastoreThreadSettings {
+        &self.inner.thread_settings
+    }
+
     /// Returns the absolute path for a backup namespace on this datastore
     pub fn namespace_path(&self, ns: &BackupNamespace) -> PathBuf {
         let mut path = self.base_path();
@@ -448,6 +991,15 @@ impl DataStore {
         full_path
     }
 
+    /// Returns the absolute path of a backup groups notes file
+    pub fn group_notes_path(
+        &self,
+        ns: &BackupNamespace,
+        group: &pbs_api_types::BackupGroup,
+    ) -> PathBuf {
+        self.group_path(ns, group).join(GROUP_NOTES_FILE_NAME)
+    }
+
     /// Returns the absolute path for backup_dir
     pub fn snapshot_path(
         &self,
@@ -472,6 +1024,15 @@ impl DataStore {
         // construct ns before mkdir to enforce max-depth and name validity
         let ns = BackupNamespace::from_parent_ns(parent, name)?;
 
+        if let DatastoreBackend::S3(s3_client) = self.backend()? {
+            let object_key = crate::s3::object_key_from_path(&ns.path(), NAMESPACE_MARKER_FILENAME)
+                .context("invalid namespace marker object key")?;
+            let _is_duplicate = proxmox_async::runtime::block_on(
+                s3_client.upload_no_replace_with_retry(object_key, hyper::body::Bytes::from("")),
+            )
+            .context("failed to create namespace on s3 backend")?;
+        }
+
         let mut ns_full_path = self.base_path();
         ns_full_path.push(ns.path());
 
@@ -491,92 +1052,459 @@ impl DataStore {
     ///
     /// Does *not* descends into child-namespaces and doesn't remoes the namespace itself either.
     ///
-    /// Returns true if all the groups were removed, and false if some were protected.
-    pub fn remove_namespace_groups(self: &Arc<Self>, ns: &BackupNamespace) -> Result<bool, Error> {
+    /// Returns a tuple with the first item being true if all the groups were removed, and false if some were protected.
+    /// The second item returns the remove statistics.
+    pub fn remove_namespace_groups(
+        self: &Arc<Self>,
+        ns: &BackupNamespace,
+    ) -> Result<(bool, BackupGroupDeleteStats), Error> {
         // FIXME: locking? The single groups/snapshots are already protected, so may not be
         // necessary (depends on what we all allow to do with namespaces)
         log::info!("removing all groups in namespace {}:/{ns}", self.name());
 
         let mut removed_all_groups = true;
+        let mut stats = BackupGroupDeleteStats::default();
 
         for group in self.iter_backup_groups(ns.to_owned())? {
-            let delete_stats = group?.destroy()?;
+            let group = group?;
+            let backend = self.backend()?;
+            let guard = group
+                .lock()
+                .with_context(|| format!("while destroying group '{group:?}'"))?;
+            let delete_stats = group.destroy(guard, &backend)?;
+            stats.add(&delete_stats);
             removed_all_groups = removed_all_groups && delete_stats.all_removed();
+        }
+
+        Ok((removed_all_groups, stats))
+    }
+
+    /// Remove a single namespace level (no recursion into children).
+    ///
+    /// If `delete_groups` is true, destroys all groups in this namespace. Otherwise only
+    /// an empty namespace directory is pruned. Returns `(removed_all_requested, stats)`
+    /// where `removed_all_requested` is true if nothing was protected and the directory
+    /// was removed.
+    pub fn remove_namespace(
+        self: &Arc<Self>,
+        ns: &BackupNamespace,
+        delete_groups: bool,
+    ) -> Result<(bool, BackupGroupDeleteStats), Error> {
+        let mut removed_all_requested = true;
+        let mut stats = BackupGroupDeleteStats::default();
+        let backend = self.backend()?;
+
+        if delete_groups {
+            log::info!("removing groups in namespace {}:/{ns}", self.name());
+            let (removed_ns_groups, delete_stats) = self.remove_namespace_groups(ns)?;
+            stats.add(&delete_stats);
+            removed_all_requested = removed_all_requested && removed_ns_groups;
         }
 
         let base_file = std::fs::File::open(self.base_path())?;
         let base_fd = base_file.as_raw_fd();
+
+        // Best-effort cleanup of empty type subdirectories (e.g. `host/`). These can be
+        // left behind after groups are destroyed (aside from protected snapshots) or after
+        // groups have been moved out, and would otherwise prevent the namespace directory
+        // below from being removed. ENOTEMPTY is expected (protected snapshots, or
+        // groups still present when `delete_groups` is false) and silently skipped.
         for ty in BackupType::iter() {
             let mut ty_dir = ns.path();
             ty_dir.push(ty.to_string());
-            // best effort only, but we probably should log the error
             if let Err(err) = unlinkat(Some(base_fd), &ty_dir, UnlinkatFlags::RemoveDir) {
-                if err != nix::errno::Errno::ENOENT {
-                    log::error!("failed to remove backup type {ty} in {ns} - {err}");
+                if err != nix::errno::Errno::ENOENT && err != nix::errno::Errno::ENOTEMPTY {
+                    log::warn!("failed to remove empty backup type dir {ty} in {ns} - {err}");
                 }
             }
         }
 
-        Ok(removed_all_groups)
+        let mut ns_dir = ns.path();
+        ns_dir.push("ns");
+        let _ = unlinkat(Some(base_fd), &ns_dir, UnlinkatFlags::RemoveDir);
+
+        if !ns.is_root() {
+            match unlinkat(Some(base_fd), &ns.path(), UnlinkatFlags::RemoveDir) {
+                Ok(()) => log::debug!("removed namespace {ns}"),
+                Err(nix::errno::Errno::ENOENT) => {
+                    log::debug!("namespace {ns} already removed")
+                }
+                Err(nix::errno::Errno::ENOTEMPTY) if !delete_groups => {
+                    removed_all_requested = false;
+                    log::debug!("skip removal of non-empty namespace {ns}")
+                }
+                Err(err) => {
+                    removed_all_requested = false;
+                    log::warn!("failed to remove namespace {ns} - {err}")
+                }
+            }
+            if let DatastoreBackend::S3(s3_client) = &backend {
+                // Only remove the namespace marker, if it was empty,
+                // than this is the same as the namespace being removed.
+                let object_key =
+                    crate::s3::object_key_from_path(&ns.path(), NAMESPACE_MARKER_FILENAME)
+                        .context("invalid namespace marker object key")?;
+                proxmox_async::runtime::block_on(s3_client.delete_object(object_key))?;
+            }
+        }
+
+        Ok((removed_all_requested, stats))
     }
 
-    /// Remove a complete backup namespace optionally including all it's, and child namespaces',
-    /// groups. If  `removed_groups` is false this only prunes empty namespaces.
+    /// Remove a complete backup namespace subtree including all child namespaces.
     ///
-    /// Returns true if everything requested, and false if some groups were protected or if some
-    /// namespaces weren't empty even though all groups were deleted (race with new backup)
+    /// If `delete_groups` is false this only prunes empty namespaces. Returns true if
+    /// everything requested was removed, and false if some groups were protected or some
+    /// namespaces weren't empty even though all groups were deleted (race with new backup).
     pub fn remove_namespace_recursive(
         self: &Arc<Self>,
         ns: &BackupNamespace,
         delete_groups: bool,
-    ) -> Result<bool, Error> {
+    ) -> Result<(bool, BackupGroupDeleteStats), Error> {
         let store = self.name();
-        let mut removed_all_requested = true;
-        if delete_groups {
-            log::info!("removing whole namespace recursively below {store}:/{ns}",);
-            for ns in self.recursive_iter_backup_ns(ns.to_owned())? {
-                let removed_ns_groups = self.remove_namespace_groups(&ns?)?;
-                removed_all_requested = removed_all_requested && removed_ns_groups;
-            }
-        } else {
-            log::info!("pruning empty namespace recursively below {store}:/{ns}");
-        }
+        log::info!(
+            "{} namespace recursively below {store}:/{ns}",
+            if delete_groups {
+                "removing whole"
+            } else {
+                "pruning empty"
+            },
+        );
 
-        // now try to delete the actual namespaces, bottom up so that we can use safe rmdir that
-        // will choke if a new backup/group appeared in the meantime (but not on an new empty NS)
         let mut children = self
             .recursive_iter_backup_ns(ns.to_owned())?
             .collect::<Result<Vec<BackupNamespace>, Error>>()?;
-
+        // Process deepest first so a parent's rmdir sees an empty directory.
         children.sort_by_key(|b| std::cmp::Reverse(b.depth()));
 
-        let base_file = std::fs::File::open(self.base_path())?;
-        let base_fd = base_file.as_raw_fd();
+        // When destroying the full subtree, a bulk S3 delete under the root prefix catches
+        // any orphaned group-level metadata (owner/notes) before per-level cleanup iterates.
+        if delete_groups {
+            if let DatastoreBackend::S3(s3_client) = &self.backend()? {
+                let ns_dir = ns.path();
+                let ns_prefix = ns_dir
+                    .to_str()
+                    .ok_or_else(|| format_err!("invalid namespace path prefix"))?;
+                let prefix = format!("{S3_CONTENT_PREFIX}/{ns_prefix}");
+                let delete_objects_error = proxmox_async::runtime::block_on(
+                    s3_client.delete_objects_by_prefix_with_suffix_filter(
+                        &S3PathPrefix::Some(prefix),
+                        PROTECTED_MARKER_FILENAME,
+                        &[GROUP_OWNER_FILE_NAME, GROUP_NOTES_FILE_NAME],
+                    ),
+                )?;
+                if !delete_objects_error.is_empty() {
+                    crate::s3::log_s3_delete_objects_errors(&delete_objects_error);
+                    bail!("deleting objects failed");
+                }
+            }
+        }
 
-        for ns in children.iter() {
-            let mut ns_dir = ns.path();
-            ns_dir.push("ns");
-            let _ = unlinkat(Some(base_fd), &ns_dir, UnlinkatFlags::RemoveDir);
+        let mut removed_all_requested = true;
+        let mut stats = BackupGroupDeleteStats::default();
+        for child in &children {
+            let (removed, delete_stats) = self.remove_namespace(child, delete_groups)?;
+            stats.add(&delete_stats);
+            removed_all_requested = removed_all_requested && removed;
+        }
 
-            if !ns.is_root() {
-                match unlinkat(Some(base_fd), &ns.path(), UnlinkatFlags::RemoveDir) {
-                    Ok(()) => log::debug!("removed namespace {ns}"),
-                    Err(nix::errno::Errno::ENOENT) => {
-                        log::debug!("namespace {ns} already removed")
-                    }
-                    Err(nix::errno::Errno::ENOTEMPTY) if !delete_groups => {
-                        removed_all_requested = false;
-                        log::debug!("skip removal of non-empty namespace {ns}")
-                    }
+        Ok((removed_all_requested, stats))
+    }
+
+    /// Validate a namespace-move request without touching locks.
+    ///
+    /// Fast pre-flight check used by the API endpoint so we can fail synchronously before
+    /// spawning a worker. Re-run inside [`Self::move_namespace`] to close the TOCTOU gap between
+    /// the API-level pre-check and the worker; since there is no namespace lock, that re-run is
+    /// the authoritative gate for namespace-level invariants. Per-group authoritative checks
+    /// live in [`Self::lock_and_move_group`].
+    pub fn check_move_namespace(
+        self: &Arc<Self>,
+        source_ns: &BackupNamespace,
+        target_ns: &BackupNamespace,
+    ) -> Result<(), Error> {
+        if source_ns.is_root() {
+            bail!("cannot move root namespace");
+        }
+        if source_ns == target_ns {
+            bail!("source and target namespace must be different");
+        }
+        if !self.namespace_exists(source_ns) {
+            bail!("source namespace '{source_ns}' does not exist");
+        }
+        let target_parent = target_ns.parent();
+        if !target_ns.is_root() && !self.namespace_exists(&target_parent) {
+            bail!("target parent namespace '{target_parent}' does not exist");
+        }
+        if source_ns.contains(target_ns).is_some() {
+            bail!(
+                "cannot move namespace '{source_ns}' into its own subtree (target: '{target_ns}')"
+            );
+        }
+        Ok(())
+    }
+
+    /// Move a backup namespace (including all child namespaces and groups) to a new location.
+    ///
+    /// Groups are moved one at a time. For each group, exclusive locks on the group and all its
+    /// snapshots (locked and moved in batches) ensure no concurrent operations are active. Groups
+    /// that cannot be locked (because a backup, verify, or other task is running) are deferred and
+    /// retried once, then reported in the error.
+    ///
+    /// If the target namespace already exists, groups are moved into it. Groups that fail (lock
+    /// conflict, merge invariant violation, or I/O error) are skipped and reported at the end -
+    /// they remain at the source and can be retried individually.
+    ///
+    /// `max_depth` limits how many levels of child namespaces below `source_ns` are included.
+    /// `None` means unlimited (move the entire subtree). `Some(0)` moves only the groups directly
+    /// in `source_ns` (no child namespaces).
+    ///
+    /// When `delete_source` is true, source namespace directories are removed once they are empty.
+    /// Sources kept behind because of `max_depth`-excluded children or failed moves stay in place.
+    /// When false the (now empty) sources are kept regardless.
+    ///
+    /// When `merge_groups` is true and a source group already exists in the target namespace, the
+    /// snapshots are merged into the existing target group (provided ownership matches and source
+    /// snapshots are strictly newer). When false the operation fails for that group.
+    pub fn move_namespace(
+        self: &Arc<Self>,
+        source_ns: &BackupNamespace,
+        target_ns: &BackupNamespace,
+        max_depth: Option<usize>,
+        delete_source: bool,
+        merge_groups: bool,
+    ) -> Result<(), Error> {
+        if *OLD_LOCKING {
+            bail!("move operations require new-style file-based locking");
+        }
+
+        // Re-run the pre-flight checks inside the worker to close the gap between the API-level
+        // pre-check and here (e.g. source namespace deleted in between).
+        self.check_move_namespace(source_ns, target_ns)?;
+
+        // Collect the source subtree for up-front depth-limit validation and for later cleanup.
+        // Groups are iterated lazily per-namespace below.
+        let depth = max_depth.unwrap_or(MAX_NAMESPACE_DEPTH);
+        let attempted_ns: Vec<BackupNamespace> =
+            ListNamespacesRecursive::new_max_depth(Arc::clone(self), source_ns.clone(), depth)?
+                .collect::<Result<Vec<_>, Error>>()?;
+
+        check_namespace_depth_limit(source_ns, target_ns, &attempted_ns)?;
+
+        let backend = self.backend()?;
+
+        log::info!(
+            "moving namespace '{source_ns}' -> '{target_ns}': {} namespace(s)",
+            attempted_ns.len(),
+        );
+
+        // Create target namespaces parent-before-child so `create_namespace` can validate each
+        // parent exists. `create_namespace` also creates the S3 marker when applicable.
+        let mut create_order: Vec<&BackupNamespace> = attempted_ns.iter().collect();
+        create_order.sort_by_key(|ns| ns.depth());
+        for ns in create_order {
+            let target_child = ns.map_prefix(source_ns, target_ns)?;
+            if target_child.is_root() || self.namespace_exists(&target_child) {
+                continue;
+            }
+            let name = target_child
+                .components()
+                .last()
+                .ok_or_else(|| format_err!("cannot determine last component of '{target_child}'"))?
+                .to_owned();
+            self.create_namespace(&target_child.parent(), name)
+                .with_context(|| format!("failed to create target namespace '{target_child}'"))?;
+        }
+
+        // Move groups one namespace at a time. Iterating lazily (rather than collecting all groups
+        // up-front) keeps each group's lock window short and avoids serialising the move behind a
+        // long enumeration phase.
+        let mut failed_fatal: Vec<(BackupNamespace, String)> = Vec::new();
+        let mut failed_retryable: Vec<(BackupNamespace, String)> = Vec::new();
+        let mut failed_ns: HashSet<BackupNamespace> = HashSet::new();
+        let mut deferred: Vec<BackupGroup> = Vec::new();
+        let mut moved_count: usize = 0;
+
+        for ns in &attempted_ns {
+            let iter = match self.iter_backup_groups(ns.clone()) {
+                Ok(iter) => iter,
+                Err(err) => {
+                    warn!("failed to list groups in '{ns}': {err:#}");
+                    failed_ns.insert(ns.clone());
+                    continue;
+                }
+            };
+            for group in iter {
+                let group = match group {
+                    Ok(g) => g,
                     Err(err) => {
-                        removed_all_requested = false;
-                        log::warn!("failed to remove namespace {ns} - {err}")
+                        warn!("failed to read group entry in '{ns}': {err:#}");
+                        failed_ns.insert(ns.clone());
+                        continue;
+                    }
+                };
+                match self.lock_and_move_group(source_ns, &group, target_ns, &backend, merge_groups)
+                {
+                    Ok(()) => {
+                        moved_count += 1;
+                        log::info!(
+                            "moved group {moved_count} ('{}' in '{}')",
+                            group.group(),
+                            group.backup_ns(),
+                        );
+                    }
+                    Err(BackupGroupOpError::Soft(err)) => {
+                        log::info!(
+                            "deferring group '{}' in '{}' - lock conflict, will retry: {err:#}",
+                            group.group(),
+                            group.backup_ns(),
+                        );
+                        deferred.push(group);
+                    }
+                    Err(BackupGroupOpError::Hard(err)) => {
+                        warn!(
+                            "failed to move group '{}' in '{}': {err:#}",
+                            group.group(),
+                            group.backup_ns(),
+                        );
+                        failed_fatal.push((group.backup_ns().clone(), group.group().to_string()));
+                        failed_ns.insert(group.backup_ns().clone());
                     }
                 }
             }
         }
 
-        Ok(removed_all_requested)
+        // Retry deferred groups once.
+        if !deferred.is_empty() {
+            log::info!("retrying {} deferred group(s)...", deferred.len());
+            for group in &deferred {
+                match self.lock_and_move_group(source_ns, group, target_ns, &backend, merge_groups)
+                {
+                    Ok(()) => {
+                        moved_count += 1;
+                        log::info!(
+                            "moved group {moved_count} ('{}' in '{}') on retry",
+                            group.group(),
+                            group.backup_ns(),
+                        );
+                    }
+                    Err(BackupGroupOpError::Soft(err)) => {
+                        warn!(
+                            "still locked after retry: group '{}' in '{}': {err:#}",
+                            group.group(),
+                            group.backup_ns(),
+                        );
+                        failed_retryable
+                            .push((group.backup_ns().clone(), group.group().to_string()));
+                        failed_ns.insert(group.backup_ns().clone());
+                    }
+                    Err(BackupGroupOpError::Hard(err)) => {
+                        warn!(
+                            "failed to move group '{}' in '{}' on retry: {err:#}",
+                            group.group(),
+                            group.backup_ns(),
+                        );
+                        failed_fatal.push((group.backup_ns().clone(), group.group().to_string()));
+                        failed_ns.insert(group.backup_ns().clone());
+                    }
+                }
+            }
+        }
+
+        // Clean up source namespaces when requested. Process deepest-first so child directories
+        // are removed before their parents.
+        if delete_source {
+            let attempted_set: HashSet<&BackupNamespace> = attempted_ns.iter().collect();
+
+            for ns in attempted_ns.iter().rev() {
+                // Skip any namespace on the path to a failed group - those groups still exist at
+                // source and the namespace is therefore not empty.
+                if failed_ns
+                    .iter()
+                    .any(|failed| failed == ns || ns.contains(failed).is_some())
+                {
+                    log::warn!(
+                        "skipping source namespace '{ns}' cleanup: contains group(s) that failed to move",
+                    );
+                    continue;
+                }
+                // A child of this namespace that's not in `attempted_set` either
+                //  - sits below the user's max-depth, so we intentionally did not move it, or
+                //  - appeared after we started (concurrent creation).
+                // Either way the source is non-empty and must stay. Warn only for the concurrent
+                // case (depth-limit skips are an explicit user choice).
+                let max_attempted_depth = source_ns.depth() + depth;
+                let mut concurrent_child: Option<BackupNamespace> = None;
+                let mut depth_limited_child = false;
+                for child in self.iter_backup_ns_ok(ns.clone())? {
+                    if attempted_set.contains(&child) {
+                        continue;
+                    }
+                    if child.depth() <= max_attempted_depth {
+                        concurrent_child = Some(child);
+                        break;
+                    }
+                    depth_limited_child = true;
+                }
+                if let Some(child) = concurrent_child {
+                    log::warn!(
+                        "skipping source namespace '{ns}' cleanup: child namespace '{child}' \
+                        was created after the move started",
+                    );
+                    continue;
+                }
+                if depth_limited_child {
+                    log::debug!(
+                        "keeping source namespace '{ns}': contains namespace(s) excluded by max-depth",
+                    );
+                    continue;
+                }
+
+                // All groups moved and all children already cleaned up: drop the now-empty
+                // namespace. Single-level cleanup since we drive traversal ourselves.
+                match self.remove_namespace(ns, false) {
+                    Ok((true, _)) => {}
+                    Ok((false, _)) => {
+                        log::warn!(
+                            "source namespace '{ns}' was not fully removed (non-empty after move)",
+                        );
+                    }
+                    Err(err) => {
+                        log::warn!("failed to remove source namespace '{ns}': {err:#}");
+                    }
+                }
+            }
+        }
+
+        if !failed_fatal.is_empty() || !failed_retryable.is_empty() {
+            let fmt = |list: &[(BackupNamespace, String)]| -> String {
+                list.iter()
+                    .map(|(ns, group)| format!("'{group}' in '{ns}'"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let total = failed_fatal.len() + failed_retryable.len();
+            let mut msg = format!(
+                "namespace move partially completed; {total} group(s) could not be moved and remain at source"
+            );
+            if !failed_fatal.is_empty() {
+                msg.push_str(&format!(
+                    "; {} with a fatal error (investigate before retrying): {}",
+                    failed_fatal.len(),
+                    fmt(&failed_fatal),
+                ));
+            }
+            if !failed_retryable.is_empty() {
+                msg.push_str(&format!(
+                    "; {} still lock-conflicted (rerun move-namespace or move-group may succeed): {}",
+                    failed_retryable.len(),
+                    fmt(&failed_retryable),
+                ));
+            }
+            bail!("{msg}");
+        }
+
+        Ok(())
     }
 
     /// Remove a complete backup group including all snapshots.
@@ -589,8 +1517,179 @@ impl DataStore {
         backup_group: &pbs_api_types::BackupGroup,
     ) -> Result<BackupGroupDeleteStats, Error> {
         let backup_group = self.backup_group(ns.clone(), backup_group.clone());
+        let guard = backup_group
+            .lock()
+            .with_context(|| format!("while destroying group '{backup_group:?}'"))?;
 
-        backup_group.destroy()
+        backup_group.destroy(guard, &self.backend()?)
+    }
+
+    /// Validate a group-move request without touching locks.
+    ///
+    /// Fast pre-flight check used by the API endpoint so we can fail synchronously before spawning
+    /// a worker. The authoritative post-lock gate lives in [`Self::lock_and_move_group`]. This
+    /// function does *not* replace it, and it does *not* check ownership - the caller handles
+    /// that.
+    pub fn check_move_group(
+        self: &Arc<Self>,
+        source_ns: &BackupNamespace,
+        target_ns: &BackupNamespace,
+        group: &pbs_api_types::BackupGroup,
+        merge_group: bool,
+    ) -> Result<(), Error> {
+        if source_ns == target_ns {
+            bail!("source and target namespace must be different");
+        }
+        if !self.namespace_exists(target_ns) {
+            bail!("target namespace '{target_ns}' does not exist");
+        }
+        if !self.backup_group(source_ns.clone(), group.clone()).exists() {
+            bail!("group '{group}' does not exist in namespace '{source_ns}'");
+        }
+        if self.backup_group(target_ns.clone(), group.clone()).exists() && !merge_group {
+            bail!(
+                "group '{group}' already exists in target namespace '{target_ns}' \
+                and merge-group is disabled"
+            );
+        }
+        Ok(())
+    }
+
+    /// Move a single backup group to a different namespace within the same datastore.
+    pub fn move_group(
+        self: &Arc<Self>,
+        source_ns: &BackupNamespace,
+        group: &pbs_api_types::BackupGroup,
+        target_ns: &BackupNamespace,
+        merge_group: bool,
+    ) -> Result<(), Error> {
+        if *OLD_LOCKING {
+            bail!("move operations require new-style file-based locking");
+        }
+
+        let source_group = self.backup_group(source_ns.clone(), group.clone());
+        let backend = self.backend()?;
+
+        self.lock_and_move_group(source_ns, &source_group, target_ns, &backend, merge_group)
+            .map_err(|err| match err {
+                BackupGroupOpError::Soft(err) | BackupGroupOpError::Hard(err) => err,
+            })
+    }
+
+    /// Lock and move a single group. Acquires exclusive locks on both source and target groups,
+    /// then moves snapshots in batches - each batch is locked, moved, and released before the next
+    /// batch starts. This ensures no concurrent readers (e.g. verify) can operate on snapshots
+    /// being moved, without exhausting file descriptors.
+    ///
+    /// `source_ns` is the subtree root of the caller's operation, not necessarily the group's own
+    /// namespace: for a namespace move, a group can live deeper than `source_ns`, so the prefix is
+    /// rewritten to its new target location.
+    ///
+    /// Returns a `BackupGroupOpError` on failure, indicating whether the failure was a transient
+    /// lock conflict (retryable) or a hard error.
+    fn lock_and_move_group(
+        self: &Arc<Self>,
+        source_ns: &BackupNamespace,
+        group: &BackupGroup,
+        target_ns: &BackupNamespace,
+        backend: &DatastoreBackend,
+        merge_groups: bool,
+    ) -> Result<(), BackupGroupOpError> {
+        let target_group_ns = group
+            .backup_ns()
+            .map_prefix(source_ns, target_ns)
+            .map_err(BackupGroupOpError::Hard)?;
+
+        // Lock the source first so concurrent lock conflicts are detected before we touch the
+        // target structure. Acquisition order is source -> target (via
+        // `create_locked_backup_group_do` below). `.lock()` is non-blocking, so two concurrent
+        // mirror moves (A -> B and B -> A on same-named groups) fail fast with `Soft` rather than
+        // deadlocking.
+        let source_guard = group.lock().map_err(BackupGroupOpError::Soft)?;
+
+        // Post-lock validation: re-runs the pre-flight checks now that we hold the source lock,
+        // closing the TOCTOU gap between the API-level pre-check and the worker. This also stops
+        // the target-group create below from silently creating a missing target namespace
+        // (intentional for backup/pull/tape-restore, not for move).
+        self.check_move_group(
+            group.backup_ns(),
+            &target_group_ns,
+            group.group(),
+            merge_groups,
+        )
+        .map_err(BackupGroupOpError::Hard)?;
+
+        let source_owner = group.get_owner().map_err(BackupGroupOpError::Hard)?;
+
+        // Create-or-open the target group under lock. Reports whether the group was created (= no
+        // merge) or already existed (= merge), and differentiates a target lock conflict (Soft)
+        // from other failures (Hard).
+        let (_, created, _target_guard) =
+            self.create_locked_backup_group_do(&target_group_ns, group.group(), &source_owner)?;
+        let target_group = self.backup_group(target_group_ns.clone(), group.group().clone());
+        let merge = !created;
+
+        if merge && !merge_groups {
+            return Err(BackupGroupOpError::Hard(format_err!(
+                "group '{}' already exists in target namespace '{target_group_ns}' \
+                and merging is disabled",
+                group.group(),
+            )));
+        }
+        log::info!(
+            "{} group '{}/{}' from '{}' to '{target_group_ns}'",
+            if merge { "merging" } else { "moving" },
+            group.group().ty,
+            group.group().id,
+            group.backup_ns(),
+        );
+
+        if merge {
+            group
+                .check_merge_invariants(&target_group)
+                .map_err(BackupGroupOpError::Hard)?;
+        }
+
+        let mut snapshots: Vec<_> = group
+            .iter_snapshots()
+            .map_err(BackupGroupOpError::Hard)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(BackupGroupOpError::Hard)?;
+        // Sort by time so a partial failure (e.g. batch N succeeds but N+1 fails) leaves a clean
+        // time-ordered split: all moved snapshots are older than all remaining ones. This keeps
+        // the merge invariant (source oldest > target newest) valid on retry.
+        snapshots.sort_by_key(|s| s.backup_time());
+
+        // Each batch is locked, moved, and released before the next to exclude concurrent readers.
+        // `move_to` writes to the per-datastore move journal before each rename so a concurrent
+        // GC phase-1 drain can still mark the moved chunks; see `move_journal` for the race.
+        for chunk in snapshots.chunks(MAX_SNAPSHOT_LOCKS) {
+            let _batch_locks: Vec<BackupLockGuard> = chunk
+                .iter()
+                .map(|snap| snap.lock().map_err(BackupGroupOpError::Soft))
+                .collect::<Result<Vec<_>, _>>()?;
+
+            for snap in chunk {
+                snap.move_to(&target_group, backend)
+                    .map_err(BackupGroupOpError::Hard)?;
+            }
+            // batch locks released here
+        }
+
+        // Move the group notes file (local rename + S3 upload). Diverging notes during a merge are
+        // kept on the target and logged.
+        group
+            .move_notes_to(&target_group, backend)
+            .map_err(BackupGroupOpError::Hard)?;
+
+        // All snapshots and notes are at the target. The source group holds only owner/lock
+        // metadata now, so hand the source lock to `destroy()` to clean up the owner, the group
+        // directory, and any group-level S3 objects in one place.
+        group
+            .destroy(source_guard, backend)
+            .map_err(BackupGroupOpError::Hard)?;
+
+        Ok(())
     }
 
     /// Remove a backup directory including all content
@@ -602,7 +1701,7 @@ impl DataStore {
     ) -> Result<(), Error> {
         let backup_dir = self.backup_dir(ns.clone(), backup_dir.clone())?;
 
-        backup_dir.destroy(force)
+        backup_dir.destroy(force, &self.backend()?)
     }
 
     /// Returns the time of the last successful backup
@@ -625,8 +1724,12 @@ impl DataStore {
     }
 
     /// Return the path of the 'owner' file.
-    fn owner_path(&self, ns: &BackupNamespace, group: &pbs_api_types::BackupGroup) -> PathBuf {
-        self.group_path(ns, group).join("owner")
+    pub(super) fn owner_path(
+        &self,
+        ns: &BackupNamespace,
+        group: &pbs_api_types::BackupGroup,
+    ) -> PathBuf {
+        self.group_path(ns, group).join(GROUP_OWNER_FILE_NAME)
     }
 
     /// Returns the backup owner.
@@ -666,11 +1769,23 @@ impl DataStore {
     ) -> Result<(), Error> {
         let path = self.owner_path(ns, backup_group);
 
+        if let DatastoreBackend::S3(s3_client) = self.backend()? {
+            let mut path = ns.path();
+            path.push(backup_group.to_string());
+            let object_key = crate::s3::object_key_from_path(&path, GROUP_OWNER_FILE_NAME)
+                .context("invalid owner file object key")?;
+            let data = hyper::body::Bytes::from(format!("{auth_id}\n"));
+            let _is_duplicate = proxmox_async::runtime::block_on(
+                s3_client.upload_replace_with_retry(object_key, data),
+            )
+            .context("failed to set owner on s3 backend")?;
+        }
+
         let mut open_options = std::fs::OpenOptions::new();
         open_options.write(true);
-        open_options.truncate(true);
 
         if force {
+            open_options.truncate(true);
             open_options.create(true);
         } else {
             open_options.create_new(true);
@@ -680,7 +1795,7 @@ impl DataStore {
             .open(&path)
             .map_err(|err| format_err!("unable to create owner file {:?} - {}", path, err))?;
 
-        writeln!(file, "{}", auth_id)
+        writeln!(file, "{auth_id}")
             .map_err(|err| format_err!("unable to write owner file  {:?} - {}", path, err))?;
 
         Ok(())
@@ -693,74 +1808,105 @@ impl DataStore {
     ///
     /// This also acquires an exclusive lock on the directory and returns the lock guard.
     pub fn create_locked_backup_group(
-        &self,
+        self: &Arc<Self>,
         ns: &BackupNamespace,
         backup_group: &pbs_api_types::BackupGroup,
         auth_id: &Authid,
-    ) -> Result<(Authid, DirLockGuard), Error> {
-        // create intermediate path first:
-        let mut full_path = self.base_path();
-        for ns in ns.components() {
-            full_path.push("ns");
-            full_path.push(ns);
-        }
-        full_path.push(backup_group.ty.as_str());
-        std::fs::create_dir_all(&full_path)?;
+    ) -> Result<(Authid, BackupLockGuard), Error> {
+        let (owner, _created, guard) = self
+            .create_locked_backup_group_do(ns, backup_group, auth_id)
+            .map_err(|err| match err {
+                BackupGroupOpError::Soft(err) | BackupGroupOpError::Hard(err) => err,
+            })?;
+        Ok((owner, guard))
+    }
 
-        full_path.push(&backup_group.id);
+    /// Inner variant of [`Self::create_locked_backup_group`] that also reports whether the group
+    /// directory was newly created, and distinguishes a transient lock conflict
+    /// ([`BackupGroupOpError::Soft`]) from other errors ([`BackupGroupOpError::Hard`]).
+    pub(crate) fn create_locked_backup_group_do(
+        self: &Arc<Self>,
+        ns: &BackupNamespace,
+        backup_group: &pbs_api_types::BackupGroup,
+        auth_id: &Authid,
+    ) -> Result<(Authid, bool, BackupLockGuard), BackupGroupOpError> {
+        let backup_group = self.backup_group(ns.clone(), backup_group.clone());
 
-        // create the last component now
-        match std::fs::create_dir(&full_path) {
-            Ok(_) => {
-                let guard = lock_dir_noblock(
-                    &full_path,
-                    "backup group",
-                    "another backup is already running",
-                )?;
-                self.set_owner(ns, backup_group, auth_id, false)?;
-                let owner = self.get_owner(ns, backup_group)?; // just to be sure
-                Ok((owner, guard))
+        let full_path = backup_group.full_group_path();
+
+        std::fs::create_dir_all(full_path.parent().ok_or_else(|| {
+            BackupGroupOpError::Hard(format_err!(
+                "could not construct parent path for group {backup_group:?}"
+            ))
+        })?)
+        .map_err(|err| BackupGroupOpError::Hard(err.into()))?;
+
+        // Try to create the group directory. This lets us distinguish "created" from "already
+        // existed".
+        let created = match std::fs::create_dir(&full_path) {
+            Ok(_) => true,
+            Err(ref err) if err.kind() == io::ErrorKind::AlreadyExists => false,
+            Err(err) => {
+                return Err(BackupGroupOpError::Hard(format_err!(
+                    "unable to create backup group {full_path:?} - {err}"
+                )));
             }
-            Err(ref err) if err.kind() == io::ErrorKind::AlreadyExists => {
-                let guard = lock_dir_noblock(
-                    &full_path,
-                    "backup group",
-                    "another backup is already running",
-                )?;
-                let owner = self.get_owner(ns, backup_group)?; // just to be sure
-                Ok((owner, guard))
+        };
+
+        let guard = backup_group.lock().map_err(|err| {
+            if created {
+                let _ = std::fs::remove_dir(&full_path);
             }
-            Err(err) => bail!("unable to create backup group {:?} - {}", full_path, err),
+            BackupGroupOpError::Soft(format_err!(
+                "{err} while {} locked backup group {full_path:?}",
+                if created { "creating new" } else { "creating" },
+            ))
+        })?;
+
+        if created {
+            if let Err(err) = self.set_owner(ns, backup_group.group(), auth_id, false) {
+                let _ = std::fs::remove_dir(&full_path);
+                return Err(BackupGroupOpError::Hard(err));
+            }
         }
+        let owner = self
+            .get_owner(ns, backup_group.group())
+            .map_err(BackupGroupOpError::Hard)?;
+        Ok((owner, created, guard))
     }
 
     /// Creates a new backup snapshot inside a BackupGroup
     ///
     /// The BackupGroup directory needs to exist.
     pub fn create_locked_backup_dir(
-        &self,
+        self: &Arc<Self>,
         ns: &BackupNamespace,
         backup_dir: &pbs_api_types::BackupDir,
-    ) -> Result<(PathBuf, bool, DirLockGuard), Error> {
-        let full_path = self.snapshot_path(ns, backup_dir);
-        let relative_path = full_path.strip_prefix(self.base_path()).map_err(|err| {
-            format_err!(
-                "failed to produce correct path for backup {backup_dir} in namespace {ns}: {err}"
-            )
-        })?;
+    ) -> Result<(PathBuf, bool, BackupLockGuard), Error> {
+        if backup_dir.time
+            > proxmox_time::epoch_i64().saturating_add(self.inner.max_snapshot_time_skew)
+        {
+            bail!(
+                "backup timestamp in the future, exceeding {} seconds time skew",
+                self.inner.max_snapshot_time_skew
+            );
+        }
 
-        let lock = || {
-            lock_dir_noblock(
-                &full_path,
-                "snapshot",
-                "internal error - tried creating snapshot that's already in use",
-            )
-        };
+        let backup_dir = self.backup_dir(ns.clone(), backup_dir.clone())?;
+        let relative_path = backup_dir.relative_path();
 
-        match std::fs::create_dir(&full_path) {
-            Ok(_) => Ok((relative_path.to_owned(), true, lock()?)),
+        match std::fs::create_dir(backup_dir.full_path()) {
+            Ok(_) => {
+                let guard = backup_dir.lock().with_context(|| {
+                    format!("while creating new locked snapshot {relative_path:?}")
+                })?;
+                Ok((relative_path, true, guard))
+            }
             Err(ref e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                Ok((relative_path.to_owned(), false, lock()?))
+                let guard = backup_dir
+                    .lock()
+                    .with_context(|| format!("while creating locked snapshot {relative_path:?}"))?;
+                Ok((relative_path, false, guard))
             }
             Err(e) => Err(e.into()),
         }
@@ -844,7 +1990,7 @@ impl DataStore {
         ListGroupsType::new(Arc::clone(self), ns, ty)
     }
 
-    /// Get a streaming iter over top-level backup groups of a datatstore of a particular type,
+    /// Get a streaming iter over top-level backup groups of a datastore of a particular type,
     /// filtered by `Ok` results
     ///
     /// The iterated item's result is already unwrapped, if it contained an error it will be
@@ -889,10 +2035,15 @@ impl DataStore {
         ListGroups::new(Arc::clone(self), ns)?.collect()
     }
 
-    pub fn list_images(&self) -> Result<Vec<PathBuf>, Error> {
+    /// Lookup all index files to be found in the datastore without taking any logical iteration
+    /// into account.
+    /// The filesystem is walked recursevly to detect index files based on their archive type based
+    /// on the filename. This however excludes the chunks folder, hidden files and does not follow
+    /// symlinks.
+    fn list_index_files(&self) -> Result<HashSet<PathBuf>, Error> {
         let base = self.base_path();
 
-        let mut list = vec![];
+        let mut list = HashSet::new();
 
         use walkdir::WalkDir;
 
@@ -923,7 +2074,7 @@ impl DataStore {
                 bail!("cannot continue garbage-collection safely, permission denied on: {path:?}");
             } else if inner.kind() == io::ErrorKind::NotFound {
                 log::info!("ignoring vanished file: {path:?}");
-                return Ok(());
+                Ok(())
             } else {
                 bail!("unexpected error on datastore traversal: {inner} - {path:?}");
             }
@@ -936,11 +2087,11 @@ impl DataStore {
                     continue;
                 }
             };
-            if let Ok(archive_type) = archive_type(&path) {
+            if let Ok(archive_type) = ArchiveType::from_path(&path) {
                 if archive_type == ArchiveType::FixedIndex
                     || archive_type == ArchiveType::DynamicIndex
                 {
-                    list.push(path);
+                    list.insert(path);
                 }
             }
         }
@@ -948,13 +2099,53 @@ impl DataStore {
         Ok(list)
     }
 
+    // Similar to open index, but return with Ok(None) if index file vanished.
+    fn open_index_reader(&self, absolute_path: &Path) -> Result<Option<Box<dyn IndexFile>>, Error> {
+        let archive_type = match ArchiveType::from_path(absolute_path) {
+            // ignore archives with unknown archive type
+            Ok(ArchiveType::Blob) | Err(_) => bail!("unexpected archive type"),
+            Ok(archive_type) => archive_type,
+        };
+
+        if absolute_path.is_relative() {
+            bail!("expected absolute path, got '{absolute_path:?}'");
+        }
+
+        let file = match std::fs::File::open(absolute_path) {
+            Ok(file) => file,
+            // ignore vanished files
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => {
+                return Err(
+                    Error::from(err).context(format!("can't open file '{absolute_path:?}'"))
+                );
+            }
+        };
+
+        match archive_type {
+            ArchiveType::FixedIndex => {
+                let reader = FixedIndexReader::new(file)
+                    .with_context(|| format!("can't open fixed index '{absolute_path:?}'"))?;
+                Ok(Some(Box::new(reader)))
+            }
+            ArchiveType::DynamicIndex => {
+                let reader = DynamicIndexReader::new(file)
+                    .with_context(|| format!("can't open dynamic index '{absolute_path:?}'"))?;
+                Ok(Some(Box::new(reader)))
+            }
+            ArchiveType::Blob => bail!("unexpected archive type blob"),
+        }
+    }
+
     // mark chunks  used by ``index`` as used
-    fn index_mark_used_chunks<I: IndexFile>(
+    fn index_mark_used_chunks(
         &self,
-        index: I,
+        index: Box<dyn IndexFile>,
         file_name: &Path, // only used for error reporting
+        chunk_lru_cache: &mut Option<LruCache<[u8; 32], ()>>,
         status: &mut GarbageCollectionStatus,
         worker: &dyn WorkerTaskContext,
+        s3_client: Option<Arc<S3Client>>,
     ) -> Result<(), Error> {
         status.index_file_count += 1;
         status.index_data_bytes += index.index_bytes();
@@ -963,22 +2154,43 @@ impl DataStore {
             worker.check_abort()?;
             worker.fail_on_shutdown()?;
             let digest = index.index_digest(pos).unwrap();
-            if !self.inner.chunk_store.cond_touch_chunk(digest, false)? {
-                let hex = hex::encode(digest);
-                task_warn!(
-                    worker,
-                    "warning: unable to access non-existent chunk {hex}, required by {file_name:?}"
-                );
 
+            // Avoid multiple expensive atime updates by utimensat
+            if let Some(chunk_lru_cache) = chunk_lru_cache {
+                if chunk_lru_cache.insert(*digest, (), |_| Ok(()))? {
+                    if let Some(cache_stats) = status.cache_stats.as_mut() {
+                        cache_stats.hits += 1;
+                    }
+                    continue;
+                }
+                if let Some(cache_stats) = status.cache_stats.as_mut() {
+                    cache_stats.misses += 1;
+                }
+            }
+
+            if !self.inner.chunk_store.cond_touch_chunk(digest, false)? {
                 // touch any corresponding .bad files to keep them around, meaning if a chunk is
                 // rewritten correctly they will be removed automatically, as well as if no index
                 // file requires the chunk anymore (won't get to this loop then)
-                for i in 0..=9 {
-                    let bad_ext = format!("{}.bad", i);
-                    let mut bad_path = PathBuf::new();
-                    bad_path.push(self.chunk_path(digest).0);
-                    bad_path.set_extension(bad_ext);
-                    self.inner.chunk_store.cond_touch_path(&bad_path, false)?;
+                let is_bad = self.inner.chunk_store.cond_touch_bad_chunks(digest)?;
+
+                if let Some(ref _s3_client) = s3_client {
+                    // Do not retry here, this is very unlikely to happen as chunk markers will
+                    // most likely only be missing if the local cache store was recreated.
+                    let _guard = self
+                        .inner
+                        .chunk_store
+                        .lock_chunk(digest, CHUNK_LOCK_TIMEOUT)?;
+                    if !self.inner.chunk_store.cond_touch_chunk(digest, false)? && !is_bad {
+                        // Insert empty file as marker to tell GC phase2 that this is
+                        // a chunk still in-use, so to keep in the S3 object store.
+                        self.inner.chunk_store.mark_chunk_as_expected(digest)?;
+                    }
+                } else {
+                    let hex = hex::encode(digest);
+                    warn!(
+                        "warning: unable to access non-existent chunk {hex}, required by {file_name:?}"
+                    );
                 }
             }
         }
@@ -989,67 +2201,169 @@ impl DataStore {
         &self,
         status: &mut GarbageCollectionStatus,
         worker: &dyn WorkerTaskContext,
+        cache_capacity: usize,
+        s3_client: Option<Arc<S3Client>>,
     ) -> Result<(), Error> {
-        let image_list = self.list_images()?;
-        let image_count = image_list.len();
+        // Iterate twice over the datastore to fetch index files, even if this comes with an
+        // additional runtime cost:
+        // - First iteration to find all index files, no matter if they are in a location expected
+        //   by the datastore's hierarchy
+        // - Iterate using the datastore's helpers, so the namespaces, groups and snapshots are
+        //   looked up given the expected hierarchy and iterator logic
+        //
+        // By this it is assured that all index files are used, even if they would not have been
+        // seen by the regular logic and the user is informed by the garbage collection run about
+        // the detected index files not following the iterators logic.
 
+        let mut unprocessed_index_list = self.list_index_files()?;
+        let mut index_count = unprocessed_index_list.len();
+
+        let mut chunk_lru_cache = if cache_capacity > 0 {
+            Some(LruCache::new(cache_capacity))
+        } else {
+            None
+        };
+        let mut processed_index_files = 0;
         let mut last_percentage: usize = 0;
 
-        let mut strange_paths_count: u64 = 0;
+        let arc_self = Arc::new(self.clone());
+        for namespace in arc_self
+            .recursive_iter_backup_ns(BackupNamespace::root())
+            .context("creating namespace iterator failed")?
+        {
+            let namespace = namespace.context("iterating namespaces failed")?;
+            for group in arc_self.iter_backup_groups(namespace)? {
+                let group = group.context("iterating backup groups failed")?;
 
-        for (i, img) in image_list.into_iter().enumerate() {
-            worker.check_abort()?;
-            worker.fail_on_shutdown()?;
+                // Avoid race between listing/marking of snapshots by GC and pruning the last
+                // snapshot in the group, following a new snapshot creation. Otherwise known chunks
+                // might only be referenced by the new snapshot, so it must be read as well.
+                let mut retry_counter = 0;
+                'retry: loop {
+                    let _lock = match retry_counter {
+                        0..=9 => None,
+                        10 => Some(
+                            group
+                                .lock()
+                                .context("exhausted retries and failed to lock group")?,
+                        ),
+                        _ => bail!("exhausted retries and unexpected counter overrun"),
+                    };
 
-            if let Some(backup_dir_path) = img.parent() {
-                let backup_dir_path = backup_dir_path.strip_prefix(self.base_path())?;
-                if let Some(backup_dir_str) = backup_dir_path.to_str() {
-                    if pbs_api_types::parse_ns_and_snapshot(backup_dir_str).is_err() {
-                        strange_paths_count += 1;
-                    }
-                }
-            }
+                    let mut snapshots = match group.list_backups() {
+                        Ok(snapshots) => snapshots,
+                        Err(err) => {
+                            if group.exists() {
+                                return Err(err).context("listing snapshots failed")?;
+                            }
+                            break 'retry;
+                        }
+                    };
 
-            match std::fs::File::open(&img) {
-                Ok(file) => {
-                    if let Ok(archive_type) = archive_type(&img) {
-                        if archive_type == ArchiveType::FixedIndex {
-                            let index = FixedIndexReader::new(file).map_err(|e| {
-                                format_err!("can't read index '{}' - {}", img.to_string_lossy(), e)
-                            })?;
-                            self.index_mark_used_chunks(index, &img, status, worker)?;
-                        } else if archive_type == ArchiveType::DynamicIndex {
-                            let index = DynamicIndexReader::new(file).map_err(|e| {
-                                format_err!("can't read index '{}' - {}", img.to_string_lossy(), e)
-                            })?;
-                            self.index_mark_used_chunks(index, &img, status, worker)?;
+                    // Always start iteration with the last snapshot of the group to reduce race
+                    // window with concurrent backup+prune previous last snapshot. Allows to retry
+                    // without the need to keep track of already processed index files for the
+                    // current group.
+                    BackupInfo::sort_list(&mut snapshots, true);
+                    for (count, snapshot) in snapshots.into_iter().rev().enumerate() {
+                        for file in snapshot.files {
+                            worker.check_abort()?;
+                            worker.fail_on_shutdown()?;
+
+                            match ArchiveType::from_path(&file) {
+                                Ok(ArchiveType::FixedIndex) | Ok(ArchiveType::DynamicIndex) => (),
+                                Ok(ArchiveType::Blob) | Err(_) => continue,
+                            }
+
+                            let mut path = snapshot.backup_dir.full_path();
+                            path.push(file);
+
+                            let index = match self.open_index_reader(&path)? {
+                                Some(index) => index,
+                                None => {
+                                    unprocessed_index_list.remove(&path);
+                                    if count == 0 {
+                                        retry_counter += 1;
+                                        continue 'retry;
+                                    }
+                                    continue;
+                                }
+                            };
+
+                            self.index_mark_used_chunks(
+                                index,
+                                &path,
+                                &mut chunk_lru_cache,
+                                status,
+                                worker,
+                                s3_client.as_ref().cloned(),
+                            )?;
+
+                            if !unprocessed_index_list.remove(&path) {
+                                info!(
+                                    "Encountered new index file '{path:?}', increment total index file count"
+                                );
+                                index_count += 1;
+                            }
+
+                            let percentage = (processed_index_files + 1) * 100 / index_count;
+                            if percentage > last_percentage {
+                                info!(
+                                    "marked {percentage}% ({} of {index_count} index files)",
+                                    processed_index_files + 1,
+                                );
+                                last_percentage = percentage;
+                            }
+                            processed_index_files += 1;
                         }
                     }
+
+                    break;
                 }
-                Err(err) if err.kind() == io::ErrorKind::NotFound => (), // ignore vanished files
-                Err(err) => bail!("can't open index {} - {}", img.to_string_lossy(), err),
-            }
-
-            let percentage = (i + 1) * 100 / image_count;
-            if percentage > last_percentage {
-                task_log!(
-                    worker,
-                    "marked {}% ({} of {} index files)",
-                    percentage,
-                    i + 1,
-                    image_count,
-                );
-                last_percentage = percentage;
             }
         }
 
-        if strange_paths_count > 0 {
-            task_log!(
+        let mut strange_paths_count = unprocessed_index_list.len();
+        for path in unprocessed_index_list {
+            let index = match self.open_index_reader(&path)? {
+                Some(index) => index,
+                None => {
+                    // do not count vanished (pruned) backup snapshots as strange paths.
+                    strange_paths_count -= 1;
+                    continue;
+                }
+            };
+            self.index_mark_used_chunks(
+                index,
+                &path,
+                &mut chunk_lru_cache,
+                status,
                 worker,
-                "found (and marked) {} index files outside of expected directory scheme",
-                strange_paths_count,
-            );
+                s3_client.as_ref().cloned(),
+            )?;
+            warn!("Marked chunks for unexpected index file at '{path:?}'");
         }
+        if strange_paths_count > 0 {
+            warn!("Found {strange_paths_count} index files outside of expected directory scheme");
+        }
+
+        // Drain the move journal under an exclusive flock. Any index file whose path
+        // was recorded before its rename is processed here even if the namespace
+        // iteration missed it at both its old and new locations. See `move_journal`
+        // for details.
+        crate::move_journal::drain_move_journal(self.name(), |path| {
+            let Some(index) = self.open_index_reader(path)? else {
+                return Ok(());
+            };
+            self.index_mark_used_chunks(
+                index,
+                path,
+                &mut chunk_lru_cache,
+                status,
+                worker,
+                s3_client.as_ref().cloned(),
+            )
+        })?;
 
         Ok(())
     }
@@ -1059,7 +2373,10 @@ impl DataStore {
     }
 
     pub fn garbage_collection_running(&self) -> bool {
-        self.inner.gc_mutex.try_lock().is_err()
+        let lock = self.inner.gc_mutex.try_lock();
+
+        // Mutex currently locked or contains an exclusive lock
+        lock.is_err() || lock.unwrap().is_some()
     }
 
     pub fn garbage_collection(
@@ -1067,113 +2384,357 @@ impl DataStore {
         worker: &dyn WorkerTaskContext,
         upid: &UPID,
     ) -> Result<(), Error> {
-        if let Ok(ref mut _mutex) = self.inner.gc_mutex.try_lock() {
+        if let Ok(mut mutex) = self.inner.gc_mutex.try_lock() {
             // avoids that we run GC if an old daemon process has still a
             // running backup writer, which is not save as we have no "oldest
             // writer" information and thus no safe atime cutoff
-            let _exclusive_lock = self.inner.chunk_store.try_exclusive_lock()?;
-
-            let phase1_start_time = proxmox_time::epoch_i64();
-            let oldest_writer = self
-                .inner
-                .chunk_store
-                .oldest_writer()
-                .unwrap_or(phase1_start_time);
-
-            let mut gc_status = GarbageCollectionStatus {
-                upid: Some(upid.to_string()),
-                ..Default::default()
-            };
-
-            task_log!(worker, "Start GC phase1 (mark used chunks)");
-
-            self.mark_used_chunks(&mut gc_status, worker)?;
-
-            task_log!(worker, "Start GC phase2 (sweep unused chunks)");
-            self.inner.chunk_store.sweep_unused_chunks(
-                oldest_writer,
-                phase1_start_time,
-                &mut gc_status,
-                worker,
-            )?;
-
-            task_log!(
-                worker,
-                "Removed garbage: {}",
-                HumanByte::from(gc_status.removed_bytes),
-            );
-            task_log!(worker, "Removed chunks: {}", gc_status.removed_chunks);
-            if gc_status.pending_bytes > 0 {
-                task_log!(
-                    worker,
-                    "Pending removals: {} (in {} chunks)",
-                    HumanByte::from(gc_status.pending_bytes),
-                    gc_status.pending_chunks,
-                );
+            let exclusive_lock = self.inner.chunk_store.try_exclusive_lock()?;
+            // keep the exclusive lock around for the duration of GC
+            if mutex.is_some() {
+                bail!("Obtained exclusive lock on datastore twice - this should never happen!");
             }
-            if gc_status.removed_bad > 0 {
-                task_log!(worker, "Removed bad chunks: {}", gc_status.removed_bad);
+            *mutex = Some(exclusive_lock);
+            drop(mutex);
+
+            let res = self.garbage_collection_impl(worker, upid);
+
+            // and now drop it again
+            let mut mutex = self.inner.gc_mutex.lock().unwrap();
+            if mutex.take().is_none() {
+                warn!("Lost exclusive datastore lock during GC - this should never happen!");
             }
 
-            if gc_status.still_bad > 0 {
-                task_log!(worker, "Leftover bad chunks: {}", gc_status.still_bad);
-            }
-
-            task_log!(
-                worker,
-                "Original data usage: {}",
-                HumanByte::from(gc_status.index_data_bytes),
-            );
-
-            if gc_status.index_data_bytes > 0 {
-                let comp_per =
-                    (gc_status.disk_bytes as f64 * 100.) / gc_status.index_data_bytes as f64;
-                task_log!(
-                    worker,
-                    "On-Disk usage: {} ({:.2}%)",
-                    HumanByte::from(gc_status.disk_bytes),
-                    comp_per,
-                );
-            }
-
-            task_log!(worker, "On-Disk chunks: {}", gc_status.disk_chunks);
-
-            let deduplication_factor = if gc_status.disk_bytes > 0 {
-                (gc_status.index_data_bytes as f64) / (gc_status.disk_bytes as f64)
-            } else {
-                1.0
-            };
-
-            task_log!(worker, "Deduplication factor: {:.2}", deduplication_factor);
-
-            if gc_status.disk_chunks > 0 {
-                let avg_chunk = gc_status.disk_bytes / (gc_status.disk_chunks as u64);
-                task_log!(worker, "Average chunk size: {}", HumanByte::from(avg_chunk));
-            }
-
-            if let Ok(serialized) = serde_json::to_string(&gc_status) {
-                let mut path = self.base_path();
-                path.push(".gc-status");
-
-                let backup_user = pbs_config::backup_user()?;
-                let mode = nix::sys::stat::Mode::from_bits_truncate(0o0644);
-                // set the correct owner/group/permissions while saving file
-                // owner(rw) = backup, group(r)= backup
-                let options = CreateOptions::new()
-                    .perm(mode)
-                    .owner(backup_user.uid)
-                    .group(backup_user.gid);
-
-                // ignore errors
-                let _ = replace_file(path, serialized.as_bytes(), options, false);
-            }
-
-            *self.inner.last_gc_status.lock().unwrap() = gc_status;
+            res
         } else {
             bail!("Start GC failed - (already running/locked)");
         }
+    }
 
+    fn garbage_collection_impl(
+        &self,
+        worker: &dyn WorkerTaskContext,
+        upid: &UPID,
+    ) -> Result<(), Error> {
+        let (config, _digest) = pbs_config::datastore::config()?;
+        let gc_store_config: DataStoreConfig = config.lookup("datastore", self.name())?;
+        let all_stores = config.convert_to_typed_array("datastore")?;
+        if let Err(err) = gc_store_config.ensure_not_nested(&all_stores) {
+            info!(
+                "Current datastore path: {path}",
+                path = gc_store_config.absolute_path()
+            );
+            bail!("Aborting GC for safety reasons: {err}");
+        }
+
+        let phase1_start_time = proxmox_time::epoch_i64();
+        let oldest_writer = self
+            .inner
+            .chunk_store
+            .oldest_writer()
+            .unwrap_or(phase1_start_time);
+
+        let mut gc_status = GarbageCollectionStatus {
+            upid: Some(upid.to_string()),
+            cache_stats: Some(GarbageCollectionCacheStats::default()),
+            ..Default::default()
+        };
+        let tuning = pbs_config::datastore::parse_datastore_tuning_options(&gc_store_config)?;
+
+        let s3_client = match self.backend()? {
+            DatastoreBackend::Filesystem => None,
+            DatastoreBackend::S3(s3_client) => {
+                proxmox_async::runtime::block_on(s3_client.head_bucket())
+                    .context("failed to reach bucket")?;
+                Some(s3_client)
+            }
+        };
+
+        if tuning.gc_atime_safety_check.unwrap_or(true) {
+            self.inner
+                .chunk_store
+                .check_fs_atime_updates(true, s3_client.clone())
+                .context("atime safety check failed")?;
+            info!("Access time update check successful, proceeding with GC.");
+        } else {
+            info!("Access time update check disabled by datastore tuning options.");
+        };
+
+        // Fallback to default 24h 5m if not set
+        let cutoff = tuning
+            .gc_atime_cutoff
+            .map(|cutoff| cutoff * 60)
+            .unwrap_or(3600 * 24 + 300);
+
+        let mut min_atime = phase1_start_time - cutoff as i64;
+        info!(
+            "Using access time cutoff {}, minimum access time is {}",
+            TimeSpan::from(Duration::from_secs(cutoff as u64)),
+            proxmox_time::epoch_to_rfc3339_utc(min_atime)?,
+        );
+        if oldest_writer < min_atime {
+            min_atime = oldest_writer - 300; // account for 5 min safety gap
+            info!(
+                "Oldest backup writer started at {}, extending minimum access time to {}",
+                TimeSpan::from(Duration::from_secs(oldest_writer as u64)),
+                proxmox_time::epoch_to_rfc3339_utc(min_atime)?,
+            );
+        }
+
+        let gc_cache_capacity = if let Some(capacity) = tuning.gc_cache_capacity {
+            info!("Using chunk digest cache capacity of {capacity}.");
+            capacity
+        } else {
+            1024 * 1024
+        };
+
+        info!("Start GC phase1 (mark used chunks)");
+
+        self.mark_used_chunks(
+            &mut gc_status,
+            worker,
+            gc_cache_capacity,
+            s3_client.as_ref().cloned(),
+        )
+        .context("marking used chunks failed")?;
+
+        let phase2_start_time = proxmox_time::epoch_i64();
+        if phase2_start_time < phase1_start_time {
+            bail!(
+                "Unexpected system time drift detected, current time {} before start of phase 1 {}",
+                proxmox_time::epoch_to_rfc3339_utc(phase2_start_time)?,
+                proxmox_time::epoch_to_rfc3339_utc(phase1_start_time)?,
+            );
+        }
+
+        info!("Start GC phase2 (sweep unused chunks)");
+
+        if let Some(ref s3_client) = s3_client {
+            let mut chunk_count = 0;
+            let prefix = S3PathPrefix::Some(".chunks/".to_string());
+            // Operates in batches of 1000 objects max per request
+            let mut list_bucket_result =
+                proxmox_async::runtime::block_on(s3_client.list_objects_v2(&prefix, None))
+                    .context("failed to list chunk in s3 object store")?;
+
+            let mut delete_list =
+                S3DeleteList::with_thresholds(S3_DELETE_BATCH_LIMIT, S3_DELETE_DEFER_LIMIT_SECONDS);
+            loop {
+                for content in list_bucket_result.contents {
+                    worker.check_abort()?;
+                    worker.fail_on_shutdown()?;
+                    let (chunk_path, digest, bad) =
+                        match self.chunk_path_from_object_key(&content.key) {
+                            Some(path) => path,
+                            None => continue,
+                        };
+
+                    let timeout = std::time::Duration::from_secs(0);
+                    let _chunk_guard = match self.inner.chunk_store.lock_chunk(&digest, timeout) {
+                        Ok(guard) => guard,
+                        Err(_) => continue,
+                    };
+                    let _guard = self.inner.chunk_store.mutex().lock().unwrap();
+
+                    // Check local markers (created or atime updated during phase1) and
+                    // keep or delete chunk based on that.
+                    let atime = match std::fs::metadata(&chunk_path) {
+                        Ok(stat) => Some(stat.accessed()?),
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                            if self.inner.chunk_store.clear_chunk_expected_mark(&digest)? {
+                                unsafe {
+                                    // chunk store lock held
+                                    self.inner
+                                        .chunk_store
+                                        .replace_chunk_with_marker_or_create_marker(&digest)?;
+                                }
+                                Some(SystemTime::now())
+                            } else {
+                                // File not found, only delete from S3
+                                None
+                            }
+                        }
+                        Err(err) => return Err(err.into()),
+                    };
+                    if let Some(atime) = atime {
+                        let atime = atime.duration_since(SystemTime::UNIX_EPOCH)?.as_secs() as i64;
+
+                        unsafe {
+                            self.inner.chunk_store.cond_sweep_chunk(
+                                atime,
+                                min_atime,
+                                oldest_writer,
+                                content.size,
+                                bad,
+                                &mut gc_status,
+                                || {
+                                    if let Some(cache) = self.cache() {
+                                        if !bad {
+                                            cache.remove(&digest)?;
+                                        } else {
+                                            std::fs::remove_file(chunk_path)?;
+                                        }
+                                    }
+                                    delete_list.push(content.key, _chunk_guard);
+                                    Ok(())
+                                },
+                            )?;
+                        }
+                    } else {
+                        gc_status.removed_chunks += 1;
+                        gc_status.removed_bytes += content.size;
+                        delete_list.push(content.key, _chunk_guard);
+                    }
+
+                    chunk_count += 1;
+
+                    // drop guard because of async S3 call below
+                    drop(_guard);
+
+                    // limit pending deletes to avoid holding too many chunk flocks
+                    delete_list.conditional_delete_and_drop_locks(s3_client)?;
+                }
+                // Process next batch of chunks if there is more
+                if list_bucket_result.is_truncated {
+                    list_bucket_result =
+                        proxmox_async::runtime::block_on(s3_client.list_objects_v2(
+                            &prefix,
+                            list_bucket_result.next_continuation_token.as_deref(),
+                        ))?;
+                    continue;
+                }
+
+                break;
+            }
+
+            // delete the last batch of objects, if there are any remaining
+            delete_list.delete_and_drop_locks(s3_client)?;
+
+            info!("processed {chunk_count} total chunks");
+
+            // Phase 2 GC of Filesystem backed storage is phase 3 for S3 backed GC
+            info!("Start GC phase3 (sweep unused chunk markers)");
+
+            let mut tmp_gc_status = GarbageCollectionStatus {
+                upid: Some(upid.to_string()),
+                ..Default::default()
+            };
+            self.inner.chunk_store.sweep_unused_chunks(
+                oldest_writer,
+                min_atime,
+                &mut tmp_gc_status,
+                worker,
+                self.cache(),
+            )?;
+        } else {
+            self.inner.chunk_store.sweep_unused_chunks(
+                oldest_writer,
+                min_atime,
+                &mut gc_status,
+                worker,
+                None,
+            )?;
+        }
+
+        if let Some(cache_stats) = &gc_status.cache_stats {
+            let total_cache_counts = cache_stats.hits + cache_stats.misses;
+            if total_cache_counts > 0 {
+                let cache_hit_ratio = (cache_stats.hits as f64 * 100.) / total_cache_counts as f64;
+                info!(
+                    "Chunk cache: hits {}, misses {} (hit ratio {cache_hit_ratio:.2}%)",
+                    cache_stats.hits, cache_stats.misses,
+                );
+            }
+        }
+        info!(
+            "Removed garbage: {}",
+            HumanByte::from(gc_status.removed_bytes),
+        );
+        info!("Removed chunks: {}", gc_status.removed_chunks);
+        if gc_status.pending_bytes > 0 {
+            info!(
+                "Pending removals: {} (in {} chunks)",
+                HumanByte::from(gc_status.pending_bytes),
+                gc_status.pending_chunks,
+            );
+        }
+        if gc_status.removed_bad > 0 {
+            info!("Removed bad chunks: {}", gc_status.removed_bad);
+        }
+
+        if gc_status.still_bad > 0 {
+            info!("Leftover bad chunks: {}", gc_status.still_bad);
+        }
+
+        info!(
+            "Original data usage: {}",
+            HumanByte::from(gc_status.index_data_bytes),
+        );
+
+        if gc_status.index_data_bytes > 0 {
+            let comp_per = (gc_status.disk_bytes as f64 * 100.) / gc_status.index_data_bytes as f64;
+            info!(
+                "On-Disk usage: {} ({comp_per:.2}%)",
+                HumanByte::from(gc_status.disk_bytes)
+            );
+        }
+
+        info!("On-Disk chunks: {}", gc_status.disk_chunks);
+
+        let deduplication_factor = if gc_status.disk_bytes > 0 {
+            (gc_status.index_data_bytes as f64) / (gc_status.disk_bytes as f64)
+        } else {
+            1.0
+        };
+
+        info!("Deduplication factor: {deduplication_factor:.2}");
+
+        if gc_status.disk_chunks > 0 {
+            let avg_chunk = gc_status.disk_bytes / (gc_status.disk_chunks as u64);
+            info!("Average chunk size: {}", HumanByte::from(avg_chunk));
+        }
+
+        if let Ok(serialized) = serde_json::to_string(&gc_status) {
+            let mut path = self.base_path();
+            path.push(".gc-status");
+
+            let backup_user = proxmox_product_config::get_api_user();
+            let mode = nix::sys::stat::Mode::from_bits_truncate(0o0644);
+            // set the correct owner/group/permissions while saving file
+            // owner(rw) = backup, group(r)= backup
+            let options = CreateOptions::new()
+                .perm(mode)
+                .owner(backup_user.uid)
+                .group(backup_user.gid);
+
+            // ignore errors
+            let _ = replace_file(path, serialized.as_bytes(), options, false);
+        }
+
+        *self.inner.last_gc_status.lock().unwrap() = gc_status;
         Ok(())
+    }
+
+    // Check and generate a chunk path from given object key
+    fn chunk_path_from_object_key(
+        &self,
+        object_key: &S3ObjectKey,
+    ) -> Option<(PathBuf, [u8; 32], bool)> {
+        let (file_name, digest, suffix) = digest_from_object_key(object_key)?;
+
+        let bad_chunk = if is_bad_chunk_suffix(suffix.as_bytes()) {
+            true
+        } else if suffix.is_empty() {
+            false
+        } else {
+            return None; // unexpected suffix
+        };
+
+        let mut chunk_path = self.base_path();
+        chunk_path.push(".chunks");
+        chunk_path.push(&file_name[..4]);
+        chunk_path.push(file_name);
+
+        Some((chunk_path, digest, bad_chunk))
     }
 
     pub fn try_shared_chunk_store_lock(&self) -> Result<ProcessLockSharedGuard, Error> {
@@ -1190,8 +2751,97 @@ impl DataStore {
             .cond_touch_chunk(digest, assert_exists)
     }
 
-    pub fn insert_chunk(&self, chunk: &DataBlob, digest: &[u8; 32]) -> Result<(bool, u64), Error> {
-        self.inner.chunk_store.insert_chunk(chunk, digest)
+    /// Inserts the chunk with given digest in the chunk store based on the given backend.
+    ///
+    /// The backend is passed along in order to reuse an active connection to the backend, created
+    /// on environment instantiation, e.g. an s3 client which lives for the whole backup session.
+    /// This calls into async code, so callers must assure to never hold a Mutex lock.
+    pub fn insert_chunk(
+        &self,
+        chunk: &DataBlob,
+        digest: &[u8; 32],
+        backend: &DatastoreBackend,
+    ) -> Result<(bool, u64), Error> {
+        match backend {
+            DatastoreBackend::Filesystem => self.inner.chunk_store.insert_chunk(chunk, digest),
+            DatastoreBackend::S3(s3_client) => self.insert_chunk_cached(chunk, digest, s3_client),
+        }
+    }
+
+    /// Inserts the chunk with given digest in the chunk store based on the given backend, but
+    /// always bypasses the local datastore cache.
+    ///
+    /// The backend is passed along in order to reuse an active connection to the backend, created
+    /// on environment instantiation, e.g. an s3 client which lives for the whole backup session.
+    /// This calls into async code, so callers must assure to never hold a Mutex lock.
+    ///
+    /// FIXME: refactor into insert_chunk() once the backend instance is cacheable on the datastore
+    /// itself.
+    pub fn insert_chunk_no_cache(
+        &self,
+        chunk: &DataBlob,
+        digest: &[u8; 32],
+        backend: &DatastoreBackend,
+    ) -> Result<(bool, u64), Error> {
+        match backend {
+            DatastoreBackend::Filesystem => self.inner.chunk_store.insert_chunk(chunk, digest),
+            DatastoreBackend::S3(s3_client) => {
+                let _chunk_guard = self
+                    .inner
+                    .chunk_store
+                    .lock_chunk(digest, CHUNK_LOCK_TIMEOUT)?;
+                let chunk_data: Bytes = chunk.raw_data().to_vec().into();
+                let chunk_size = chunk_data.len() as u64;
+                let object_key = crate::s3::object_key_from_digest(digest)?;
+                let is_duplicate = proxmox_async::runtime::block_on(
+                    s3_client.upload_no_replace_with_retry(object_key, chunk_data),
+                )
+                .map_err(|err| format_err!("failed to upload chunk to s3 backend - {err:#}"))?;
+                Ok((is_duplicate, chunk_size))
+            }
+        }
+    }
+
+    fn insert_chunk_cached(
+        &self,
+        chunk: &DataBlob,
+        digest: &[u8; 32],
+        s3_client: &Arc<S3Client>,
+    ) -> Result<(bool, u64), Error> {
+        let chunk_data = chunk.raw_data();
+        let chunk_size = chunk_data.len() as u64;
+        let _chunk_guard = self
+            .inner
+            .chunk_store
+            .lock_chunk(digest, CHUNK_LOCK_TIMEOUT)?;
+
+        // Avoid re-upload to S3 if the chunk is either present in the in-memory LRU cache
+        // or the chunk marker file exists on filesystem. The latter means the chunk has
+        // been uploaded in the past, but was evicted from the LRU cache since but was not
+        // cleaned up by garbage collection, so contained in the S3 object store.
+        if self.cache_contains(digest) {
+            tracing::info!("Skip upload of cached chunk {}", hex::encode(digest));
+            return Ok((true, chunk_size));
+        }
+        if let Ok(true) = self.cond_touch_chunk(digest, false) {
+            tracing::info!(
+                "Skip upload of already encountered chunk {}",
+                hex::encode(digest),
+            );
+            return Ok((true, chunk_size));
+        }
+
+        tracing::info!("Upload new chunk {}", hex::encode(digest));
+        let object_key = crate::s3::object_key_from_digest(digest)?;
+        let chunk_data: Bytes = chunk_data.to_vec().into();
+        let is_duplicate = proxmox_async::runtime::block_on(
+            s3_client.upload_no_replace_with_retry(object_key, chunk_data),
+        )
+        .map_err(|err| format_err!("failed to upload chunk to s3 backend - {err:#}"))?;
+        tracing::info!("Caching of chunk {}", hex::encode(digest));
+        self.cache_insert(digest, chunk)?;
+        self.inner.chunk_store.clear_chunk_expected_mark(digest)?;
+        Ok((is_duplicate, chunk_size))
     }
 
     pub fn stat_chunk(&self, digest: &[u8; 32]) -> Result<std::fs::Metadata, Error> {
@@ -1224,16 +2874,49 @@ impl DataStore {
             bail!("snapshot {} does not exist!", backup_dir.dir());
         }
 
-        let _guard = lock_dir_noblock(&full_path, "snapshot", "possibly running or in use")?;
+        let _guard = backup_dir.lock().with_context(|| {
+            format!(
+                "while updating the protection status of snapshot {:?}",
+                backup_dir.relative_path()
+            )
+        })?;
 
         let protected_path = backup_dir.protected_file();
         if protection {
-            std::fs::File::create(protected_path)
+            std::fs::File::create(&protected_path)
                 .map_err(|err| format_err!("could not create protection file: {}", err))?;
-        } else if let Err(err) = std::fs::remove_file(protected_path) {
-            // ignore error for non-existing file
-            if err.kind() != std::io::ErrorKind::NotFound {
-                bail!("could not remove protection file: {}", err);
+            if let DatastoreBackend::S3(s3_client) = self.backend()? {
+                let object_key = crate::s3::object_key_from_path(
+                    &backup_dir.relative_path(),
+                    PROTECTED_MARKER_FILENAME,
+                )
+                .context("invalid protected marker object key")?;
+                let _is_duplicate = proxmox_async::runtime::block_on(
+                    s3_client
+                        .upload_no_replace_with_retry(object_key, hyper::body::Bytes::from("")),
+                )
+                .context("failed to mark snapshot as protected on s3 backend")?;
+            }
+        } else {
+            if let Err(err) = std::fs::remove_file(&protected_path) {
+                // ignore error for non-existing file
+                if err.kind() != std::io::ErrorKind::NotFound {
+                    bail!("could not remove protection file: {err}");
+                }
+            }
+            if let DatastoreBackend::S3(s3_client) = self.backend()? {
+                let object_key = crate::s3::object_key_from_path(
+                    &backup_dir.relative_path(),
+                    PROTECTED_MARKER_FILENAME,
+                )
+                .context("invalid protected marker object key")?;
+                if let Err(err) =
+                    proxmox_async::runtime::block_on(s3_client.delete_object(object_key))
+                {
+                    std::fs::File::create(&protected_path)
+                        .map_err(|err| format_err!("could not re-create protection file: {err}"))?;
+                    return Err(err);
+                }
             }
         }
 
@@ -1283,9 +2966,7 @@ impl DataStore {
 
         match self.inner.chunk_order {
             // sorting by inode improves data locality, which makes it lots faster on spinners
-            ChunkOrder::Inode => {
-                chunk_list.sort_unstable_by(|(_, ino_a), (_, ino_b)| ino_a.cmp(ino_b))
-            }
+            ChunkOrder::Inode => chunk_list.sort_unstable_by_key(|(_, ino)| *ino),
             ChunkOrder::None => {}
         }
 
@@ -1362,36 +3043,19 @@ impl DataStore {
     }
     */
 
-    /// Syncs the filesystem of the datastore if 'sync_level' is set to
+    /// Syncs the filesystem of the chunk store base path if 'sync_level' is set to
     /// [`DatastoreFSyncLevel::Filesystem`]. Uses syncfs(2).
     pub fn try_ensure_sync_level(&self) -> Result<(), Error> {
-        if self.inner.sync_level != DatastoreFSyncLevel::Filesystem {
-            return Ok(());
-        }
-        let file = std::fs::File::open(self.base_path())?;
-        let fd = file.as_raw_fd();
-        log::info!("syncing filesystem");
-        #[cfg(target_os = "linux")]
-        if unsafe { libc::syncfs(fd) } < 0 {
-            bail!("error during syncfs: {}", std::io::Error::last_os_error());
-        }
-        // no syncfs(2) elsewhere, sync all file systems instead
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = fd;
-            unsafe { libc::sync() };
-        }
-        Ok(())
+        let mutex_guard = self.inner.chunk_store.mutex().lock().unwrap();
+        self.inner
+            .chunk_store
+            .try_ensure_sync_level_with_update(mutex_guard, None)
     }
 
     /// Destroy a datastore. This requires that there are no active operations on the datastore.
     ///
     /// This is a synchronous operation and should be run in a worker-thread.
-    pub fn destroy(
-        name: &str,
-        destroy_data: bool,
-        worker: &dyn WorkerTaskContext,
-    ) -> Result<(), Error> {
+    pub fn destroy(name: &str, destroy_data: bool) -> Result<(), Error> {
         let config_lock = pbs_config::datastore::lock_config()?;
 
         let (mut config, _digest) = pbs_config::datastore::config()?;
@@ -1412,20 +3076,20 @@ impl DataStore {
             bail!("datastore is currently in use");
         }
 
-        let base = PathBuf::from(&datastore_config.path);
+        let base = PathBuf::from(datastore_config.absolute_path());
 
         let mut ok = true;
         if destroy_data {
             let remove = |subdir, ok: &mut bool| {
                 if let Err(err) = std::fs::remove_dir_all(base.join(subdir)) {
                     if err.kind() != io::ErrorKind::NotFound {
-                        task_warn!(worker, "failed to remove {subdir:?} subdirectory: {err}");
+                        warn!("failed to remove {subdir:?} subdirectory: {err}");
                         *ok = false;
                     }
                 }
             };
 
-            task_log!(worker, "Deleting datastore data...");
+            info!("Deleting datastore data...");
             remove("ns", &mut ok); // ns first
             remove("ct", &mut ok);
             remove("vm", &mut ok);
@@ -1434,9 +3098,22 @@ impl DataStore {
             if ok {
                 if let Err(err) = std::fs::remove_file(base.join(".gc-status")) {
                     if err.kind() != io::ErrorKind::NotFound {
-                        task_warn!(worker, "failed to remove .gc-status file: {err}");
+                        warn!("failed to remove .gc-status file: {err}");
                         ok = false;
                     }
+                }
+            }
+
+            if let (_backend, Some(s3_client)) =
+                Self::s3_client_and_backend_from_datastore_config(&datastore_config)?
+            {
+                // Delete all objects within the datastore prefix
+                let prefix = S3PathPrefix::Some(String::default());
+                let delete_objects_error =
+                    proxmox_async::runtime::block_on(s3_client.delete_objects_by_prefix(&prefix))?;
+                if !delete_objects_error.is_empty() {
+                    crate::s3::log_s3_delete_objects_errors(&delete_objects_error);
+                    bail!("deleting objects failed");
                 }
             }
 
@@ -1444,12 +3121,22 @@ impl DataStore {
             if ok {
                 remove(".chunks", &mut ok);
             }
+        } else if let (_backend, Some(s3_client)) =
+            Self::s3_client_and_backend_from_datastore_config(&datastore_config)?
+        {
+            // Only delete in-use marker so datastore can be re-imported
+            let object_key = S3ObjectKey::try_from(S3_DATASTORE_IN_USE_MARKER)
+                .context("failed to generate in-use marker object key")?;
+            proxmox_async::runtime::block_on(s3_client.delete_object(object_key))
+                .context("failed to delete in-use marker")?;
         }
 
         // now the config
         if ok {
-            task_log!(worker, "Removing datastore from config...");
+            info!("Removing datastore from config...");
             let _lock = pbs_config::datastore::lock_config()?;
+            // read again to avoid loosing concurrent modifications
+            let (mut config, _digest) = pbs_config::datastore::config()?;
             let _ = config.sections.remove(name);
             pbs_config::datastore::save_config(&config)?;
         }
@@ -1459,38 +3146,459 @@ impl DataStore {
             if ok {
                 if let Err(err) = std::fs::remove_file(base.join(".lock")) {
                     if err.kind() != io::ErrorKind::NotFound {
-                        task_warn!(worker, "failed to remove .lock file: {err}");
+                        warn!("failed to remove .lock file: {err}");
                         ok = false;
                     }
                 }
             }
 
             if ok {
-                task_log!(worker, "Finished deleting data.");
+                info!("Finished deleting data.");
 
                 match std::fs::remove_dir(base) {
-                    Ok(()) => task_log!(worker, "Removed empty datastore directory."),
+                    Ok(()) => info!("Removed empty datastore directory."),
                     Err(err) if err.kind() == io::ErrorKind::NotFound => {
                         // weird, but ok
                     }
                     Err(err) if err.is_errno(nix::errno::Errno::EBUSY) => {
-                        task_warn!(
-                            worker,
-                            "Cannot delete datastore directory (is it a mount point?)."
-                        )
+                        if datastore_config.backing_device.is_none() {
+                            warn!("Cannot delete datastore directory (is it a mount point?).")
+                        }
                     }
                     Err(err) if err.is_errno(nix::errno::Errno::ENOTEMPTY) => {
-                        task_warn!(worker, "Datastore directory not empty, not deleting.")
+                        warn!("Datastore directory not empty, not deleting.")
                     }
                     Err(err) => {
-                        task_warn!(worker, "Failed to remove datastore directory: {err}");
+                        warn!("Failed to remove datastore directory: {err}");
                     }
                 }
             } else {
-                task_log!(worker, "There were errors deleting data.");
+                info!("There were errors deleting data.");
             }
         }
 
+        Ok(())
+    }
+
+    pub fn old_locking(&self) -> bool {
+        *OLD_LOCKING
+    }
+
+    /// Fetch contents from S3 object store, clear and replace the local cache store contents.
+    /// Returns with error for non-S3 datastore backends.
+    pub async fn s3_refresh(self: &Arc<Self>) -> Result<(), Error> {
+        match self.backend()? {
+            DatastoreBackend::Filesystem => bail!("store '{}' not backed by S3", self.name()),
+            DatastoreBackend::S3(s3_client) => {
+                let tmp_base = proxmox_sys::fs::make_tmp_dir(self.base_path(), None)
+                    .context("failed to create temporary content folder in {store_base}")?;
+
+                if let Err(err) = async {
+                    self.fetch_tmp_contents(&tmp_base, &s3_client).await?;
+                    self.move_tmp_contents_in_place(&tmp_base).await
+                }
+                .await
+                {
+                    // igonre cleaunp errors, cannot act anyways
+                    let _ = std::fs::remove_dir_all(&tmp_base);
+                    return Err(err);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // Fetch the contents (metadata, no chunks) of the datastore from the S3 object store to the
+    // provided temporaray directory
+    async fn fetch_tmp_contents(&self, tmp_base: &Path, s3_client: &S3Client) -> Result<(), Error> {
+        let backup_user = proxmox_product_config::get_api_user();
+        let mode = nix::sys::stat::Mode::from_bits_truncate(0o0644);
+        let file_create_options = CreateOptions::new()
+            .perm(mode)
+            .owner(backup_user.uid)
+            .group(backup_user.gid);
+        let mode = nix::sys::stat::Mode::from_bits_truncate(0o0755);
+        let dir_create_options = CreateOptions::new()
+            .perm(mode)
+            .owner(backup_user.uid)
+            .group(backup_user.gid);
+
+        let list_prefix = S3PathPrefix::Some(S3_CONTENT_PREFIX.to_string());
+        let store_prefix = format!("{}/{S3_CONTENT_PREFIX}/", self.name());
+        let mut next_continuation_token: Option<String> = None;
+        loop {
+            let list_objects_result = s3_client
+                .list_objects_v2(&list_prefix, next_continuation_token.as_deref())
+                .await
+                .context("failed to list object")?;
+
+            for object in list_objects_result.contents {
+                let object_path =
+                    match crate::s3::content_filepath_from_object_key(&object.key, &store_prefix) {
+                        Ok(Some(path)) => path,
+                        Ok(None) => {
+                            info!("Skipping directory object {}", object.key);
+                            continue;
+                        }
+                        Err(err) => bail!(
+                            "Failed to parse filepath from object key {}: {err}",
+                            object.key
+                        ),
+                    };
+
+                let file_path = tmp_base.join(&object_path);
+                if let Some(parent) = file_path.parent() {
+                    proxmox_sys::fs::create_path(
+                        parent,
+                        Some(dir_create_options),
+                        Some(dir_create_options),
+                    )?;
+                }
+
+                if object_path.ends_with(NAMESPACE_MARKER_FILENAME) {
+                    info!("Created namespace {object_path:?}");
+                    continue;
+                }
+
+                info!("Fetching object {object_path:?}");
+
+                let mut target_file = tokio::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .read(true)
+                    .open(&file_path)
+                    .await
+                    .with_context(|| format!("failed to create target file {file_path:?}"))?;
+
+                if let Some(response) = s3_client
+                    .get_object(object.key)
+                    .await
+                    .with_context(|| format!("failed to fetch object {object_path:?}"))?
+                {
+                    let data = response
+                        .content
+                        .collect()
+                        .await
+                        .context("failed to collect object contents")?;
+                    target_file
+                        .write_all(&data.to_bytes())
+                        .await
+                        .context("failed to write to target file")?;
+                    file_create_options
+                        .apply_to(&mut target_file, &file_path)
+                        .context("failed to set target file create options")?;
+                    target_file
+                        .flush()
+                        .await
+                        .context("failed to flush target file")?;
+                } else {
+                    bail!("failed to download {object_path:?}, not found");
+                }
+            }
+
+            if list_objects_result.is_truncated {
+                next_continuation_token = list_objects_result
+                    .next_continuation_token
+                    .as_ref()
+                    .cloned();
+                continue;
+            }
+            break;
+        }
+        Ok(())
+    }
+
+    // Fetch the contents (metadata, no chunks) of the datastore from the S3 object store to the
+    // provided temporaray directory
+    async fn move_tmp_contents_in_place(&self, tmp_base: &PathBuf) -> Result<(), Error> {
+        for ty in ["vm", "ct", "host", "ns"] {
+            let store_base_clone = self.base_path().clone();
+            let tmp_base_clone = tmp_base.clone();
+            tokio::task::spawn_blocking(move || {
+                let type_dir = store_base_clone.join(ty);
+                if let Err(err) = std::fs::remove_dir_all(&type_dir) {
+                    if err.kind() != io::ErrorKind::NotFound {
+                        return Err(err).with_context(|| {
+                            format!("failed to remove old contents in {type_dir:?}")
+                        });
+                    }
+                }
+                let tmp_type_dir = tmp_base_clone.join(ty);
+                if let Err(err) = std::fs::rename(&tmp_type_dir, &type_dir) {
+                    if err.kind() != io::ErrorKind::NotFound {
+                        return Err(err)
+                            .with_context(|| format!("failed to rename {tmp_type_dir:?}"));
+                    }
+                }
+                Ok::<(), Error>(())
+            })
+            .await?
+            .with_context(|| format!("failed to refresh {:?}", self.base_path()))?;
+        }
+
+        std::fs::remove_dir_all(tmp_base)
+            .with_context(|| format!("failed to cleanup temporary content in {tmp_base:?}"))?;
+
+        Ok(())
+    }
+
+    pub fn s3_client_and_backend_from_datastore_config(
+        datastore_config: &DataStoreConfig,
+    ) -> Result<(DatastoreBackendType, Option<S3Client>), Error> {
+        let backend_config = pbs_config::datastore::parse_backend_config(datastore_config)?;
+        let backend_type = backend_config.ty.unwrap_or_default();
+
+        if backend_type != DatastoreBackendType::S3 {
+            return Ok((backend_type, None));
+        }
+
+        let s3_client_id = backend_config
+            .client
+            .as_ref()
+            .ok_or_else(|| format_err!("missing required client"))?;
+        let bucket = backend_config
+            .bucket
+            .clone()
+            .ok_or_else(|| format_err!("missing required bucket"))?;
+        let (config, _config_digest) =
+            pbs_config::s3::config().context("failed to get s3 config")?;
+        let client_config: S3ClientConf = config
+            .lookup(S3_CFG_TYPE_ID, s3_client_id)
+            .with_context(|| format!("no '{s3_client_id}' in config"))?;
+        let backup_user = proxmox_product_config::get_api_user();
+        let rate_limiter_options = S3RateLimiterOptions {
+            id: s3_client_id.to_string(),
+            user: backup_user.clone(),
+            base_path: S3_CLIENT_RATE_LIMITER_BASE_PATH.into(),
+        };
+        let request_counter_config = S3RequestCounterConfig {
+            id: format!("{s3_client_id}-{bucket}-{}", datastore_config.name),
+            user: backup_user.clone(),
+            base_path: S3_CLIENT_REQUEST_COUNTER_BASE_PATH.into(),
+        };
+        let http_proxy = if client_config.config.use_node_proxy.unwrap_or(false) {
+            pbs_config::node::node_http_proxy_config()?
+        } else {
+            None
+        };
+
+        let options = S3ClientOptions::from_config(
+            client_config.config,
+            client_config.secret_key,
+            Some(bucket),
+            datastore_config.name.to_owned(),
+            Some(rate_limiter_options),
+            http_proxy,
+            Some(request_counter_config),
+        );
+        let s3_client = S3Client::new(options)
+            .context("failed to create s3 client")
+            .map_err(|err| format_err!("{err:#}"))?;
+        Ok((backend_type, Some(s3_client)))
+    }
+
+    /// Creates or updates the notes associated with a backup group.
+    /// Acquires exclusive lock on the backup group.
+    pub fn set_group_notes(
+        self: &Arc<Self>,
+        notes: String,
+        backup_group: BackupGroup,
+    ) -> Result<(), Error> {
+        let _lock = backup_group.lock().context("failed to lock backup group")?;
+
+        if let DatastoreBackend::S3(s3_client) = self.backend()? {
+            let mut path = backup_group.backup_ns().path();
+            path.push(backup_group.group().to_string());
+            let object_key = crate::s3::object_key_from_path(&path, "notes")
+                .context("invalid owner file object key")?;
+            let data = hyper::body::Bytes::copy_from_slice(notes.as_bytes());
+            let _is_duplicate = proxmox_async::runtime::block_on(
+                s3_client.upload_replace_with_retry(object_key, data),
+            )
+            .context("failed to set notes on s3 backend")?;
+        }
+        let notes_path = self.group_notes_path(backup_group.backup_ns(), backup_group.group());
+        replace_file(notes_path, notes.as_bytes(), CreateOptions::new(), false)
+            .context("failed to replace group notes file")?;
+        Ok(())
+    }
+
+    /// Delete a backup snapshot from the datastore.
+    /// Acquires exclusive lock on the backup snapshot.
+    pub fn delete_snapshot(self: &Arc<Self>, snapshot: &BackupDir) -> Result<(), Error> {
+        let backend = self.backend().context("failed to get backend")?;
+        // acquires exclusive lock on snapshot before removal
+        snapshot.destroy(false, &backend)?;
+        Ok(())
+    }
+
+    /// Adds the blob to the given snapshot.
+    /// Requires the caller to hold the exclusive lock.
+    pub fn add_blob(
+        self: &Arc<Self>,
+        filename: &str,
+        snapshot: BackupDir,
+        blob: DataBlob,
+        backend: &DatastoreBackend,
+    ) -> Result<(), Error> {
+        if let DatastoreBackend::S3(s3_client) = backend {
+            let object_key = crate::s3::object_key_from_path(&snapshot.relative_path(), filename)
+                .context("invalid blob object key")?;
+            let data = hyper::body::Bytes::copy_from_slice(blob.raw_data());
+            proxmox_async::runtime::block_on(s3_client.upload_replace_with_retry(object_key, data))
+                .context("failed to upload blob to s3 backend")?;
+        };
+
+        let mut path = snapshot.full_path();
+        path.push(filename);
+        replace_file(&path, blob.raw_data(), CreateOptions::new(), false)?;
+        Ok(())
+    }
+
+    /// Set the notes for given snapshots.
+    pub fn set_notes(self: &Arc<Self>, notes: String, snapshot: BackupDir) -> Result<(), Error> {
+        let backend = self.backend().context("failed to get backend")?;
+        snapshot
+            .update_manifest(&backend, |manifest| {
+                manifest.unprotected["notes"] = notes.into();
+            })
+            .map_err(|err| format_err!("unable to update manifest blob - {err}"))?;
+        Ok(())
+    }
+
+    /// Renames a corrupt chunk, returning the new path if the chunk was renamed successfully.
+    /// Returns with `Ok(None)` if the chunk source was not found.
+    pub fn rename_corrupt_chunk(&self, digest: &[u8; 32]) -> Result<Option<PathBuf>, Error> {
+        let (path, digest_str) = self.chunk_path(digest);
+
+        let _chunk_guard;
+        if let DatastoreBackendType::S3 = self.inner.backend_config.ty.unwrap_or_default() {
+            _chunk_guard = self
+                .inner
+                .chunk_store
+                .lock_chunk(digest, CHUNK_LOCK_TIMEOUT)?;
+        }
+        let _lock = self.inner.chunk_store.mutex().lock().unwrap();
+
+        let (new_path, counter) = self.inner.chunk_store.next_bad_chunk_path(digest);
+
+        let result = match std::fs::rename(&path, &new_path) {
+            Ok(_) => Ok(Some(new_path)),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) => bail!("could not rename corrupt chunk {path:?} - {err}"),
+        };
+
+        if let Some(cache) = self.cache() {
+            // Locks are being held, so it is safe to call the method.
+            // Ignores errors from chunk marker file remove, it cannot be present since renamed.
+            let _ = unsafe { cache.remove(digest) };
+        }
+
+        drop(_lock);
+
+        let backend = self.backend().map_err(|err| {
+            format_err!(
+                "failed to get backend while trying to rename bad chunk: {digest_str} - {err}"
+            )
+        })?;
+
+        if let DatastoreBackend::S3(s3_client) = backend {
+            let suffix = format!(".{counter}.bad");
+            let target_key = crate::s3::object_key_from_digest_with_suffix(digest, &suffix)
+                .map_err(|err| {
+                    format_err!("could not generate target key for corrupt chunk {path:?} - {err}")
+                })?;
+            let object_key = crate::s3::object_key_from_digest(digest).map_err(|err| {
+                format_err!("could not generate object key for corrupt chunk {path:?} - {err}")
+            })?;
+
+            proxmox_async::runtime::block_on(s3_client.copy_object(object_key.clone(), target_key))
+                .map_err(|err| {
+                    format_err!("failed to copy corrupt chunk on s3 backend: {digest_str} - {err}")
+                })?;
+
+            proxmox_async::runtime::block_on(s3_client.delete_object(object_key)).map_err(
+                |err| {
+                    format_err!(
+                        "failed to delete corrupt chunk on s3 backend: {digest_str} - {err}"
+                    )
+                },
+            )?;
+        }
+
+        result
+    }
+}
+
+/// Track S3 object keys to be deleted by garbage collection while holding their file lock.
+struct S3DeleteList {
+    list: Vec<(S3ObjectKey, BackupLockGuard)>,
+    first_entry_added: SystemTime,
+    age_threshold: Duration,
+    capacity_threshold: usize,
+}
+
+impl S3DeleteList {
+    /// Create a new list instance with given capacity and age thresholds.
+    fn with_thresholds(capacity_threshold: usize, age_threshold: Duration) -> Self {
+        Self {
+            first_entry_added: SystemTime::now(), // init only, updated once added
+            list: Vec::with_capacity(capacity_threshold),
+            age_threshold,
+            capacity_threshold,
+        }
+    }
+
+    /// Pushes the current key and backup lock guard to the list, updating the delete list age if
+    /// the list was empty before the insert.
+    fn push(&mut self, key: S3ObjectKey, guard: BackupLockGuard) {
+        // set age based on first insertion
+        if self.list.is_empty() {
+            self.first_entry_added = SystemTime::now();
+        }
+        self.list.push((key, guard));
+    }
+
+    /// Delete the objects in the list via the provided S3 client instance.
+    /// Clears the list contents and frees the per-chunk file locks.
+    fn delete_and_drop_locks(&mut self, s3_client: &Arc<S3Client>) -> Result<(), Error> {
+        if self.list.is_empty() {
+            return Ok(());
+        }
+        let delete_objects_result = proxmox_async::runtime::block_on(
+            s3_client.delete_objects(
+                &self
+                    .list
+                    .iter()
+                    .map(|(key, _)| key.clone())
+                    .collect::<Vec<S3ObjectKey>>(),
+            ),
+        )?;
+        if delete_objects_result.error.is_some() {
+            bail!("failed to delete some objects");
+        }
+        // drops all chunk flock guards
+        self.list.clear();
+        Ok(())
+    }
+
+    /// Delete the object stored in the list if either the list equals or exceed the capacity
+    /// threshold or the delete list age threshold.
+    fn conditional_delete_and_drop_locks(
+        &mut self,
+        s3_client: &Arc<S3Client>,
+    ) -> Result<(), Error> {
+        if self.list.len() >= self.capacity_threshold
+            || (!self.list.is_empty()
+                && self
+                    .first_entry_added
+                    .elapsed()
+                    .unwrap_or(self.age_threshold) // time jump to past, chunk markers already gone
+                    >= self.age_threshold)
+        {
+            self.delete_and_drop_locks(s3_client)?;
+        }
         Ok(())
     }
 }

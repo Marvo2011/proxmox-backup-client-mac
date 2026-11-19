@@ -1,7 +1,7 @@
 //! The "basic" api types we generally require along with some of their macros.
 use const_format::concatcp;
 
-use crate::{ApiStringFormat, ArraySchema, Schema, StringSchema};
+use crate::{ApiStringFormat, ArraySchema, IntegerSchema, Schema, StringSchema};
 
 #[rustfmt::skip]
 const IPV4OCTET: &str = r"(?:25[0-5]|(?:2[0-4]|1[0-9]|[1-9])?[0-9])";
@@ -87,7 +87,7 @@ const_regex! {
     ///
     /// This
     /// [article](https://dwheeler.com/essays/fixing-unix-linux-filenames.html)
-    /// contains further information why it is reasonable to restict
+    /// contains further information why it is reasonable to restrict
     /// names this way. This is not only useful for filenames, but for
     /// any identifier command line tools work with.
     pub SAFE_ID_REGEX = concatcp!(r"^", SAFE_ID_REGEX_STR, r"$");
@@ -95,8 +95,11 @@ const_regex! {
     pub PASSWORD_REGEX = r"^[[:^cntrl:]]*$";
     /// Single line comment. Allow everything but control characters.
     pub SINGLE_LINE_COMMENT_REGEX = r"^[[:^cntrl:]]*$";
-    /// Comment spawning multiple lines. Allow everything but control characters.
-    pub MULTI_LINE_COMMENT_REGEX = r"(?m)^([[:^cntrl:]]*)$";
+    /// Comment spanning multiple lines. Allow newlines, tabs and everything but other control
+    /// characters, as tabs are ordinary whitespace in free-form text like markdown notes.
+    /// Anchored to the entire input so a single dirty line cannot hide behind a clean one
+    /// (`is_match` of a multi-line `^...$` pattern would succeed as long as any line matched).
+    pub MULTI_LINE_COMMENT_REGEX = r"\A(?:[[:^cntrl:]]|[\t\n])*\z";
 
     pub HOSTNAME_REGEX = r"^(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]*[a-zA-Z0-9])?)$";
     pub DNS_NAME_REGEX = concatcp!(r"^", DNS_NAME_STR, r"$");
@@ -120,8 +123,16 @@ const_regex! {
     /// specified in the RFC.
     pub GENERIC_URI_REGEX = r#"^[^\x00-\x1F\x7F <>#"]*$"#;
 
-    pub BLOCKDEVICE_NAME_REGEX = r"^(?:(?:h|s|x?v)d[a-z]+)|(?:nvme\d+n\d+)$";
-    pub BLOCKDEVICE_DISK_AND_PARTITION_NAME_REGEX = r"^(?:(?:h|s|x?v)d[a-z]+\d*)|(?:nvme\d+n\d+(p\d+)?)$";
+    pub BLOCKDEVICE_NAME_REGEX = r"^(?:(?:(?:h|s|x?v)d[a-z]+)|(?:nvme\d+n\d+))$";
+    pub BLOCKDEVICE_DISK_AND_PARTITION_NAME_REGEX = r"^(?:(?:(?:h|s|x?v)d[a-z]+\d*)|(?:nvme\d+n\d+(p\d+)?))$";
+
+    /// Regex to match a base64-encoded ED25519 key.
+    /// A ED25519 key has always 32 bytes of raw key material, base64 needs 4 * (n / 3) characters
+    /// to represent n bytes -> 4 * (32 / 3) = 42.6.., thus 43 + 1 padding character.
+    pub ED25519_BASE64_KEY_REGEX =r"^[a-zA-Z0-9+/-]{43}=$";
+
+    /// Regex for matching a non-empty string that does not contain any whitespace.
+    pub NON_EMPTY_NO_WHITESPACE_REGEX = r"^\S+$";
 }
 
 pub const SAFE_ID_FORMAT: ApiStringFormat = ApiStringFormat::Pattern(&SAFE_ID_REGEX);
@@ -153,6 +164,9 @@ pub const HTTP_URL_FORMAT: ApiStringFormat = ApiStringFormat::Pattern(&HTTP_URL_
 pub const DNS_ALIAS_FORMAT: ApiStringFormat = ApiStringFormat::Pattern(&DNS_ALIAS_REGEX);
 pub const DNS_NAME_FORMAT: ApiStringFormat = ApiStringFormat::Pattern(&DNS_NAME_REGEX);
 pub const DNS_NAME_OR_IP_FORMAT: ApiStringFormat = ApiStringFormat::Pattern(&DNS_NAME_OR_IP_REGEX);
+
+pub const NON_EMPTY_NO_WHITESPACE_FORMAT: ApiStringFormat =
+    ApiStringFormat::Pattern(&NON_EMPTY_NO_WHITESPACE_REGEX);
 
 pub const IP_V4_SCHEMA: Schema = StringSchema::new("IPv4 address.")
     .format(&IP_V4_FORMAT)
@@ -221,6 +235,11 @@ pub const HOST_PORT_SCHEMA: Schema =
         .format(&HOST_PORT_FORMAT)
         .schema();
 
+pub const PORT_SCHEMA: Schema = IntegerSchema::new("Node port")
+    .minimum(1)
+    .maximum(65535)
+    .schema();
+
 pub const HTTP_URL_SCHEMA: Schema = StringSchema::new("HTTP(s) url with optional port.")
     .format(&HTTP_URL_FORMAT)
     .schema();
@@ -284,4 +303,85 @@ fn test_regexes() {
     assert!(IP_BRACKET_REGEX.is_match("[2014:b3a::27]"));
     assert!(IP_BRACKET_REGEX.is_match("[2014:b3a::192.168.0.1]"));
     assert!(IP_BRACKET_REGEX.is_match("[2014:b3a:0102:adf1:1234:4321:4afA:BCDF]"));
+
+    assert!(ED25519_BASE64_KEY_REGEX.is_match("KNpc7alqlLTaWE6RzuzHGioKs7Nqh/z3YxMJojpSelA="));
+    assert!(!ED25519_BASE64_KEY_REGEX.is_match(""));
+    // 31 bytes of data
+    assert!(!ED25519_BASE64_KEY_REGEX.is_match("6zroXbjGs9sdOpr1n/M5hh+UklBxtQ90tGQDnYzJfw=="));
+    // 33 bytes of data
+    assert!(!ED25519_BASE64_KEY_REGEX.is_match("IiC3Nkh4Fn2ukUZUNmdK5K5CWO53Zmk/eGlKO4m6aCD/"));
+    // valid key with trailing data
+    assert!(!ED25519_BASE64_KEY_REGEX.is_match("KNpc7alqlLTaWE6RzuzHGioKs7Nqh/z3YxMJojpSelA=;x"));
+    assert!(!ED25519_BASE64_KEY_REGEX.is_match("KNpc7alqlLTaWE6RzuzHGioKs7Nqh/z3YxMJojpSelA=\n"));
+}
+
+#[test]
+fn test_blockdevice_name_regexes() {
+    for name in ["sda", "sdaa", "hdb", "vdc", "xvda", "nvme0n1", "nvme10n12"] {
+        assert!(BLOCKDEVICE_NAME_REGEX.is_match(name), "{name:?}");
+        assert!(
+            BLOCKDEVICE_DISK_AND_PARTITION_NAME_REGEX.is_match(name),
+            "{name:?}"
+        );
+    }
+
+    for name in ["sda1", "xvda12", "nvme0n1p1"] {
+        assert!(!BLOCKDEVICE_NAME_REGEX.is_match(name), "{name:?}");
+        assert!(
+            BLOCKDEVICE_DISK_AND_PARTITION_NAME_REGEX.is_match(name),
+            "{name:?}"
+        );
+    }
+
+    // both alternatives must be anchored at start and end
+    for name in [
+        "",
+        "sda/../../dev/foo",
+        "sda; reboot",
+        "sda\n",
+        "/dev/sda",
+        "junk-nvme0n1",
+        "nvme0n1/../sda",
+        "sda1/../foo",
+        "nvme0n1p1 foo",
+    ] {
+        assert!(!BLOCKDEVICE_NAME_REGEX.is_match(name), "{name:?}");
+        assert!(
+            !BLOCKDEVICE_DISK_AND_PARTITION_NAME_REGEX.is_match(name),
+            "{name:?}"
+        );
+    }
+}
+
+#[test]
+fn test_non_empty_no_whitespace_regex() {
+    assert!(NON_EMPTY_NO_WHITESPACE_REGEX.is_match("abc"));
+    assert!(NON_EMPTY_NO_WHITESPACE_REGEX.is_match("äöü€"));
+    assert!(NON_EMPTY_NO_WHITESPACE_REGEX.is_match("abc123&_.*#$%^&*()_"));
+
+    assert!(!NON_EMPTY_NO_WHITESPACE_REGEX.is_match(""));
+    assert!(!NON_EMPTY_NO_WHITESPACE_REGEX.is_match(" "));
+    assert!(!NON_EMPTY_NO_WHITESPACE_REGEX.is_match("abc\n"));
+    assert!(!NON_EMPTY_NO_WHITESPACE_REGEX.is_match("ab c"));
+    assert!(!NON_EMPTY_NO_WHITESPACE_REGEX.is_match("äöü €"));
+    assert!(!NON_EMPTY_NO_WHITESPACE_REGEX.is_match("ab\nc"));
+    assert!(!NON_EMPTY_NO_WHITESPACE_REGEX.is_match("ab\rc"));
+    assert!(!NON_EMPTY_NO_WHITESPACE_REGEX.is_match("ab\r\nc"));
+    assert!(!NON_EMPTY_NO_WHITESPACE_REGEX.is_match("ab\tc"));
+    assert!(!NON_EMPTY_NO_WHITESPACE_REGEX.is_match("ab\u{a0}c"));
+    assert!(!NON_EMPTY_NO_WHITESPACE_REGEX.is_match("ab\u{2028}c"));
+}
+
+#[test]
+fn test_multi_line_comment_regex() {
+    assert!(MULTI_LINE_COMMENT_REGEX.is_match(""));
+    assert!(MULTI_LINE_COMMENT_REGEX.is_match("first line\nsecond line\n"));
+    assert!(MULTI_LINE_COMMENT_REGEX.is_match("list:\n\t- indented with a tab\n"));
+    assert!(MULTI_LINE_COMMENT_REGEX.is_match("non-ASCII: äöü €\n"));
+
+    // a clean line, including the empty one after a trailing newline, must not make up for
+    // a control character elsewhere in the value
+    assert!(!MULTI_LINE_COMMENT_REGEX.is_match("clean\nbel\x07line"));
+    assert!(!MULTI_LINE_COMMENT_REGEX.is_match("esc\x1b[1m\n"));
+    assert!(!MULTI_LINE_COMMENT_REGEX.is_match("crlf\r\n"));
 }

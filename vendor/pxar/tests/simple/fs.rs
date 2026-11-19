@@ -2,14 +2,14 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use pxar::decoder::sync as decoder;
+use pxar::EntryKind as PxarEntryKind;
+use pxar::Metadata;
 use pxar::decoder::SeqRead;
+use pxar::decoder::sync as decoder;
 use pxar::encoder::sync as encoder;
 use pxar::encoder::{LinkOffset, SeqWrite};
 use pxar::format::acl::{self, Permissions};
-use pxar::format::{mode, Device};
-use pxar::EntryKind as PxarEntryKind;
-use pxar::Metadata;
+use pxar::format::{Device, mode};
 
 use crate::Error;
 
@@ -144,12 +144,12 @@ impl Entry {
 
             EntryKind::Directory(entries) => {
                 self.no_hardlink()?;
-                let mut dir = encoder.create_directory(&self.name, &self.metadata)?;
+                encoder.create_directory(&self.name, &self.metadata)?;
                 let path = path.join(&self.name);
                 for entry in entries {
-                    entry.encode_into(&mut dir, hardlinks, &path)?;
+                    entry.encode_into(encoder, hardlinks, &path)?;
                 }
-                dir.finish()?;
+                encoder.finish()?;
             }
 
             EntryKind::Symlink(path) => {
@@ -229,11 +229,13 @@ impl Entry {
                     })?))
                 };
             match item.kind() {
+                PxarEntryKind::Version(_) => continue,
+                PxarEntryKind::Prelude(_) => continue,
                 PxarEntryKind::GoodbyeTable => break,
                 PxarEntryKind::File { size, .. } => {
                     let mut data = Vec::new();
                     decoder
-                        .contents()
+                        .contents()?
                         .ok_or_else(|| {
                             format_err!("failed to get contents for file entry: {:?}", item.path())
                         })?

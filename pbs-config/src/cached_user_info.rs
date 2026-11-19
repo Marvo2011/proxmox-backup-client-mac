@@ -1,18 +1,17 @@
 //! Cached user info for fast ACL permission checks
 
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, LazyLock, RwLock};
 
-use anyhow::{bail, Error};
-use lazy_static::lazy_static;
+use anyhow::{Error, bail};
 
 use proxmox_router::UserInformation;
 use proxmox_section_config::SectionConfigData;
 use proxmox_time::epoch_i64;
 
-use pbs_api_types::{privs_to_priv_names, ApiToken, Authid, User, Userid, ROLE_ADMIN};
+use pbs_api_types::{ApiToken, Authid, ROLE_ADMIN, User, Userid, privs_to_priv_names};
 
-use crate::acl::{AclTree, ROLE_NAMES};
 use crate::ConfigVersionCache;
+use crate::acl::{AclTree, ROLE_NAMES};
 
 /// Cache User/Group/Token/Acl configuration data for fast permission tests
 pub struct CachedUserInfo {
@@ -24,15 +23,17 @@ struct ConfigCache {
     data: Option<Arc<CachedUserInfo>>,
     last_update: i64,
     last_user_cache_generation: usize,
+    last_acl_cache_generation: usize,
 }
 
-lazy_static! {
-    static ref CACHED_CONFIG: RwLock<ConfigCache> = RwLock::new(ConfigCache {
+static CACHED_CONFIG: LazyLock<RwLock<ConfigCache>> = LazyLock::new(|| {
+    RwLock::new(ConfigCache {
         data: None,
         last_update: 0,
-        last_user_cache_generation: 0
-    });
-}
+        last_user_cache_generation: 0,
+        last_acl_cache_generation: 0,
+    })
+});
 
 impl CachedUserInfo {
     /// Returns a cached instance (up to 5 seconds old).
@@ -41,11 +42,13 @@ impl CachedUserInfo {
 
         let version_cache = ConfigVersionCache::new()?;
         let user_cache_generation = version_cache.user_cache_generation();
+        let acl_cache_generation = version_cache.acl_cache_generation();
 
         {
             // limit scope
             let cache = CACHED_CONFIG.read().unwrap();
             if (user_cache_generation == cache.last_user_cache_generation)
+                && (acl_cache_generation == cache.last_acl_cache_generation)
                 && ((now - cache.last_update) < 5)
             {
                 if let Some(ref config) = cache.data {
@@ -62,6 +65,7 @@ impl CachedUserInfo {
         let mut cache = CACHED_CONFIG.write().unwrap();
         cache.last_update = now;
         cache.last_user_cache_generation = user_cache_generation;
+        cache.last_acl_cache_generation = acl_cache_generation;
         cache.data = Some(config.clone());
 
         Ok(config)
@@ -138,7 +142,7 @@ impl CachedUserInfo {
     }
 
     pub fn is_superuser(&self, auth_id: &Authid) -> bool {
-        !auth_id.is_token() && auth_id.user() == "root@pam"
+        !auth_id.is_token() && auth_id.user() == Userid::root_userid()
     }
 
     pub fn is_group_member(&self, _userid: &Userid, _group: &str) -> bool {
@@ -179,7 +183,7 @@ impl CachedUserInfo {
         (privs, propagated_privs)
     }
 
-    /// Checks whether the `auth_id` has any of the privilegs `privs` on any object below `path`.
+    /// Checks whether the `auth_id` has any of the privileges `privs` on any object below `path`.
     pub fn any_privs_below(
         &self,
         auth_id: &Authid,
@@ -209,7 +213,7 @@ impl CachedUserInfo {
 
 impl UserInformation for CachedUserInfo {
     fn is_superuser(&self, userid: &str) -> bool {
-        userid == "root@pam"
+        userid == Userid::root_userid().as_str()
     }
 
     fn is_group_member(&self, _userid: &str, _group: &str) -> bool {

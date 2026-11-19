@@ -5,7 +5,7 @@ use anyhow::Error;
 use nix::fcntl::OFlag;
 use nix::sys::stat::Mode;
 use nix::unistd::mkdir;
-use proxmox_shared_memory::{check_subtype, initialize_subtype, Init, SharedMemory, SharedMutex};
+use proxmox_shared_memory::{Init, SharedMemory, SharedMutex, check_subtype, initialize_subtype};
 use proxmox_sys::fs::CreateOptions;
 
 use std::sync::atomic::AtomicU64;
@@ -77,7 +77,7 @@ impl Init for MultiMutexData {
     }
 }
 
-fn create_test_dir<T: Init>(filename: &str) -> Option<PathBuf> {
+fn create_test_dir(filename: &str) -> Option<PathBuf> {
     let test_dir: String = env!("CARGO_TARGET_TMPDIR").to_string();
 
     let mut path = PathBuf::from(&test_dir);
@@ -100,14 +100,15 @@ fn create_test_dir<T: Init>(filename: &str) -> Option<PathBuf> {
 }
 #[test]
 fn test_shared_memory_mutex() -> Result<(), Error> {
-    let path = match create_test_dir::<SingleMutexData>("data1.shm") {
+    let path = match create_test_dir("data1.shm") {
         None => {
             return Ok(()); // no O_TMPFILE support, can't run test
         }
         Some(path) => path,
     };
 
-    let shared: SharedMemory<SingleMutexData> = SharedMemory::open(&path, CreateOptions::new())?;
+    let shared: SharedMemory<SingleMutexData> =
+        SharedMemory::open_non_tmpfs(&path, CreateOptions::new())?;
 
     let shared = Arc::new(shared);
 
@@ -138,13 +139,14 @@ fn test_shared_memory_mutex() -> Result<(), Error> {
 
 #[test]
 fn test_shared_memory_multi_mutex() -> Result<(), Error> {
-    let path = match create_test_dir::<SingleMutexData>("data2.shm") {
+    let path = match create_test_dir("data2.shm") {
         None => {
             return Ok(()); // no O_TMPFILE support, can't run test
         }
         Some(path) => path,
     };
-    let shared: SharedMemory<MultiMutexData> = SharedMemory::open(&path, CreateOptions::new())?;
+    let shared: SharedMemory<MultiMutexData> =
+        SharedMemory::open_non_tmpfs(&path, CreateOptions::new())?;
 
     let shared = Arc::new(shared);
 

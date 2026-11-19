@@ -1,7 +1,8 @@
 use std::io::Write;
 
-use anyhow::{bail, Error};
-use openssl::symm::{decrypt_aead, Mode};
+use anyhow::{Error, bail};
+use openssl::symm::{Mode, decrypt_aead};
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 use proxmox_io::{ReadExt, WriteExt};
 
@@ -30,7 +31,7 @@ pub struct ChunkInfo {
 /// ".didx").
 ///
 pub struct DataBlob {
-    raw_data: Vec<u8>, // tagged, compressed, encryped data
+    raw_data: Vec<u8>, // tagged, compressed, encrypted data
 }
 
 impl DataBlob {
@@ -56,13 +57,13 @@ impl DataBlob {
 
     /// accessor to crc32 checksum
     pub fn crc(&self) -> u32 {
-        let crc_o = proxmox_lang::offsetof!(DataBlobHeader, crc);
+        let crc_o = std::mem::offset_of!(DataBlobHeader, crc);
         u32::from_le_bytes(self.raw_data[crc_o..crc_o + 4].try_into().unwrap())
     }
 
     // set the CRC checksum field
     pub fn set_crc(&mut self, crc: u32) {
-        let crc_o = proxmox_lang::offsetof!(DataBlobHeader, crc);
+        let crc_o = std::mem::offset_of!(DataBlobHeader, crc);
         self.raw_data[crc_o..crc_o + 4].copy_from_slice(&crc.to_le_bytes());
     }
 
@@ -93,28 +94,42 @@ impl DataBlob {
             bail!("data blob too large ({} bytes).", data.len());
         }
 
-        let mut blob = if let Some(config) = config {
-            let compr_data;
-            let (_compress, data, magic) = if compress {
-                compr_data = zstd::bulk::compress(data, 1)?;
-                // Note: We only use compression if result is shorter
-                if compr_data.len() < data.len() {
-                    (true, &compr_data[..], ENCR_COMPR_BLOB_MAGIC_1_0)
-                } else {
-                    (false, data, ENCRYPTED_BLOB_MAGIC_1_0)
-                }
-            } else {
-                (false, data, ENCRYPTED_BLOB_MAGIC_1_0)
-            };
+        let header_len = if config.is_some() {
+            std::mem::size_of::<EncryptedDataBlobHeader>()
+        } else {
+            std::mem::size_of::<DataBlobHeader>()
+        };
 
-            let header_len = std::mem::size_of::<EncryptedDataBlobHeader>();
+        let mut compressed = false;
+        let mut data_compressed = vec![0u8; header_len + data.len()];
+        if compress {
+            match zstd_safe::compress(&mut data_compressed[header_len..], data, 1) {
+                Ok(size) if size <= data.len() => {
+                    data_compressed.truncate(header_len + size);
+                    compressed = true;
+                }
+                Err(err) if !zstd_error_is_target_too_small(err) => {
+                    log::warn!("zstd compression error: {err}");
+                }
+                _ => {}
+            }
+        }
+
+        let (magic, encryption_source) = match (compressed, config.is_some()) {
+            (true, true) => (ENCR_COMPR_BLOB_MAGIC_1_0, &data_compressed[header_len..]),
+            (true, false) => (COMPRESSED_BLOB_MAGIC_1_0, &data_compressed[header_len..]),
+            (false, true) => (ENCRYPTED_BLOB_MAGIC_1_0, data),
+            (false, false) => {
+                (&mut data_compressed[header_len..]).write_all(data)?;
+                (UNCOMPRESSED_BLOB_MAGIC_1_0, data)
+            }
+        };
+
+        let raw_data = if let Some(config) = config {
             let mut raw_data = Vec::with_capacity(data.len() + header_len);
 
             let dummy_head = EncryptedDataBlobHeader {
-                head: DataBlobHeader {
-                    magic: [0u8; 8],
-                    crc: [0; 4],
-                },
+                head: DataBlobHeader { magic, crc: [0; 4] },
                 iv: [0u8; 16],
                 tag: [0u8; 16],
             };
@@ -122,7 +137,7 @@ impl DataBlob {
                 raw_data.write_le_value(dummy_head)?;
             }
 
-            let (iv, tag) = Self::encrypt_to(config, data, &mut raw_data)?;
+            let (iv, tag) = Self::encrypt_to(config, encryption_source, &mut raw_data)?;
 
             let head = EncryptedDataBlobHeader {
                 head: DataBlobHeader { magic, crc: [0; 4] },
@@ -134,45 +149,17 @@ impl DataBlob {
                 (&mut raw_data[0..header_len]).write_le_value(head)?;
             }
 
-            DataBlob { raw_data }
+            raw_data
         } else {
-            let max_data_len = data.len() + std::mem::size_of::<DataBlobHeader>();
-            if compress {
-                let mut comp_data = Vec::with_capacity(max_data_len);
-
-                let head = DataBlobHeader {
-                    magic: COMPRESSED_BLOB_MAGIC_1_0,
-                    crc: [0; 4],
-                };
-                unsafe {
-                    comp_data.write_le_value(head)?;
-                }
-
-                zstd::stream::copy_encode(data, &mut comp_data, 1)?;
-
-                if comp_data.len() < max_data_len {
-                    let mut blob = DataBlob {
-                        raw_data: comp_data,
-                    };
-                    blob.set_crc(blob.compute_crc());
-                    return Ok(blob);
-                }
-            }
-
-            let mut raw_data = Vec::with_capacity(max_data_len);
-
-            let head = DataBlobHeader {
-                magic: UNCOMPRESSED_BLOB_MAGIC_1_0,
-                crc: [0; 4],
-            };
+            let head = DataBlobHeader { magic, crc: [0; 4] };
             unsafe {
-                raw_data.write_le_value(head)?;
+                (&mut data_compressed[0..header_len]).write_le_value(head)?;
             }
-            raw_data.extend_from_slice(data);
 
-            DataBlob { raw_data }
+            data_compressed
         };
 
+        let mut blob = DataBlob { raw_data };
         blob.set_crc(blob.compute_crc());
 
         Ok(blob)
@@ -180,17 +167,11 @@ impl DataBlob {
 
     /// Get the encryption mode for this blob.
     pub fn crypt_mode(&self) -> Result<CryptMode, Error> {
-        let magic = self.magic();
-
-        Ok(
-            if magic == &UNCOMPRESSED_BLOB_MAGIC_1_0 || magic == &COMPRESSED_BLOB_MAGIC_1_0 {
-                CryptMode::None
-            } else if magic == &ENCR_COMPR_BLOB_MAGIC_1_0 || magic == &ENCRYPTED_BLOB_MAGIC_1_0 {
-                CryptMode::Encrypt
-            } else {
-                bail!("Invalid blob magic number.");
-            },
-        )
+        match *self.magic() {
+            UNCOMPRESSED_BLOB_MAGIC_1_0 | COMPRESSED_BLOB_MAGIC_1_0 => Ok(CryptMode::None),
+            ENCR_COMPR_BLOB_MAGIC_1_0 | ENCRYPTED_BLOB_MAGIC_1_0 => Ok(CryptMode::Encrypt),
+            _ => bail!("Invalid blob magic number."),
+        }
     }
 
     /// Decode blob data
@@ -199,33 +180,33 @@ impl DataBlob {
         config: Option<&CryptConfig>,
         digest: Option<&[u8; 32]>,
     ) -> Result<Vec<u8>, Error> {
-        let magic = self.magic();
+        let magic = *self.magic();
 
-        if magic == &UNCOMPRESSED_BLOB_MAGIC_1_0 {
-            let data_start = std::mem::size_of::<DataBlobHeader>();
-            let data = self.raw_data[data_start..].to_vec();
-            if let Some(digest) = digest {
-                Self::verify_digest(&data, None, digest)?;
+        let (data, crypt_config) = match magic {
+            UNCOMPRESSED_BLOB_MAGIC_1_0 => {
+                let data_start = std::mem::size_of::<DataBlobHeader>();
+                let data = self.raw_data[data_start..].to_vec();
+                (data, None)
             }
-            Ok(data)
-        } else if magic == &COMPRESSED_BLOB_MAGIC_1_0 {
-            let data_start = std::mem::size_of::<DataBlobHeader>();
-            let mut reader = &self.raw_data[data_start..];
-            let data = zstd::stream::decode_all(&mut reader)?;
-            // zstd::block::decompress is abou 10% slower
-            // let data = zstd::block::decompress(&self.raw_data[data_start..], MAX_BLOB_SIZE)?;
-            if let Some(digest) = digest {
-                Self::verify_digest(&data, None, digest)?;
+            COMPRESSED_BLOB_MAGIC_1_0 => {
+                let data_start = std::mem::size_of::<DataBlobHeader>();
+                let mut reader = &self.raw_data[data_start..];
+                let data = zstd::stream::decode_all(&mut reader)?;
+                // zstd::block::decompress is about 10% slower
+                // let data = zstd::block::decompress(&self.raw_data[data_start..], MAX_BLOB_SIZE)?;
+                (data, None)
             }
-            Ok(data)
-        } else if magic == &ENCR_COMPR_BLOB_MAGIC_1_0 || magic == &ENCRYPTED_BLOB_MAGIC_1_0 {
-            let header_len = std::mem::size_of::<EncryptedDataBlobHeader>();
-            let head = unsafe {
-                (&self.raw_data[..header_len]).read_le_value::<EncryptedDataBlobHeader>()?
-            };
+            ENCR_COMPR_BLOB_MAGIC_1_0 | ENCRYPTED_BLOB_MAGIC_1_0 => {
+                let header_len = std::mem::size_of::<EncryptedDataBlobHeader>();
+                let head = unsafe {
+                    (&self.raw_data[..header_len]).read_le_value::<EncryptedDataBlobHeader>()?
+                };
 
-            if let Some(config) = config {
-                let data = if magic == &ENCR_COMPR_BLOB_MAGIC_1_0 {
+                let Some(config) = config else {
+                    bail!("unable to decrypt blob - missing CryptConfig");
+                };
+
+                let data = if magic == ENCR_COMPR_BLOB_MAGIC_1_0 {
                     Self::decode_compressed_chunk(
                         config,
                         &self.raw_data[header_len..],
@@ -240,27 +221,38 @@ impl DataBlob {
                         &head.tag,
                     )?
                 };
-                if let Some(digest) = digest {
-                    Self::verify_digest(&data, Some(config), digest)?;
-                }
-                Ok(data)
-            } else {
-                bail!("unable to decrypt blob - missing CryptConfig");
+                (data, Some(config))
             }
-        } else {
-            bail!("Invalid blob magic number.");
+            _ => bail!("Invalid blob magic number."),
+        };
+
+        if let Some(digest) = digest {
+            Self::verify_digest(&data, crypt_config, digest)?;
         }
+
+        Ok(data)
     }
 
-    /// Load blob from ``reader``, verify CRC
+    /// Load data blob via given sync ``reader`` and verify its CRC
     pub fn load_from_reader(reader: &mut dyn std::io::Read) -> Result<Self, Error> {
         let mut data = Vec::with_capacity(1024 * 1024);
         reader.read_to_end(&mut data)?;
+        Self::from_raw_with_crc_check(data)
+    }
 
-        let blob = Self::from_raw(data)?;
+    /// Load data blob via given async ``reader`` and verify its CRC
+    pub async fn load_from_async_reader(
+        reader: &mut (dyn AsyncRead + Unpin + Send),
+    ) -> Result<Self, Error> {
+        let mut data = Vec::with_capacity(1024 * 1024);
+        reader.read_to_end(&mut data).await?;
+        Self::from_raw_with_crc_check(data)
+    }
 
+    /// Generates a data blob from raw input data and checks for matching CRC in header
+    fn from_raw_with_crc_check(raw_data: Vec<u8>) -> Result<Self, Error> {
+        let blob = Self::from_raw(raw_data)?;
         blob.verify_crc()?;
-
         Ok(blob)
     }
 
@@ -330,6 +322,11 @@ impl DataBlob {
         }
 
         Ok(())
+    }
+
+    /// Compute the sha256 digest on the raw blob data
+    pub fn csum(&self) -> [u8; 32] {
+        openssl::sha::sha256(&self.raw_data)
     }
 
     fn verify_digest(
@@ -472,7 +469,7 @@ impl DataBlob {
 /// Builder for chunk DataBlobs
 ///
 /// Main purpose is to centralize digest computation. Digest
-/// computation differ for encryped chunk, and this interface ensures that
+/// computation differ for encrypted chunk, and this interface ensures that
 /// we always compute the correct one.
 pub struct DataChunkBuilder<'a, 'b> {
     config: Option<&'b CryptConfig>,
@@ -560,5 +557,116 @@ impl<'a, 'b> DataChunkBuilder<'a, 'b> {
         }
 
         chunk_builder.build()
+    }
+}
+
+/// Check if the error code returned by `zstd_safe::compress`, or anything else that does FFI calls
+/// into zstd code, was `70` 'Destination buffer is too small' by subtracting the error code from
+/// `0` (with underflow), see `ERR_getErrorCode` in
+/// <https://github.com/facebook/zstd/blob/dev/lib/common/error_private.h>
+///
+/// There is a test below to ensure we catch any change in the interface or internal value.
+fn zstd_error_is_target_too_small(err: usize) -> bool {
+    // TODO: when zstd_sys >= 2.0.9 is available, we can use
+    // ZSTD_getErrorCode and the enum to use the public zstd API
+    let (real_code, _) = 0usize.overflowing_sub(err);
+    // see ZSTD_ErrorCode in https://github.com/facebook/zstd/blob/dev/lib/zstd_errors.h
+    real_code == 70 // ZSTD_error_dstSize_tooSmall
+}
+
+#[cfg(test)]
+mod test {
+    use pbs_tools::crypt_config::CryptConfig;
+
+    use super::{DataChunkBuilder, zstd_error_is_target_too_small};
+
+    const TEST_DATA_LEN: usize = 50;
+
+    fn build_test_data() -> Vec<u8> {
+        let mut data = Vec::with_capacity(TEST_DATA_LEN);
+        for i in 0..TEST_DATA_LEN / 10 {
+            for _ in 0..10 {
+                data.push(i as u8);
+            }
+        }
+        data
+    }
+
+    #[test]
+    fn unencrypted_uncompressed() {
+        let data = build_test_data();
+        let (chunk, digest) = DataChunkBuilder::new(&data)
+            .compress(false)
+            .build()
+            .expect("could not create unencrypted, uncompressed chunk");
+
+        let data_decoded = chunk
+            .decode(None, Some(&digest))
+            .expect("cannot decode unencrypted, uncompressed chunk");
+        assert_eq!(data, data_decoded);
+    }
+
+    #[test]
+    fn unencrypted_compressed() {
+        let data = build_test_data();
+        let (chunk, digest) = DataChunkBuilder::new(&data)
+            .compress(true)
+            .build()
+            .expect("could not create unencrypted, compressed chunk");
+
+        let data_decoded = chunk
+            .decode(None, Some(&digest))
+            .expect("cannot decode unencrypted, compressed chunk");
+        assert_eq!(data, data_decoded);
+    }
+
+    #[test]
+    fn encrypted_uncompressed() {
+        let data = build_test_data();
+        let crypt_config = CryptConfig::new([9; 32]).expect("could not create crypt config");
+        let (chunk, digest) = DataChunkBuilder::new(&data)
+            .compress(false)
+            .crypt_config(&crypt_config)
+            .build()
+            .expect("could not create encrypted, uncompressed chunk");
+
+        let data_decoded = chunk
+            .decode(Some(&crypt_config), Some(&digest))
+            .expect("cannot decode encrypted, uncompressed chunk");
+        assert_eq!(data, data_decoded);
+    }
+
+    #[test]
+    fn encrypted_compressed() {
+        let data = build_test_data();
+        let crypt_config = CryptConfig::new([9; 32]).expect("could not create crypt config");
+        let (chunk, digest) = DataChunkBuilder::new(&data)
+            .compress(true)
+            .crypt_config(&crypt_config)
+            .build()
+            .expect("could not create encrypted, compressed chunk");
+
+        let data_decoded = chunk
+            .decode(Some(&crypt_config), Some(&digest))
+            .expect("cannot decode encrypted, compressed chunk");
+        assert_eq!(data, data_decoded);
+    }
+
+    #[test]
+    /// test for the error code internal logic of zstd so we catch any interface/value changes on
+    /// (package) compile time
+    fn zstd_assert_dst_size_to_small_error_code_abi() {
+        let data = &build_test_data();
+        let mut target = Vec::new();
+        match zstd_safe::compress(&mut target, data, 1) {
+            Ok(_) => panic!("unexpected success with zero-sized buffer"),
+            Err(err) => {
+                if !zstd_error_is_target_too_small(err) {
+                    panic!(
+                        "unexpected error code {err}, check test validity and zstd for changes!"
+                    );
+                }
+            }
+        }
     }
 }

@@ -1,9 +1,11 @@
 #![recursion_limit = "256"]
+#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
 extern crate proc_macro;
 extern crate proc_macro2;
 
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Error;
 
@@ -45,7 +47,7 @@ fn handle_error(mut item: TokenStream, data: Result<TokenStream, Error>) -> Toke
                 item.extend(err.to_compile_error());
                 item
             }
-            Err(err) => panic!("error in api/router macro: {}", err),
+            Err(err) => panic!("error in api/router macro: {err}"),
         },
     };
     data.extend(take_non_fatal_errors());
@@ -151,8 +153,10 @@ fn router_do(item: TokenStream) -> Result<TokenStream, Error> {
     }
     ```
 
-    The `#[api]` macro can also be used on type declarations to create schemas for structs to be
-    used instead of accessing json values via string indexing.
+    The `#[api]` macro can also be used on type declarations to create schemas for `struct` and
+    `enum` types to be used instead of accessing json values via string indexing.
+
+    # Object schemas: `struct` types.
 
     For a simple struct, the schema can be left empty and will be completely derived from the
     information available in rust:
@@ -176,30 +180,127 @@ fn router_do(item: TokenStream) -> Result<TokenStream, Error> {
 
     This will produce the following schema:
     ```no_run
+    # use proxmox_schema::ApiType;
+    # use proxmox_schema::ObjectSchema;
+    # use proxmox_schema::Schema;
+    # use proxmox_schema::StringSchema;
     # struct RenamedStruct;
-    impl RenamedStruct {
-        pub const API_SCHEMA: &'static ::proxmox_schema::Schema =
-            &::proxmox_schema::ObjectSchema::new(
+    impl ApiType for RenamedStruct {
+        const API_SCHEMA: Schema =
+            ObjectSchema::new(
                 "An example of a struct with renamed fields.",
                 &[
-                    (
-                        "test-string",
-                        false,
-                        &::proxmox_schema::StringSchema::new("A test string.").schema(),
-                    ),
-                    (
+                   (
                         "SomeOther",
                         true,
-                        &::proxmox_schema::StringSchema::new(
+                        &StringSchema::new(
                             "An optional auto-derived value for testing:",
                         )
                         .schema(),
                     ),
+                    (
+                        "test-string",
+                        false,
+                        &StringSchema::new("A test string.").schema(),
+                    ),
+
                 ],
             )
             .schema();
     }
     ```
+
+    # Shared state parameters.
+
+    Parameters marked with `#[state]` are not part of the API schema. Instead of being extracted
+    from the API input, they are filled in from the `SharedStateRegistry` of the environment
+    the handler is called with. The handler receives a clone of the value registered for the
+    parameter's type and fails if no value of that type was registered:
+
+    ```no_run
+    # use proxmox_api_macro::api;
+    # use anyhow::Error;
+    #[derive(Clone)]
+    struct AuthContext {
+        realm: String,
+    }
+
+    #[api]
+    /// Show which realm the daemon was configured with.
+    fn print_realm(#[state] auth: AuthContext) -> Result<(), Error> {
+        println!("realm: {}", auth.realm);
+
+        Ok(())
+    }
+    ```
+
+    State arguments can also be taken as an `Option`, which turns an unavailable value from an
+    error into a `None`. This covers a type which was not registered as well as an environment
+    without any registry at all.
+
+    ```no_run
+    # use proxmox_api_macro::api;
+    # use anyhow::Error;
+    # #[derive(Clone)]
+    # struct AuthContext { realm: String }
+    #[api]
+    /// Show which realm the daemon was configured with, if any.
+    fn print_realm(#[state] auth: Option<AuthContext>) -> Result<(), Error> {
+        match auth {
+            Some(auth) => println!("realm: {}", auth.realm),
+            None => println!("no auth context configured"),
+        }
+
+        Ok(())
+    }
+    ```
+
+    # Deprecated property aliases
+
+    Use this when a property has been renamed and you want to keep the old name accepted for
+    one release cycle (a deprecation window) without exposing it in the public schema or in
+    generated documentation. If there are no external consumers of the old name, just rename
+    the property and skip the alias.
+
+    Declare a property entry with only an `alias:` key to keep the old name accepted. The form
+    mirrors PVE's Perl `JSONSchema.pm`:
+
+    ```
+    # use proxmox_api_macro::api;
+    # use serde::{Deserialize, Serialize};
+    #[api(
+        properties: {
+            "verify-mode": {
+                description: "Verification mode.",
+                type: String,
+            },
+            verify: { alias: "verify-mode" },
+        },
+    )]
+    #[derive(Deserialize, Serialize)]
+    /// A config with a renamed property.
+    pub struct Config {
+        #[serde(rename = "verify-mode")]
+        pub verify_mode: String,
+    }
+    ```
+
+    **Scope.** Aliases are honored on three layers:
+
+    - The *schema* sidecar (`ObjectSchema::property_aliases`), used by `lookup` and
+      `canonicalize_aliases`. This covers CLI getopts, property-string parsing, query and form
+      parameter parsing, the REST-server JSON-body dispatch, and `proxmox-section-config`
+      parsing, all of which rewrite the alias to the canonical name before validation.
+    - *Serde*: a `#[serde(alias = "...")]` attribute is auto-emitted on the canonical struct
+      field, so direct serde-driven paths (`serde_json::from_value::<Config>`, TOML,
+      `convert_to_typed_array`, ...) accept the deprecated name without further plumbing.
+
+    The `#[derive(Updater)]` derive is not currently alias-aware. The Updater struct only
+    accepts the canonical name.
+
+    Mixing the alias and the canonical (or two distinct aliases of the same canonical) in one
+    schema-validated request is rejected with a `cannot set both` error. Direct serde calls
+    will silently accept whichever key serde encounters last.
 
     Note that when writing out parts or all of the schema manually, the schema itself has to
     contain the already renamed fields!
@@ -224,10 +325,167 @@ fn router_do(item: TokenStream) -> Result<TokenStream, Error> {
     ```
 
     There are a few shortcuts for schemas: if the `type` refers to an arbitrary rust type other
-    than strings or integers, we assume that it has an `impl` block containing a `pub const
-    API_SCHEMA: &'static Schema`. This is what the `#[api]` macro produces on `struct` and `enum`
-    declarations. If it contains a `schema` key, this is expected to be the path to an existing
-    schema. (Hence `type: Foo` is the same as `schema: Foo::API_SCHEMA`.)
+    than strings or integers, we assume that it implements `proxmox_schema::ApiType`.
+    If it contains a `schema` key, this is expected to be the path to an existing schema. (Hence
+    `type: Foo` is the same as `schema: Foo::API_SCHEMA`.)
+
+    The `#[api]` macro supports `#[serde(flatten)]` by creating an `AllOfSchema`. Note that this is
+    incompatible with `#[serde(deny_unknown_fields)]`.
+
+    # `enum` types:
+
+    The `#[api]` macro supports 2 distinct versions of `enum` types:
+
+    - Simple enums, which become `String` types using the "format" `ApiStringFormat::Enum`. A
+      single `#[serde(untagged)]` variant is allowed to support "unknown" strings.
+    - Enums with only newtype variants.
+
+    ## Simple enums.
+
+    ```no_run
+    # use proxmox_api_macro::api;
+    # use serde::{Deserialize, Serialize};
+    #[api]
+    #[derive(Deserialize, Serialize)]
+    #[serde(rename_all = "kebab-case")]
+    /// Some Description.
+    pub enum SimpleEnum {
+        /// Mandatory description 1.
+        VariantOne,
+        /// Mandatory description 2.
+        VariantTwo,
+    }
+    ```
+
+    This produces the following schema:
+
+    ```no_run
+    # use proxmox_schema::ApiType;
+    # use proxmox_schema::Schema;
+    # use proxmox_schema::StringSchema;
+    # use proxmox_schema::ApiStringFormat;
+    # use proxmox_schema::EnumEntry;
+    # pub enum SimpleEnum {}
+    impl ApiType for SimpleEnum {
+        const API_SCHEMA: Schema =
+            StringSchema::new("Some Description.")
+                .format(&ApiStringFormat::Enum(&[
+                    EnumEntry {
+                        value: "variant-one",
+                        description: "Mandatory description 1.",
+                    },
+                    EnumEntry {
+                        value: "variant-two",
+                        description: "Mandatory description 2.",
+                    },
+                ]))
+                .schema();
+    }
+    ```
+
+    ## `OneOf` schema `enum`s.
+
+    For `enum`s with newtype variants, the `#[api]` macro currently supports internally and
+    adjacently tagged enums. There is currently no support for externally tagged enums.
+
+    ```no_run
+    # use proxmox_api_macro::api;
+    # use serde::{Deserialize, Serialize};
+    # #[api]
+    # /// Name and value.
+    # #[derive(Deserialize, Serialize)]
+    # pub struct NameValue {}
+    #
+    # #[api]
+    # /// Index and text.
+    # #[derive(Deserialize, Serialize)]
+    # pub struct IndexText {}
+    #[api]
+    /// An A or a B.
+    #[derive(Deserialize, Serialize)]
+    #[serde(tag = "type")]
+    pub enum AOrB {
+        /// Type A.
+        A(NameValue),
+        /// Type B.
+        B(IndexText),
+    }
+    ```
+
+    This will produce the following schema.
+
+    ```no_run
+    # use proxmox_api_macro::api;
+    # use proxmox_schema::ApiType;
+    # use proxmox_schema::OneOfSchema;
+    # use proxmox_schema::Schema;
+    # use proxmox_schema::StringSchema;
+    # use serde::{Deserialize, Serialize};
+    # #[api]
+    # #[derive(Deserialize, Serialize)]
+    # /// Name and value.
+    # pub struct NameValue {}
+    # #[api]
+    # /// Index and text.
+    # #[derive(Deserialize, Serialize)]
+    # pub struct IndexText {}
+    # pub enum AOrB {}
+    impl ApiType for AOrB {
+        const API_SCHEMA: Schema = OneOfSchema::new(
+            "An A or a B.",
+            &("type", false, &StringSchema::new("...").schema() /* .format(enum entries...) */ ),
+            &[("A", &NameValue::API_SCHEMA), ("B", &IndexText::API_SCHEMA)],
+        )
+        .schema();
+    }
+    ```
+
+    Adding a `#[serde(content = "value")]` to it will wrap the two variants in an additional
+    object schema like so:
+
+    ```no_run
+    # use proxmox_api_macro::api;
+    # use proxmox_schema::ApiType;
+    # use proxmox_schema::OneOfSchema;
+    # use proxmox_schema::ObjectSchema;
+    # use proxmox_schema::Schema;
+    # use proxmox_schema::StringSchema;
+    # use serde::{Deserialize, Serialize};
+    # #[api]
+    # #[derive(Deserialize, Serialize)]
+    # /// Name and value.
+    # pub struct NameValue {}
+    # #[api]
+    # /// Index and text.
+    # #[derive(Deserialize, Serialize)]
+    # pub struct IndexText {}
+    # pub enum AOrB {}
+    impl ApiType for AOrB {
+        const API_SCHEMA: Schema = OneOfSchema::new(
+            "An A or a B.",
+            &("type", false, &StringSchema::new("...").schema() /* .format(enum entries...) */ ),
+            &[
+                (
+                    "A",
+                    &ObjectSchema::new(
+                        "An instance of A.",
+                        &[("value", false, &NameValue::API_SCHEMA)],
+                    )
+                    .schema(),
+                ),
+                (
+                    "B",
+                    &ObjectSchema::new(
+                        "An instance of B.",
+                        &[("value", false, &IndexText::API_SCHEMA)],
+                    )
+                    .schema(),
+                ),
+            ],
+        )
+        .schema();
+    }
+    ```
 
     # Deriving an `Updater`:
 
@@ -291,7 +549,26 @@ fn router_do(item: TokenStream) -> Result<TokenStream, Error> {
 pub fn api(attr: TokenStream_1, item: TokenStream_1) -> TokenStream_1 {
     let _error_guard = init_local_error();
     let item: TokenStream = item.into();
-    handle_error(item.clone(), api::api(attr.into(), item)).into()
+    let fallback = api::strip_helper_attributes(item.clone());
+    handle_error(fallback, api::api(attr.into(), item)).into()
+}
+
+/// *Experimental:* Transform a json-like schema definition into an expression yielding a `Schema`.
+///
+/// This is currently considered experimental as it should not be required for normal code.
+#[proc_macro]
+pub fn json_schema(item: TokenStream_1) -> TokenStream_1 {
+    let _error_guard = init_local_error();
+    let item: TokenStream = item.into();
+    let mut output = take_non_fatal_errors();
+    match api::json_schema(item) {
+        Ok(ts) => output.extend(ts),
+        Err(err) => match err.downcast::<syn::Error>() {
+            Ok(err) => output.extend(err.to_compile_error()),
+            Err(err) => panic!("error in json_schema!() macro: {err}"),
+        },
+    }
+    quote::quote!({ #output }).into()
 }
 
 /// This is a dummy derive macro actually handled by `#[api]`!
@@ -313,7 +590,7 @@ pub fn derive_updater_type(item: TokenStream_1) -> TokenStream_1 {
     .into()
 }
 
-thread_local!(static NON_FATAL_ERRORS: RefCell<Option<TokenStream>> = RefCell::new(None));
+thread_local!(static NON_FATAL_ERRORS: RefCell<Option<TokenStream>> = const { RefCell::new(None) });
 
 /// The local error TLS must be freed at the end of a macro as any leftover `TokenStream` (even an
 /// empty one) will just panic between different runs as the multiple source files are handled by
@@ -352,4 +629,28 @@ pub(crate) fn take_non_fatal_errors() -> TokenStream {
             .take()
             .expect("missing call to init_local_mut")
     })
+}
+
+static WARN_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+/// Create a deprecation warning.
+pub(crate) fn add_warning(span: proc_macro2::Span, message: &str) {
+    let id = WARN_COUNTER.fetch_add(1, Ordering::Relaxed);
+
+    let id_name = syn::Ident::new(&format!("api_macro_deprecation_warning_{id}"), span);
+
+    NON_FATAL_ERRORS.with(|errors| {
+        errors
+            .borrow_mut()
+            .as_mut()
+            .expect("missing call to init_local_error")
+            .extend(quote::quote_spanned! { span =>
+                #[allow(dead_code)]
+                fn #id_name() {
+                    #[deprecated(note = #message)]
+                    const WARN: () = ();
+                    let _warn = WARN;
+                }
+            })
+    });
 }

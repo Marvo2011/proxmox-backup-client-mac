@@ -1,16 +1,16 @@
 [package]
 name = "proxmox-uuid"
-version = "1.0.2"
+description = "bindings for libuuid with optional serde support"
+version = "1.1.1"
+
 authors.workspace = true
 edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "bindings for libuuid with optional serde support"
-
-exclude.workspace = true
 
 [dependencies]
-libc.workspace = true
 serde = { workspace = true, optional = true }
 
 [features]

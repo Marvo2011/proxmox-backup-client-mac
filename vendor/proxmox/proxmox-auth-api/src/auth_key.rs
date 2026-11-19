@@ -1,6 +1,6 @@
 //! Auth key handling.
 
-use anyhow::{bail, format_err, Error};
+use anyhow::{Error, bail, format_err};
 use openssl::hash::MessageDigest;
 use openssl::pkey::{HasPublic, Id, PKey, PKeyRef, Private, Public};
 use openssl::rsa::Rsa;
@@ -86,7 +86,7 @@ impl PrivateKey {
         PublicKey::from_pem(&self.public_key_to_pem()?)
     }
 
-    pub(self) fn sign(&self, digest: MessageDigest, data: &[u8]) -> Result<Vec<u8>, Error> {
+    fn sign(&self, digest: MessageDigest, data: &[u8]) -> Result<Vec<u8>, Error> {
         let mut signer = if self.key.id() == Id::ED25519 {
             // ed25519 does not support signing with digest
             Signer::new_without_digest(&self.key)
@@ -154,7 +154,7 @@ impl HMACKey {
     }
 
     pub fn from_base64(string: &str) -> Result<Self, Error> {
-        let bytes = base64::decode_config(string, base64::STANDARD_NO_PAD)
+        let bytes = proxmox_base64::decode_no_pad(string)
             .map_err(|e| format_err!("could not decode base64 hmac key - {e}"))?;
 
         Self::from_bytes(&bytes)
@@ -202,10 +202,10 @@ impl HMACKey {
             .raw_private_key()
             .map_err(|e| format_err!("could not get key as raw bytes - {e}"))?;
 
-        Ok(base64::encode_config(bytes, base64::STANDARD_NO_PAD))
+        Ok(proxmox_base64::encode_no_pad(bytes))
     }
 
-    // This is needed for legacy CSRF token verifyication.
+    // This is needed for legacy CSRF token verification.
     //
     // TODO: remove once all dependent products had a major version release (PBS)
     #[cfg(feature = "api")]
@@ -229,12 +229,18 @@ enum VerificationKey {
 
 /// A key ring for authentication.
 ///
-/// This can hold one active signing key for new tickets (either an HMAC secret or an assymmetric
+/// This can hold one active signing key for new tickets (either an HMAC secret or an asymmetric
 /// key), and optionally multiple public keys and HMAC secrets for verifying them in order to
 /// support key rollover.
 pub struct Keyring {
     signing_key: Option<SigningKey>,
     public_keys: Vec<VerificationKey>,
+}
+
+impl Default for Keyring {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Keyring {
@@ -314,7 +320,7 @@ impl Keyring {
         if let Some(key) = &self.signing_key {
             match key {
                 SigningKey::Private(key) if verify_with(&key.key, digest, signature, data)? => {
-                    return Ok(true)
+                    return Ok(true);
                 }
                 SigningKey::Hmac(key) if key.verify(digest, signature, data)? => return Ok(true),
                 _ => (),
@@ -324,10 +330,10 @@ impl Keyring {
         for key in &self.public_keys {
             match key {
                 VerificationKey::Public(key) if verify_with(&key.key, digest, signature, data)? => {
-                    return Ok(true)
+                    return Ok(true);
                 }
                 VerificationKey::Hmac(key) if key.verify(digest, signature, data)? => {
-                    return Ok(true)
+                    return Ok(true);
                 }
                 _ => (),
             }

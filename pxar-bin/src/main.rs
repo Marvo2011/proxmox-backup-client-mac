@@ -3,19 +3,26 @@ use std::ffi::OsStr;
 use std::fs::OpenOptions;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use anyhow::{bail, format_err, Error};
+use anyhow::{Error, bail, format_err};
 use futures::future::FutureExt;
 use futures::select;
-use tokio::signal::unix::{signal, SignalKind};
+use serde_json::Value;
+use tokio::signal::unix::{SignalKind, signal};
 
 use pathpatterns::{MatchEntry, MatchType, PatternFlag};
-use pbs_client::pxar::{
-    format_single_line_entry, Flags, OverwriteFlags, PxarExtractOptions, ENCODER_MAX_ENTRIES,
-};
 
+use pbs_api_types::PathPattern;
+use pbs_client::pxar::tools::format_single_line_entry;
+use pbs_client::pxar::{
+    ENCODER_MAX_ENTRIES, Flags, OverwriteFlags, PxarExtractOptions, PxarWriters,
+};
+use pxar::EntryKind;
+
+use proxmox_human_byte::HumanByte;
+use proxmox_log::{Level, debug, enabled, error};
 use proxmox_router::cli::*;
 use proxmox_schema::api;
 
@@ -24,13 +31,19 @@ fn extract_archive_from_reader<R: std::io::Read>(
     target: &str,
     feature_flags: Flags,
     options: PxarExtractOptions,
+    payload_reader: Option<&mut R>,
 ) -> Result<(), Error> {
+    let reader = if let Some(payload_reader) = payload_reader {
+        pxar::PxarVariant::Split(reader, payload_reader)
+    } else {
+        pxar::PxarVariant::Unified(reader)
+    };
     pbs_client::pxar::extract_archive(
         pxar::decoder::Decoder::from_std(reader)?,
         Path::new(target),
         feature_flags,
         |path| {
-            log::debug!("{:?}", path);
+            debug!("{path:?}");
         },
         options,
     )
@@ -43,13 +56,12 @@ fn extract_archive_from_reader<R: std::io::Read>(
                 description: "Archive name.",
             },
             pattern: {
-                description: "List of paths or pattern matching files to restore",
                 type: Array,
                 items: {
-                    type: String,
-                    description: "Path or pattern matching files to restore.",
+                    type: PathPattern,
                 },
                 optional: true,
+                description: "Path or match pattern to limit files that get restored.",
             },
             target: {
                 description: "Target directory",
@@ -119,6 +131,14 @@ fn extract_archive_from_reader<R: std::io::Read>(
                 optional: true,
                 default: false,
             },
+            "payload-input": {
+                description: "'ppxar' payload input data file to restore split archive.",
+                optional: true,
+            },
+            "prelude-target": {
+                description: "Path to restore pxar archive prelude to.",
+                optional: true,
+            },
         },
     },
 )]
@@ -126,7 +146,6 @@ fn extract_archive_from_reader<R: std::io::Read>(
 #[allow(clippy::too_many_arguments)]
 fn extract_archive(
     archive: String,
-    pattern: Option<Vec<String>>,
     target: Option<String>,
     no_xattrs: bool,
     no_fcaps: bool,
@@ -141,6 +160,9 @@ fn extract_archive(
     no_fifos: bool,
     no_sockets: bool,
     strict: bool,
+    payload_input: Option<String>,
+    prelude_target: Option<String>,
+    param: Value,
 ) -> Result<(), Error> {
     let mut feature_flags = Flags::DEFAULT;
     if no_xattrs {
@@ -170,7 +192,6 @@ fn extract_archive(
         overwrite_flags.insert(OverwriteFlags::all());
     }
 
-    let pattern = pattern.unwrap_or_default();
     let target = target.as_ref().map_or_else(|| ".", String::as_str);
 
     let mut match_list = Vec::new();
@@ -184,11 +205,15 @@ fn extract_archive(
         }
     }
 
-    for entry in pattern {
-        match_list.push(
-            MatchEntry::parse_pattern(entry, PatternFlag::PATH_NAME, MatchType::Include)
-                .map_err(|err| format_err!("error in pattern: {}", err))?,
-        );
+    if let Some(pattern) = param["pattern"].as_array() {
+        for p in pattern {
+            if let Some(entry) = p.as_str() {
+                match_list.push(
+                    MatchEntry::parse_pattern(entry, PatternFlag::PATH_NAME, MatchType::Include)
+                        .map_err(|err| format_err!("error in pattern: {err}"))?,
+                );
+            }
+        }
     }
 
     let extract_match_default = match_list.is_empty();
@@ -202,7 +227,7 @@ fn extract_archive(
         // otherwise we want to log them but not act on them
         Some(Box::new(move |err| {
             was_ok.store(false, Ordering::Release);
-            log::error!("error: {}", err);
+            error!("error: {err:?}");
             Ok(())
         })
             as Box<dyn FnMut(Error) -> Result<(), Error> + Send>)
@@ -214,17 +239,32 @@ fn extract_archive(
         overwrite_flags,
         extract_match_default,
         on_error,
+        prelude_path: prelude_target.map(PathBuf::from),
     };
 
     if archive == "-" {
         let stdin = std::io::stdin();
         let mut reader = stdin.lock();
-        extract_archive_from_reader(&mut reader, target, feature_flags, options)?;
+        extract_archive_from_reader(&mut reader, target, feature_flags, options, None)
+            .map_err(|err| format_err!("error extracting archive - {err:#}"))?;
     } else {
-        log::debug!("PXAR extract: {}", archive);
+        debug!("PXAR extract: {archive}");
         let file = std::fs::File::open(archive)?;
         let mut reader = std::io::BufReader::new(file);
-        extract_archive_from_reader(&mut reader, target, feature_flags, options)?;
+        let mut payload_reader = if let Some(payload_input) = payload_input {
+            let file = std::fs::File::open(payload_input)?;
+            Some(std::io::BufReader::new(file))
+        } else {
+            None
+        };
+        extract_archive_from_reader(
+            &mut reader,
+            target,
+            feature_flags,
+            options,
+            payload_reader.as_mut(),
+        )
+        .map_err(|err| format_err!("error extracting archive - {err:#}"))?
     }
 
     if !was_ok.load(Ordering::Acquire) {
@@ -290,9 +330,13 @@ fn extract_archive(
             "entries-max": {
                 description: "Max number of entries loaded at once into memory",
                 optional: true,
-                default: ENCODER_MAX_ENTRIES as isize,
+                default: ENCODER_MAX_ENTRIES as i64,
                 minimum: 0,
-                maximum: isize::MAX,
+                maximum: i64::MAX,
+            },
+            "payload-output": {
+                description: "'ppxar' payload output data file to create split archive.",
+                optional: true,
             },
         },
     },
@@ -310,7 +354,8 @@ async fn create_archive(
     no_fifos: bool,
     no_sockets: bool,
     exclude: Option<Vec<String>>,
-    entries_max: isize,
+    entries_max: i64,
+    payload_output: Option<String>,
 ) -> Result<(), Error> {
     let patterns = {
         let input = exclude.unwrap_or_default();
@@ -336,6 +381,8 @@ async fn create_archive(
         patterns,
         skip_lost_and_found: false,
         skip_e2big_xattr: false,
+        previous_ref: None,
+        max_cache_size: None,
     };
 
     let source = PathBuf::from(source);
@@ -351,6 +398,16 @@ async fn create_archive(
         .write(true)
         .mode(0o640)
         .open(archive)?;
+
+    let payload_file = payload_output
+        .map(|payload_output| {
+            OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o640)
+                .open(payload_output)
+        })
+        .transpose()?;
 
     let writer = std::io::BufWriter::with_capacity(1024 * 1024, file);
     let mut feature_flags = Flags::DEFAULT;
@@ -373,17 +430,26 @@ async fn create_archive(
         feature_flags.remove(Flags::WITH_SOCKETS);
     }
 
-    let writer = pxar::encoder::sync::StandardWriter::new(writer);
+    let writer = if let Some(payload_file) = payload_file {
+        let payload_writer = std::io::BufWriter::with_capacity(1024 * 1024, payload_file);
+        pxar::PxarVariant::Split(
+            pxar::encoder::sync::StandardWriter::new(writer),
+            pxar::encoder::sync::StandardWriter::new(payload_writer),
+        )
+    } else {
+        pxar::PxarVariant::Unified(pxar::encoder::sync::StandardWriter::new(writer))
+    };
     pbs_client::pxar::create_archive(
         dir,
-        writer,
+        PxarWriters::new(writer, None),
         feature_flags,
         move |path| {
-            log::debug!("{:?}", path);
+            debug!("{path:?}");
             Ok(())
         },
-        None,
         options,
+        None,
+        None,
     )
     .await?;
 
@@ -400,25 +466,41 @@ async fn create_archive(
                 optional: true,
                 default: false,
             },
+            "payload-input": {
+                description: "'ppxar' payload input data file to restore split archive.",
+                optional: true,
+            },
         },
     },
 )]
 /// Mount the archive to the provided mountpoint via FUSE.
-async fn mount_archive(archive: String, mountpoint: String, verbose: bool) -> Result<(), Error> {
+async fn mount_archive(
+    archive: String,
+    mountpoint: String,
+    verbose: bool,
+    payload_input: Option<String>,
+) -> Result<(), Error> {
     let archive = Path::new(&archive);
     let mountpoint = Path::new(&mountpoint);
     let options = OsStr::new("ro,default_permissions");
+    let payload_input = payload_input.map(PathBuf::from);
 
-    let session = pbs_pxar_fuse::Session::mount_path(archive, options, verbose, mountpoint)
-        .await
-        .map_err(|err| format_err!("pxar mount failed: {}", err))?;
+    let session = pbs_pxar_fuse::Session::mount_path(
+        archive,
+        options,
+        verbose,
+        mountpoint,
+        payload_input.as_deref(),
+    )
+    .await
+    .map_err(|err| format_err!("pxar mount failed: {}", err))?;
 
     let mut interrupt = signal(SignalKind::interrupt())?;
 
     select! {
         res = session.fuse() => res?,
         _ = interrupt.recv().fuse() => {
-            log::debug!("interrupted");
+            debug!("interrupted");
         }
     }
 
@@ -431,25 +513,71 @@ async fn mount_archive(archive: String, mountpoint: String, verbose: bool) -> Re
             archive: {
                 description: "Archive name.",
             },
+            "payload-input": {
+                description: "'ppxar' payload input data file for split archive.",
+                optional: true,
+            },
         },
     },
 )]
 /// List the contents of an archive.
-fn dump_archive(archive: String) -> Result<(), Error> {
-    for entry in pxar::decoder::Decoder::open(archive)? {
+fn dump_archive(archive: String, payload_input: Option<String>) -> Result<(), Error> {
+    if archive.ends_with(".mpxar") && payload_input.is_none() {
+        bail!("Payload input required for split pxar archives");
+    }
+
+    let input = if let Some(payload_input) = payload_input {
+        pxar::PxarVariant::Split(archive, payload_input)
+    } else {
+        pxar::PxarVariant::Unified(archive)
+    };
+
+    let mut last = None;
+    for entry in pxar::decoder::Decoder::open(input)? {
         let entry = entry?;
 
-        if log::log_enabled!(log::Level::Debug) {
-            log::debug!("{}", format_single_line_entry(&entry));
+        if enabled!(Level::DEBUG) {
+            match entry.kind() {
+                EntryKind::Version(version) => {
+                    debug!("pxar format version '{version:?}'");
+                    continue;
+                }
+                EntryKind::Prelude(prelude) => {
+                    debug!("prelude of size {}", HumanByte::from(prelude.data.len()));
+                    continue;
+                }
+                EntryKind::File {
+                    payload_offset: Some(offset),
+                    size,
+                    ..
+                } => {
+                    if let Some(last) = last {
+                        let skipped = offset - last;
+                        if skipped > 0 {
+                            debug!("Encountered padding of {skipped} bytes");
+                        }
+                    }
+                    last = Some(offset + size + std::mem::size_of::<pxar::format::Header>() as u64);
+                }
+                _ => (),
+            }
+
+            println!("{}", format_single_line_entry(&entry));
         } else {
-            log::info!("{:?}", entry.path());
+            match entry.kind() {
+                EntryKind::Version(_) | EntryKind::Prelude(_) => continue,
+                _ => println!("{:?}", entry.path()),
+            }
         }
     }
     Ok(())
 }
 
 fn main() {
-    init_cli_logger("PXAR_LOG", "info");
+    proxmox_log::Logger::from_env("PXAR_LOG", proxmox_log::LevelFilter::INFO)
+        .stderr()
+        .init()
+        .expect("failed to initiate logger");
 
     let cmd_def = CliCommandMap::new()
         .insert(
@@ -457,7 +585,8 @@ fn main() {
             CliCommand::new(&API_METHOD_CREATE_ARCHIVE)
                 .arg_param(&["archive", "source"])
                 .completion_cb("archive", complete_file_name)
-                .completion_cb("source", complete_file_name),
+                .completion_cb("source", complete_file_name)
+                .completion_cb("payload-output", complete_file_name),
         )
         .insert(
             "extract",
@@ -465,20 +594,24 @@ fn main() {
                 .arg_param(&["archive", "target"])
                 .completion_cb("archive", complete_file_name)
                 .completion_cb("target", complete_file_name)
-                .completion_cb("files-from", complete_file_name),
+                .completion_cb("files-from", complete_file_name)
+                .completion_cb("payload-input", complete_file_name)
+                .completion_cb("prelude-target", complete_file_name),
         )
         .insert(
             "mount",
             CliCommand::new(&API_METHOD_MOUNT_ARCHIVE)
                 .arg_param(&["archive", "mountpoint"])
                 .completion_cb("archive", complete_file_name)
-                .completion_cb("mountpoint", complete_file_name),
+                .completion_cb("mountpoint", complete_file_name)
+                .completion_cb("payload-input", complete_file_name),
         )
         .insert(
             "list",
             CliCommand::new(&API_METHOD_DUMP_ARCHIVE)
                 .arg_param(&["archive"])
-                .completion_cb("archive", complete_file_name),
+                .completion_cb("archive", complete_file_name)
+                .completion_cb("payload-input", complete_file_name),
         );
 
     let rpcenv = CliEnvironment::new();

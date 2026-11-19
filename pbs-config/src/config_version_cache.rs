@@ -1,13 +1,13 @@
 use std::mem::{ManuallyDrop, MaybeUninit};
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use anyhow::{bail, Error};
+use anyhow::{Error, bail};
 use nix::sys::stat::Mode;
 use once_cell::sync::OnceCell;
 
-use proxmox_sys::fs::{create_path, CreateOptions};
+use proxmox_sys::fs::{CreateOptions, create_path};
 
 // openssl::sha::sha256(b"Proxmox Backup ConfigVersionCache v1.0")[0..8];
 pub const PROXMOX_BACKUP_CONFIG_VERSION_CACHE_MAGIC_1_0: [u8; 8] =
@@ -26,8 +26,11 @@ struct ConfigVersionCacheDataInner {
     // Traffic control (traffic-control.cfg) generation/version.
     traffic_control_generation: AtomicUsize,
     // datastore (datastore.cfg) generation/version
-    // FIXME: remove with PBS 3.0
     datastore_generation: AtomicUsize,
+    // Token shadow (token.shadow) generation/version.
+    token_shadow_generation: AtomicUsize,
+    // ACL (acl.cfg) cache generation/version.
+    acl_cache_generation: AtomicUsize,
     // Add further atomics here
 }
 
@@ -91,7 +94,7 @@ impl ConfigVersionCache {
 
     // Actual work of `new`:
     fn open() -> Result<Arc<Self>, Error> {
-        let user = crate::backup_user()?;
+        let user = proxmox_product_config::get_api_user();
 
         let dir_opts = CreateOptions::new()
             .perm(Mode::from_bits_truncate(0o770))
@@ -101,7 +104,7 @@ impl ConfigVersionCache {
         let file_path = Path::new(FILE_PATH);
         let dir_path = file_path.parent().unwrap();
 
-        create_path(dir_path, Some(dir_opts.clone()), Some(dir_opts))?;
+        create_path(dir_path, Some(dir_opts), Some(dir_opts))?;
 
         let file_opts = CreateOptions::new()
             .perm(Mode::from_bits_truncate(0o660))
@@ -145,12 +148,51 @@ impl ConfigVersionCache {
             .fetch_add(1, Ordering::AcqRel);
     }
 
+    /// Returns the datastore generation number.
+    pub fn datastore_generation(&self) -> usize {
+        self.shmem
+            .data()
+            .datastore_generation
+            .load(Ordering::Acquire)
+    }
+
     /// Increase the datastore generation number.
-    // FIXME: remove with PBS 3.0 or make actually useful again in datastore lookup
     pub fn increase_datastore_generation(&self) -> usize {
         self.shmem
             .data()
             .datastore_generation
             .fetch_add(1, Ordering::AcqRel)
+    }
+
+    /// Returns the token shadow generation number.
+    pub fn token_shadow_generation(&self) -> usize {
+        self.shmem
+            .data()
+            .token_shadow_generation
+            .load(Ordering::Acquire)
+    }
+
+    /// Increase the token shadow generation number.
+    pub fn increase_token_shadow_generation(&self) -> usize {
+        self.shmem
+            .data()
+            .token_shadow_generation
+            .fetch_add(1, Ordering::AcqRel)
+    }
+
+    /// Returns the acl cache generation number.
+    pub fn acl_cache_generation(&self) -> usize {
+        self.shmem
+            .data()
+            .acl_cache_generation
+            .load(Ordering::Acquire)
+    }
+
+    /// Increase the acl cache generation number.
+    pub fn increase_acl_cache_generation(&self) {
+        self.shmem
+            .data()
+            .acl_cache_generation
+            .fetch_add(1, Ordering::AcqRel);
     }
 }

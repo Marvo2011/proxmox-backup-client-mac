@@ -1,14 +1,18 @@
 //! HTTP related utilities used by various Proxmox products.
 
+#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+
 #[cfg(feature = "websocket")]
 pub mod websocket;
 
-#[cfg(feature = "http-helpers")]
+#[cfg(any(feature = "http-helpers", feature = "api-types"))]
 pub mod uri;
 
-#[cfg(feature = "http-helpers")]
+#[cfg(any(feature = "http-helpers", feature = "api-types"))]
 pub mod proxy_config;
-#[cfg(feature = "http-helpers")]
+#[cfg(feature = "api-types")]
+pub use proxy_config::HTTP_PROXY_SCHEMA;
+#[cfg(any(feature = "http-helpers", feature = "api-types"))]
 pub use proxy_config::ProxyConfig;
 
 #[cfg(feature = "http-helpers")]
@@ -24,12 +28,14 @@ mod client_trait;
 #[cfg(feature = "client-trait")]
 pub use client_trait::HttpClient;
 
-#[cfg(feature = "rate-limiter")]
-mod rate_limiter;
-#[cfg(feature = "rate-limiter")]
-pub use rate_limiter::{RateLimit, RateLimiter, RateLimiterVec, ShareableRateLimit};
-
 #[cfg(feature = "rate-limited-stream")]
 mod rate_limited_stream;
 #[cfg(feature = "rate-limited-stream")]
-pub use rate_limited_stream::RateLimitedStream;
+pub use rate_limited_stream::{
+    RateLimitedStream, RateLimiterTag, RateLimiterTags, RateLimiterTagsHandle,
+};
+
+#[cfg(feature = "body")]
+mod body;
+#[cfg(feature = "body")]
+pub use body::Body;

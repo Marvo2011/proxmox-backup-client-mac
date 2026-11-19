@@ -1,3 +1,6 @@
+#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+#![deny(unsafe_op_in_unsafe_fn)]
+
 use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::mem::MaybeUninit;
@@ -6,10 +9,10 @@ use std::os::unix::io::AsRawFd;
 use std::os::unix::io::FromRawFd;
 use std::path::Path;
 
-use anyhow::{bail, format_err, Error};
+use anyhow::{Error, bail, format_err};
 use nix::errno::Errno;
 use nix::fcntl::OFlag;
-use nix::sys::mman::{MapFlags, ProtFlags};
+use nix::sys::mman::{MapFlags, MsFlags, ProtFlags};
 use nix::sys::stat::Mode;
 
 use proxmox_sys::error::SysError;
@@ -52,15 +55,23 @@ const fn up_to_page_size(n: usize) -> usize {
     (n + 4095) & !4095
 }
 
+#[cfg(target_os = "linux")]
+const MAP_FLAGS: MapFlags = MapFlags::MAP_SHARED
+    .union(MapFlags::MAP_NORESERVE)
+    .union(MapFlags::MAP_POPULATE);
+#[cfg(not(target_os = "linux"))]
+const MAP_FLAGS: MapFlags = MapFlags::MAP_SHARED.union(MapFlags::MAP_NORESERVE);
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn mmap_file<T: Init>(file: &mut File, initialize: bool) -> Result<Mmap<T>, Error> {
     // map it as MaybeUninit
     let mut mmap: Mmap<MaybeUninit<T>> = unsafe {
         Mmap::map_fd(
-            file.as_raw_fd(),
+            file,
             0,
             1,
             ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
-            MapFlags::MAP_SHARED | MapFlags::MAP_NORESERVE | MapFlags::MAP_POPULATE,
+            MAP_FLAGS,
         )?
     };
 
@@ -73,11 +84,29 @@ fn mmap_file<T: Init>(file: &mut File, initialize: bool) -> Result<Mmap<T>, Erro
         Err(err) => bail!("detected wrong types in mmaped files: {}", err),
     }
 
-    Ok(unsafe { std::mem::transmute(mmap) })
+    Ok(unsafe { std::mem::transmute::<Mmap<MaybeUninit<T>>, Mmap<T>>(mmap) })
 }
 
 impl<T: Sized + Init> SharedMemory<T> {
+    /// Open and mmap the file given at path, checking if the file resides on tmpfs. Further,
+    /// checks the size to be multiples of the page size.
+    /// Creates the file and path directories with given create options if they do not exist.
     pub fn open(path: &Path, options: CreateOptions) -> Result<Self, Error> {
+        Self::open_impl(path, options, false)
+    }
+
+    /// Open and mmap the file given at path, without checking if it is located on a tmpfs.
+    /// Checks the size to be multiples of the page size.
+    /// Creates the file and path directories with given create options if they do not exist.
+    pub fn open_non_tmpfs(path: &Path, options: CreateOptions) -> Result<Self, Error> {
+        Self::open_impl(path, options, true)
+    }
+
+    fn open_impl(
+        path: &Path,
+        options: CreateOptions,
+        skip_tmpfs_check: bool,
+    ) -> Result<Self, Error> {
         let size = std::mem::size_of::<T>();
         let up_size = up_to_page_size(size);
 
@@ -89,12 +118,42 @@ impl<T: Sized + Init> SharedMemory<T> {
             );
         }
 
-        let mmap = Self::open_shmem(path, options)?;
+        let mmap = Self::open_shmem_impl(path, options, skip_tmpfs_check)?;
 
         Ok(Self { mmap })
     }
 
+    /// Open and mmap the file given at path, checking if the file resides on tmpfs.
+    /// Creates the file and path directories with given create options if they do not exist.
     pub fn open_shmem<P: AsRef<Path>>(path: P, options: CreateOptions) -> Result<Mmap<T>, Error> {
+        Self::open_shmem_impl(path, options, false)
+    }
+
+    /// Open and mmap the file given at path, without checking if it is located on a tmpfs.
+    /// Creates the file and path directories with given create options if they do not exist.
+    pub fn open_shmem_non_tmpfs<P: AsRef<Path>>(
+        path: P,
+        options: CreateOptions,
+    ) -> Result<Mmap<T>, Error> {
+        Self::open_shmem_impl(path, options, true)
+    }
+
+    // Needs tmpfs, O_TMPFILE and robust mutexes, only the server uses it.
+    #[cfg(not(target_os = "linux"))]
+    fn open_shmem_impl<P: AsRef<Path>>(
+        _path: P,
+        _options: CreateOptions,
+        _skip_tmpfs_check: bool,
+    ) -> Result<Mmap<T>, Error> {
+        bail!("shared memory is only supported on Linux");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn open_shmem_impl<P: AsRef<Path>>(
+        path: P,
+        options: CreateOptions,
+        skip_tmpfs_check: bool,
+    ) -> Result<Mmap<T>, Error> {
         let path = path.as_ref();
 
         let dir_name = path
@@ -102,7 +161,7 @@ impl<T: Sized + Init> SharedMemory<T> {
             .ok_or_else(|| format_err!("bad path {:?}", path))?
             .to_owned();
 
-        if !dir_name.ends_with("shmemtest") {
+        if !skip_tmpfs_check {
             let statfs = nix::sys::statfs::statfs(&dir_name)?;
             if statfs.filesystem_type() != nix::sys::statfs::TMPFS_MAGIC {
                 bail!("path {:?} is not on tmpfs", dir_name);
@@ -142,13 +201,17 @@ impl<T: Sized + Init> SharedMemory<T> {
         let size = std::mem::size_of::<T>();
         let size = up_to_page_size(size);
 
-        nix::unistd::ftruncate(file.as_raw_fd(), size as i64)?;
+        nix::unistd::ftruncate(&file, size as i64)?;
 
         // link the file into place:
         let proc_path = format!("/proc/self/fd/{}\0", file.as_raw_fd());
         let proc_path = unsafe { CStr::from_bytes_with_nul_unchecked(proc_path.as_bytes()) };
 
         let mmap = mmap_file(&mut file, true)?;
+
+        if skip_tmpfs_check {
+            mmap.msync(MsFlags::MS_SYNC)?;
+        }
 
         let res = {
             let path = CString::new(path.as_os_str().as_bytes())?;
@@ -190,6 +253,11 @@ impl<T: Sized + Init> SharedMemory<T> {
     pub fn data_mut(&mut self) -> &mut T {
         &mut self.mmap[0]
     }
+
+    /// Flush all in-memory contents to the backing file.
+    pub fn msync(&self, flags: MsFlags) -> Result<(), Error> {
+        self.mmap.msync(flags).map_err(Into::into)
+    }
 }
 
 /// Helper to initialize nested data
@@ -199,7 +267,7 @@ impl<T: Sized + Init> SharedMemory<T> {
 /// This calls `Init::initialize`, it is up to the user to ensure this is safe. The value should
 /// not have been initialized at this point.
 pub unsafe fn initialize_subtype<T: Init>(this: &mut T) {
-    let data: &mut MaybeUninit<T> = std::mem::transmute(this);
+    let data: &mut MaybeUninit<T> = unsafe { std::mem::transmute(this) };
     Init::initialize(data);
 }
 
@@ -209,6 +277,6 @@ pub unsafe fn initialize_subtype<T: Init>(this: &mut T) {
 ///
 /// This calls `Init::check_type_magic`, it is up to the user to ensure this is safe.
 pub unsafe fn check_subtype<T: Init>(this: &T) -> Result<(), Error> {
-    let data: &MaybeUninit<T> = std::mem::transmute(this);
+    let data: &MaybeUninit<T> = unsafe { std::mem::transmute(this) };
     Init::check_type_magic(data)
 }

@@ -1,18 +1,17 @@
 //! Blocking `pxar` random access handling.
 
 use std::io;
-use std::ops::Range;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::Context;
 
-use crate::accessor::{self, cache::Cache, MaybeReady, ReadAt, ReadAtOperation};
+use crate::accessor::{self, ContentRange, MaybeReady, ReadAt, ReadAtOperation, cache::Cache};
 use crate::decoder::Decoder;
 use crate::format::GoodbyeItem;
 use crate::util::poll_result_once;
-use crate::Entry;
+use crate::{Entry, PxarVariant};
 
 /// Blocking `pxar` random-access decoder.
 ///
@@ -31,7 +30,7 @@ impl<T: FileExt> Accessor<FileReader<T>> {
     /// Decode a `pxar` archive from a standard file implementing `FileExt`.
     #[inline]
     pub fn from_file_and_size(input: T, size: u64) -> io::Result<Self> {
-        Accessor::new(FileReader::new(input), size)
+        Accessor::new(PxarVariant::Unified(FileReader::new(input)), size)
     }
 }
 
@@ -64,7 +63,7 @@ where
 {
     /// Open an `Arc` or `Rc` of `File`.
     pub fn from_file_ref_and_size(input: T, size: u64) -> io::Result<Accessor<FileRefReader<T>>> {
-        Accessor::new(FileRefReader::new(input), size)
+        Accessor::new(PxarVariant::Unified(FileRefReader::new(input)), size)
     }
 }
 
@@ -74,7 +73,7 @@ impl<T: ReadAt> Accessor<T> {
     ///
     /// Note that the `input`'s `SeqRead` implementation must always return `Poll::Ready` and is
     /// not allowed to use the `Waker`, as this will cause a `panic!`.
-    pub fn new(input: T, size: u64) -> io::Result<Self> {
+    pub fn new(input: PxarVariant<T, (T, u64)>, size: u64) -> io::Result<Self> {
         Ok(Self {
             inner: poll_result_once(accessor::AccessorImpl::new(input, size))?,
         })
@@ -142,11 +141,14 @@ impl<T: Clone + ReadAt> Accessor<T> {
     ///
     /// This will provide a reader over an arbitrary range of the archive file, so unless this
     /// comes from a actual file entry data, the contents might not make much sense.
-    pub unsafe fn open_contents_at_range(&self, range: Range<u64>) -> FileContents<T> {
-        FileContents {
-            inner: unsafe { self.inner.open_contents_at_range(range) },
+    pub unsafe fn open_contents_at_range(
+        &self,
+        range: &ContentRange,
+    ) -> io::Result<FileContents<T>> {
+        Ok(FileContents {
+            inner: poll_result_once(self.inner.open_contents_at_range(range))?,
             at: 0,
-        }
+        })
     }
 
     /// Following a hardlink.
@@ -262,7 +264,7 @@ impl<T: Clone + ReadAt> Directory<T> {
     }
 
     /// Get an iterator over the directory's contents.
-    pub fn read_dir(&self) -> ReadDir<T> {
+    pub fn read_dir(&self) -> ReadDir<'_, T> {
         ReadDir {
             inner: self.inner.read_dir(),
         }
@@ -291,7 +293,7 @@ impl<T: Clone + ReadAt> FileEntry<T> {
     }
 
     /// For use with unsafe accessor methods.
-    pub fn content_range(&self) -> io::Result<Option<Range<u64>>> {
+    pub fn content_range(&self) -> io::Result<Option<ContentRange>> {
         self.inner.content_range()
     }
 
@@ -337,7 +339,7 @@ pub struct ReadDir<'a, T> {
     inner: accessor::ReadDirImpl<'a, T>,
 }
 
-impl<'a, T: Clone + ReadAt> ReadDir<'a, T> {
+impl<T: Clone + ReadAt> ReadDir<'_, T> {
     /// Efficient alternative to `Iterator::skip`.
     #[inline]
     pub fn skip(self, n: usize) -> Self {
@@ -365,7 +367,7 @@ impl<'a, T: Clone + ReadAt> Iterator for ReadDir<'a, T> {
     }
 }
 
-impl<'a, T: Clone + ReadAt> std::iter::FusedIterator for ReadDir<'a, T> {}
+impl<T: Clone + ReadAt> std::iter::FusedIterator for ReadDir<'_, T> {}
 
 /// A directory entry. When iterating through the contents of a directory we first get access to
 /// the file name. The remaining information can be decoded afterwards.
@@ -374,7 +376,7 @@ pub struct DirEntry<'a, T: Clone + ReadAt> {
     inner: accessor::DirEntryImpl<'a, T>,
 }
 
-impl<'a, T: Clone + ReadAt> DirEntry<'a, T> {
+impl<T: Clone + ReadAt> DirEntry<'_, T> {
     /// Get the current file name.
     pub fn file_name(&self) -> &Path {
         self.inner.file_name()

@@ -5,7 +5,7 @@ pub(crate) mod sys;
 pub(crate) mod util;
 
 #[doc(inline)]
-pub use sys::{EntryParam, ReplyBufState, ROOT_ID};
+pub use sys::{EntryParam, ROOT_ID, ReplyBufState};
 
 #[doc(inline)]
 pub use requests::Request;

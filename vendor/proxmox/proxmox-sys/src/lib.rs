@@ -1,11 +1,15 @@
+#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+#![deny(unsafe_op_in_unsafe_fn)]
+
+use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
+use std::sync::LazyLock;
 
 pub mod boot_mode;
 pub mod command;
 // links against libcrypt (crypt_r, crypt_gensalt_rn)
 #[cfg(all(feature = "crypt", target_os = "linux"))]
 pub mod crypt;
-pub mod email;
 pub mod error;
 pub mod fd;
 pub mod fs;
@@ -17,50 +21,40 @@ pub mod mmap;
 pub mod process_locker;
 pub mod systemd;
 
-mod worker_task_context;
-pub use worker_task_context::*;
-
-#[allow(deprecated)]
-use fd::Fd;
-
 /// Returns the hosts node name (UTS node name)
 pub fn nodename() -> &'static str {
-    lazy_static::lazy_static! {
-        static ref NODENAME: String = {
-            std::str::from_utf8(
-                nix::sys::utsname::uname()
-                    .expect("failed to get nodename")
-                    .nodename()
-                    .as_bytes(),
-            )
-            .expect("non utf-8 nodename not supported")
-            .split('.')
-            .next()
-            .unwrap()
-            .to_owned()
-        };
-    }
+    static NODENAME: LazyLock<String> = LazyLock::new(|| {
+        std::str::from_utf8(
+            nix::sys::utsname::uname()
+                .expect("failed to get nodename")
+                .nodename()
+                .as_bytes(),
+        )
+        .expect("non utf-8 nodename not supported")
+        .split('.')
+        .next()
+        .unwrap()
+        .to_owned()
+    });
 
     &NODENAME
 }
 
-/// Safe wrapper for `nix::unistd::pipe2` defaulting to `O_CLOEXEC`
-/// and guarding the file descriptors.
-#[allow(deprecated)]
-pub fn pipe() -> Result<(Fd, Fd), nix::Error> {
+/// Wrapper for `nix::unistd::pipe2` defaulting to `O_CLOEXEC`.
+pub fn pipe() -> Result<(OwnedFd, OwnedFd), nix::Error> {
     #[cfg(target_os = "linux")]
-    let (pin, pout) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)?;
+    {
+        nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)
+    }
 
+    // no pipe2(2) on macOS, set FD_CLOEXEC afterwards
     #[cfg(not(target_os = "linux"))]
-    let (pin, pout) = {
+    {
         use nix::fcntl::{fcntl, FcntlArg, FdFlag};
-        use std::os::unix::io::IntoRawFd;
+        use std::os::fd::AsRawFd;
         let (pin, pout) = nix::unistd::pipe()?;
-        let (pin, pout) = (Fd(pin), Fd(pout));
-        fcntl(pin.0, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))?;
-        fcntl(pout.0, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))?;
-        (pin.into_raw_fd(), pout.into_raw_fd())
-    };
-
-    Ok((Fd(pin), Fd(pout)))
+        fcntl(pin.as_raw_fd(), FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))?;
+        fcntl(pout.as_raw_fd(), FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))?;
+        Ok((pin, pout))
+    }
 }

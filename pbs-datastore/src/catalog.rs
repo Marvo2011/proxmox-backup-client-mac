@@ -1,12 +1,17 @@
 use std::ffi::{CStr, CString, OsStr};
 use std::fmt;
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::ops::Range;
 use std::os::unix::ffi::OsStrExt;
 
-use anyhow::{bail, format_err, Error};
+use anyhow::{Error, bail, format_err};
 use serde::{Deserialize, Serialize};
 
 use pathpatterns::{MatchList, MatchType};
+use pxar::accessor::ReadAt;
+use pxar::accessor::aio::FileEntry;
+use pxar::format::SignedDuration;
+use pxar::{EntryKind, mode};
 
 use proxmox_io::ReadExt;
 use proxmox_schema::api;
@@ -85,7 +90,7 @@ impl fmt::Display for CatalogEntryType {
 ///
 /// The ``attr`` property contain the exact type with type specific
 /// attributes.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DirEntry {
     pub name: Vec<u8>,
     pub attr: DirEntryAttribute,
@@ -94,8 +99,17 @@ pub struct DirEntry {
 /// Used to specific additional attributes inside DirEntry
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DirEntryAttribute {
-    Directory { start: u64 },
-    File { size: u64, mtime: i64 },
+    Directory {
+        start: u64,
+        /// A range that encloses the entries of this directory and
+        /// all of its children. This is not part of the file format,
+        /// it is only used for parsing.
+        reader_bounds: Range<u64>,
+    },
+    File {
+        size: u64,
+        mtime: i64,
+    },
     Symlink,
     Hardlink,
     BlockDevice,
@@ -104,12 +118,60 @@ pub enum DirEntryAttribute {
     Socket,
 }
 
+impl<T> TryFrom<&FileEntry<T>> for DirEntryAttribute
+where
+    T: Clone + ReadAt,
+{
+    type Error = Error;
+
+    fn try_from(entry: &FileEntry<T>) -> Result<Self, Self::Error> {
+        let attr = match entry.kind() {
+            EntryKind::Version(_) | EntryKind::Prelude(_) | EntryKind::GoodbyeTable => bail!(
+                "cannot convert pxar entry kind {:?} to catalog directory entry attribute",
+                entry.kind(),
+            ),
+            EntryKind::Directory => DirEntryAttribute::Directory {
+                start: entry.entry_range_info().entry_range.start,
+                // empty because start does not point into a catalog file
+                reader_bounds: 0..0,
+            },
+            EntryKind::File { size, .. } => {
+                let mtime = match entry.metadata().mtime_as_duration() {
+                    SignedDuration::Positive(val) => i64::try_from(val.as_secs())?,
+                    SignedDuration::Negative(val) => -i64::try_from(val.as_secs())?,
+                };
+                DirEntryAttribute::File { size: *size, mtime }
+            }
+            EntryKind::Device(_) => match entry.metadata().file_type() {
+                mode::IFBLK => DirEntryAttribute::BlockDevice,
+                mode::IFCHR => DirEntryAttribute::CharDevice,
+                _ => bail!("encountered unknown device type"),
+            },
+            EntryKind::Symlink(_) => DirEntryAttribute::Symlink,
+            EntryKind::Hardlink(_) => DirEntryAttribute::Hardlink,
+            EntryKind::Fifo => DirEntryAttribute::Fifo,
+            EntryKind::Socket => DirEntryAttribute::Socket,
+        };
+        Ok(attr)
+    }
+}
+
 impl DirEntry {
-    fn new(etype: CatalogEntryType, name: Vec<u8>, start: u64, size: u64, mtime: i64) -> Self {
+    fn new(
+        etype: CatalogEntryType,
+        name: Vec<u8>,
+        start: u64,
+        size: u64,
+        mtime: i64,
+        reader_bounds: Range<u64>,
+    ) -> Self {
         match etype {
             CatalogEntryType::Directory => DirEntry {
                 name,
-                attr: DirEntryAttribute::Directory { start },
+                attr: DirEntryAttribute::Directory {
+                    start,
+                    reader_bounds,
+                },
             },
             CatalogEntryType::File => DirEntry {
                 name,
@@ -163,7 +225,7 @@ impl DirEntry {
 
     /// Check if DirEntry is a symlink
     pub fn is_symlink(&self) -> bool {
-        matches!(self.attr, DirEntryAttribute::Symlink { .. })
+        matches!(self.attr, DirEntryAttribute::Symlink)
     }
 }
 
@@ -188,7 +250,7 @@ impl DirInfo {
         match entry {
             DirEntry {
                 name,
-                attr: DirEntryAttribute::Directory { start },
+                attr: DirEntryAttribute::Directory { start, .. },
             } => {
                 writer.write_all(&[CatalogEntryType::Directory as u8])?;
                 catalog_encode_u64(writer, name.len() as u64)?;
@@ -300,6 +362,10 @@ impl DirInfo {
             let cont = match etype {
                 CatalogEntryType::Directory => {
                     let offset = catalog_decode_u64(&mut cursor)?;
+                    // prevent infinite recursion
+                    if offset == 0 {
+                        bail!("directory cannot contain itself");
+                    }
                     callback(etype, name, offset, 0, 0)?
                 }
                 CatalogEntryType::File => {
@@ -401,7 +467,10 @@ impl<W: Write> BackupCatalogWriter for CatalogWriter<W> {
         let name = name.to_bytes().to_vec();
         current.entries.push(DirEntry {
             name,
-            attr: DirEntryAttribute::Directory { start },
+            attr: DirEntryAttribute::Directory {
+                start,
+                reader_bounds: 0..0, // unused
+            },
         });
 
         Ok(())
@@ -515,9 +584,13 @@ impl<R: Read + Seek> CatalogReader<R> {
         let root = self.root()?;
         match root {
             DirEntry {
-                attr: DirEntryAttribute::Directory { start },
+                attr:
+                    DirEntryAttribute::Directory {
+                        start,
+                        reader_bounds,
+                    },
                 ..
-            } => self.dump_dir(std::path::Path::new("./"), start),
+            } => self.dump_dir(std::path::Path::new("./"), start, reader_bounds),
             _ => bail!("unexpected root entry type, not a directory!"),
         }
     }
@@ -531,27 +604,40 @@ impl<R: Read + Seek> CatalogReader<R> {
         if magic != PROXMOX_CATALOG_FILE_MAGIC_1_0 {
             bail!("got unexpected magic number for catalog");
         }
-        self.reader.seek(SeekFrom::End(-8))?;
+        let max_end = self.reader.seek(SeekFrom::End(-8))?;
         let start = unsafe { self.reader.read_le_value::<u64>()? };
+
+        let bounds = (magic.len() as u64)..max_end;
+        if !bounds.contains(&start) {
+            bail!("unexpected root directory start: {start} not in {bounds:?}");
+        }
+
         Ok(DirEntry {
             name: b"".to_vec(),
-            attr: DirEntryAttribute::Directory { start },
+            attr: DirEntryAttribute::Directory {
+                start,
+                reader_bounds: bounds,
+            },
         })
     }
 
     /// Read all directory entries
     pub fn read_dir(&mut self, parent: &DirEntry) -> Result<Vec<DirEntry>, Error> {
-        let start = match parent.attr {
-            DirEntryAttribute::Directory { start } => start,
+        let (start, bounds) = match &parent.attr {
+            DirEntryAttribute::Directory {
+                start,
+                reader_bounds,
+            } => (*start, reader_bounds.clone()),
             _ => bail!("parent is not a directory - internal error"),
         };
 
-        let data = self.read_raw_dirinfo_block(start)?;
+        let data = self.read_raw_dirinfo_block(start, bounds.clone())?;
 
         let mut entry_list = Vec::new();
 
         DirInfo::parse(&data, |etype, name, offset, size, mtime| {
-            let entry = DirEntry::new(etype, name.to_vec(), start - offset, size, mtime);
+            let pos = subtract_offset(start, offset)?;
+            let entry = DirEntry::new(etype, name.to_vec(), pos, size, mtime, bounds.start..start);
             entry_list.push(entry);
             Ok(true)
         })?;
@@ -592,20 +678,25 @@ impl<R: Read + Seek> CatalogReader<R> {
         parent: &DirEntry,
         filename: &[u8],
     ) -> Result<Option<DirEntry>, Error> {
-        let start = match parent.attr {
-            DirEntryAttribute::Directory { start } => start,
+        let (start, bounds) = match &parent.attr {
+            DirEntryAttribute::Directory {
+                start,
+                reader_bounds,
+            } => (*start, reader_bounds.clone()),
             _ => bail!("parent is not a directory - internal error"),
         };
 
-        let data = self.read_raw_dirinfo_block(start)?;
+        let data = self.read_raw_dirinfo_block(start, bounds.clone())?;
 
         let mut item = None;
         DirInfo::parse(&data, |etype, name, offset, size, mtime| {
+            let pos = subtract_offset(start, offset)?;
+
             if name != filename {
                 return Ok(true);
             }
 
-            let entry = DirEntry::new(etype, name.to_vec(), start - offset, size, mtime);
+            let entry = DirEntry::new(etype, name.to_vec(), pos, size, mtime, bounds.start..start);
             item = Some(entry);
             Ok(false) // stop parsing
         })?;
@@ -614,19 +705,32 @@ impl<R: Read + Seek> CatalogReader<R> {
     }
 
     /// Read the raw directory info block from current reader position.
-    fn read_raw_dirinfo_block(&mut self, start: u64) -> Result<Vec<u8>, Error> {
+    fn read_raw_dirinfo_block(&mut self, start: u64, bounds: Range<u64>) -> Result<Vec<u8>, Error> {
+        if !bounds.contains(&start) {
+            bail!("directory start out of range: {start} not in {bounds:?}");
+        }
         self.reader.seek(SeekFrom::Start(start))?;
-        let size = catalog_decode_u64(&mut self.reader)?;
+
+        let mut reader = self.reader.by_ref().take(bounds.end - start);
+
+        let size = catalog_decode_u64(&mut reader)?;
         if size < 1 {
-            bail!("got small directory size {}", size)
-        };
-        let data = self.reader.read_exact_allocated(size as usize)?;
-        Ok(data)
+            bail!("got small directory size: {}", size);
+        }
+        if size > reader.limit() {
+            bail!("got large directory size: {}", size);
+        }
+        Ok(reader.read_exact_allocated(size.try_into()?)?)
     }
 
     /// Print the content of a directory to stdout
-    pub fn dump_dir(&mut self, prefix: &std::path::Path, start: u64) -> Result<(), Error> {
-        let data = self.read_raw_dirinfo_block(start)?;
+    fn dump_dir(
+        &mut self,
+        prefix: &std::path::Path,
+        start: u64,
+        bounds: Range<u64>,
+    ) -> Result<(), Error> {
+        let data = self.read_raw_dirinfo_block(start, bounds.clone())?;
 
         DirInfo::parse(&data, |etype, name, offset, size, mtime| {
             let mut path = std::path::PathBuf::from(prefix);
@@ -636,11 +740,8 @@ impl<R: Read + Seek> CatalogReader<R> {
             match etype {
                 CatalogEntryType::Directory => {
                     log::info!("{} {:?}", etype, path);
-                    if offset > start {
-                        bail!("got wrong directory offset ({} > {})", offset, start);
-                    }
-                    let pos = start - offset;
-                    self.dump_dir(&path, pos)?;
+                    let pos = subtract_offset(start, offset)?;
+                    self.dump_dir(&path, pos, bounds.start..start)?;
                 }
                 CatalogEntryType::File => {
                     let mut mtime_string = mtime.to_string();
@@ -716,6 +817,12 @@ impl<R: Read + Seek> CatalogReader<R> {
     }
 }
 
+fn subtract_offset(start: u64, offset: u64) -> Result<u64, Error> {
+    start
+        .checked_sub(offset)
+        .ok_or_else(|| format_err!("got wrong directory offset ({offset} > {start})"))
+}
+
 /// Serialize i64 as short, variable length byte sequence
 ///
 /// Stores 7 bits per byte, Bit 8 indicates the end of the sequence (when not set).
@@ -756,13 +863,10 @@ pub fn catalog_encode_i64<W: Write>(writer: &mut W, v: i64) -> Result<(), Error>
 #[allow(clippy::neg_multiply)]
 pub fn catalog_decode_i64<R: Read>(reader: &mut R) -> Result<i64, Error> {
     let mut v: u64 = 0;
-    let mut buf = [0u8];
+    let mut buf: [u8; 1] = [0u8];
 
     for i in 0..11 {
         // only allow 11 bytes (70 bits + sign marker)
-        if buf.is_empty() {
-            bail!("decode_i64 failed - unexpected EOB");
-        }
         reader.read_exact(&mut buf)?;
 
         let t = buf[0];
@@ -772,6 +876,13 @@ pub fn catalog_decode_i64<R: Read>(reader: &mut R) -> Result<i64, Error> {
                 return Ok(0);
             }
             return Ok(((v - 1) as i64 * -1) - 1); // also handles i64::MIN
+        } else if i == 10 {
+            // The 11th byte can only be zero because 70 bits are
+            // more than enough to store the magnitude of an i64.
+            //
+            // Attempting to shift by 70 would also panic in debug
+            // builds, or shift by 70 % 64 = 6 in release mode.
+            break;
         } else if t < 128 {
             v |= (t as u64) << (i * 7);
             return Ok(v as i64);
@@ -809,13 +920,10 @@ pub fn catalog_encode_u64<W: Write>(writer: &mut W, v: u64) -> Result<(), Error>
 /// but we currently only encode up to 64 bits
 pub fn catalog_decode_u64<R: Read>(reader: &mut R) -> Result<u64, Error> {
     let mut v: u64 = 0;
-    let mut buf = [0u8];
+    let mut buf: [u8; 1] = [0u8];
 
     for i in 0..10 {
         // only allow 10 bytes (70 bits)
-        if buf.is_empty() {
-            bail!("decode_u64 failed - unexpected EOB");
-        }
         reader.read_exact(&mut buf)?;
         let t = buf[0];
         if t < 128 {
@@ -875,6 +983,9 @@ fn test_catalog_i64_encoder() {
     test_encode_decode(-(1 << 20) - 1);
     test_encode_decode(i64::MIN);
     test_encode_decode(i64::MAX);
+
+    // this used to panic in debug builds because it tried to shift by 70
+    assert!(catalog_decode_i64(&mut [0xff; 11].as_slice()).is_err());
 }
 
 #[test]
@@ -895,6 +1006,14 @@ fn test_catalog_i64_compatibility() {
     test_encode_decode((1 << 20) - 1);
     test_encode_decode((1 << 50) - 1);
     test_encode_decode(u64::MAX);
+
+    for i in 0..10 {
+        test_encode_decode(i);
+        test_encode_decode(19283749 + i);
+        test_encode_decode(i64::MAX as u64 - i);
+        test_encode_decode(i64::MAX as u64 + i);
+        test_encode_decode(u64::MAX - i);
+    }
 }
 
 /// An entry in a hierarchy of files for restore and listing.
@@ -933,8 +1052,8 @@ impl ArchiveEntry {
         size: Option<u64>,
     ) -> Self {
         Self {
-            filepath: base64::encode(filepath),
-            text: String::from_utf8_lossy(filepath.split(|x| *x == b'/').last().unwrap())
+            filepath: proxmox_base64::encode(filepath),
+            text: String::from_utf8_lossy(filepath.split(|x| *x == b'/').next_back().unwrap())
                 .to_string(),
             entry_type: match entry_type {
                 Some(entry_type) => CatalogEntryType::from(entry_type).to_string(),
@@ -947,5 +1066,196 @@ impl ArchiveEntry {
                 _ => None,
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use super::*;
+
+    use crate::file_formats::PROXMOX_CATALOG_FILE_MAGIC_1_0;
+
+    #[test]
+    fn sanity_check() {
+        let mut buffer = vec![];
+
+        let mut writer = CatalogWriter::new(&mut buffer).unwrap();
+        writer.add_fifo(c"fifo").unwrap();
+        writer.start_directory(c"outer").unwrap();
+        writer.add_file(c"file", 123, -456).unwrap();
+        writer.add_socket(c"socket").unwrap();
+        writer.start_directory(c"inner").unwrap();
+        writer.add_symlink(c"symlink").unwrap();
+        writer.add_hardlink(c"hardlink").unwrap();
+        writer.start_directory(c"empty").unwrap();
+        writer.end_directory().unwrap();
+        writer.end_directory().unwrap();
+        writer.add_char_device(c"char device").unwrap();
+        writer.end_directory().unwrap();
+        writer.add_block_device(c"block device").unwrap();
+        writer.finish().unwrap();
+
+        let mut reader = CatalogReader::new(Cursor::new(buffer));
+        let root = reader.root().unwrap();
+
+        use pathpatterns::{MatchEntry, Pattern};
+        let match_list = vec![MatchEntry::include(Pattern::path("*").unwrap())];
+
+        let mut all = vec![];
+        reader
+            .find(&root, &mut vec![], &match_list, &mut |path| {
+                all.push(str::from_utf8(path).unwrap().to_string());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            all,
+            [
+                "/fifo",
+                "/outer",
+                "/outer/file",
+                "/outer/socket",
+                "/outer/inner",
+                "/outer/inner/symlink",
+                "/outer/inner/hardlink",
+                "/outer/inner/empty",
+                "/outer/char device",
+                "/block device"
+            ]
+        );
+
+        assert_eq!(
+            &reader.lookup_recursive(b"/outer/file").unwrap().attr,
+            &DirEntryAttribute::File {
+                size: 123,
+                mtime: -456
+            }
+        );
+
+        assert!(
+            reader
+                .list_dir_contents(b"/outer/inner/empty")
+                .unwrap()
+                .is_empty()
+        );
+
+        // no easy way to capture the log output, but it should at least not panic
+        reader.dump().unwrap();
+    }
+
+    #[test]
+    fn test_subdirectory_offset() {
+        let mut buffer = vec![];
+        let mut w = CatalogWriter::new(&mut buffer).unwrap();
+
+        w.start_directory(c"A").unwrap();
+        w.end_directory().unwrap();
+        w.finish().unwrap();
+
+        // 253, 96, 249, 196, 103, 88, 213, | magic
+        // 1, 0,                            | A
+        // 5, 1, 100, 1, 65, 2,             | /
+        // 10, 0, 0, 0, 0, 0, 0, 0,         | /.start
+        let offset_index = 8 + 2 + 5;
+        assert_eq!(buffer[offset_index], 2);
+
+        for (offset, expected) in [
+            // no stack overflow from infinite recursion:
+            (0, "directory cannot contain itself"),
+            // no integer overflow on start - offset:
+            (11, "got wrong directory offset (11 > 10)"),
+        ] {
+            buffer[offset_index] = offset;
+
+            let mut reader = CatalogReader::new(Cursor::new(&buffer));
+            assert_eq!(reader.dump().unwrap_err().to_string(), expected);
+            let root = reader.root().unwrap();
+            assert_eq!(reader.read_dir(&root).unwrap_err().to_string(), expected);
+            assert_eq!(
+                reader.lookup_recursive(b"/A").unwrap_err().to_string(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn test_root_offset_out_of_bounds() {
+        let mut buffer = vec![];
+        let mut w = CatalogWriter::new(&mut buffer).unwrap();
+        w.start_directory(c"A").unwrap();
+        w.end_directory().unwrap();
+        w.finish().unwrap();
+
+        for offset in [0, 7, buffer.len() as u64 - 8, u64::MAX] {
+            *buffer.last_chunk_mut().unwrap() = offset.to_le_bytes();
+            let mut reader = CatalogReader::new(Cursor::new(&buffer));
+            assert_eq!(
+                reader.root().unwrap_err().to_string(),
+                format!("unexpected root directory start: {offset} not in 8..16")
+            );
+        }
+    }
+
+    #[test]
+    fn test_not_out_of_memory_for_large_directory_size() {
+        for size in [
+            2,              // already points into trailer
+            20 * (1 << 40), // 20 TiB
+        ] {
+            let mut catalog = vec![];
+            catalog.extend_from_slice(&PROXMOX_CATALOG_FILE_MAGIC_1_0);
+            catalog_encode_u64(&mut catalog, size).unwrap();
+            catalog.push(0); // count
+            catalog.extend_from_slice(&8u64.to_le_bytes()); // trailer: root block is at offset 8
+
+            let mut reader = CatalogReader::new(Cursor::new(catalog));
+
+            let expected = format!("got large directory size: {size}");
+
+            assert_eq!(reader.dump().unwrap_err().to_string(), expected);
+            let root = reader.root().unwrap();
+            assert_eq!(reader.read_dir(&root).unwrap_err().to_string(), expected);
+            assert_eq!(
+                reader.lookup_recursive(b"/dummy").unwrap_err().to_string(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn test_no_overlap_with_parent() {
+        let mut buffer = vec![];
+        let mut w = CatalogWriter::new(&mut buffer).unwrap();
+
+        w.start_directory(c"a").unwrap();
+        w.start_directory(c"b").unwrap();
+        w.end_directory().unwrap();
+        w.end_directory().unwrap();
+        w.finish().unwrap();
+
+        // size of magic and b
+        let a_size_index = 8 + 2;
+        assert_eq!(buffer[a_size_index], 5);
+
+        buffer[a_size_index] = 6;
+        let expected = "got large directory size: 6";
+
+        let mut reader = CatalogReader::new(Cursor::new(&buffer));
+        assert_eq!(reader.dump().unwrap_err().to_string(), expected);
+
+        let root = reader.root().unwrap();
+        let entries = reader.read_dir(&root).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            reader.read_dir(&entries[0]).unwrap_err().to_string(),
+            expected
+        );
+
+        assert_eq!(
+            reader.lookup_recursive(b"/a/b").unwrap_err().to_string(),
+            expected
+        );
     }
 }

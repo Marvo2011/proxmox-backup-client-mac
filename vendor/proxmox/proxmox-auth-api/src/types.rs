@@ -14,7 +14,7 @@
 //! * [`TokennameRef`]: a borrowed `Tokenname` (`str` equivalent).
 //! * [`Userid`]: an owned user id (`"user@realm"`).
 //! * [`Authid`]: an owned Authentication ID (a `Userid` with an optional `Tokenname`).
-//! Note that `Userid` and `Authid` do not have a separate borrowed type.
+//!   Note that `Userid` and `Authid` do not have a separate borrowed type.
 //!
 //! Note that `Username`s are not unique, therefore they do not implement `Eq` and cannot be
 //! compared directly. If a direct comparison is really required, they can be compared as strings
@@ -23,14 +23,14 @@
 
 use std::borrow::Borrow;
 use std::fmt;
+use std::sync::LazyLock;
 
-use anyhow::{bail, format_err, Error};
+use anyhow::{Error, bail, format_err};
 use const_format::concatcp;
-use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
 
 use proxmox_schema::{
-    api, const_regex, ApiStringFormat, ApiType, Schema, StringSchema, UpdaterType,
+    ApiStringFormat, ApiType, Schema, StringSchema, UpdaterType, api, const_regex,
 };
 
 use proxmox_schema::api_types::SAFE_ID_REGEX_STR;
@@ -95,7 +95,7 @@ pub const PROXMOX_GROUP_ID_SCHEMA: Schema = StringSchema::new("Group ID")
 pub const PROXMOX_AUTH_REALM_STRING_SCHEMA: StringSchema =
     StringSchema::new("Authentication domain ID")
         .format(&proxmox_schema::api_types::SAFE_ID_FORMAT)
-        .min_length(3)
+        .min_length(2)
         .max_length(32);
 pub const PROXMOX_AUTH_REALM_SCHEMA: Schema = PROXMOX_AUTH_REALM_STRING_SCHEMA.schema();
 
@@ -454,9 +454,7 @@ impl Userid {
     }
 }
 
-lazy_static! {
-    pub static ref ROOT_USERID: Userid = Userid::new("root@pam".to_string(), 4);
-}
+pub static ROOT_USERID: LazyLock<Userid> = LazyLock::new(|| Userid::new("root@pam".to_string(), 4));
 
 impl From<Authid> for Userid {
     fn from(authid: Authid) -> Self {
@@ -587,9 +585,8 @@ impl Authid {
     }
 }
 
-lazy_static! {
-    pub static ref ROOT_AUTHID: Authid = Authid::from(Userid::new("root@pam".to_string(), 4));
-}
+pub static ROOT_AUTHID: LazyLock<Authid> =
+    LazyLock::new(|| Authid::from(Userid::new("root@pam".to_string(), 4)));
 
 impl From<Userid> for Authid {
     fn from(parts: Userid) -> Self {
@@ -679,6 +676,93 @@ impl TryFrom<String> for Authid {
     }
 }
 
+#[api]
+/// The parameter object for creating new ticket.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CreateTicket {
+    /// User name
+    pub username: Userid,
+
+    /// The secret password. This can also be a valid ticket. Only optional if the ticket is
+    /// provided in a cookie header and only if the endpoint supports this.
+    #[serde(default)]
+    pub password: Option<String>,
+
+    /// Verify ticket, and check if user have access 'privs' on 'path'.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+
+    /// Verify ticket, and check if user have access 'privs' on 'path'.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub privs: Option<String>,
+
+    /// Port for verifying terminal tickets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+
+    /// The signed TFA challenge string the user wants to respond to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "tfa-challenge")]
+    pub tfa_challenge: Option<String>,
+}
+
+#[api]
+/// The parameter object for verifying a VNC ticket.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct VerifyVNCTicket {
+    /// Userid or Token
+    pub authid: Authid,
+
+    /// The VNC ticket
+    #[serde(default)]
+    pub vncticket: String,
+
+    /// Verify ticket, and check if user have access 'privs' on 'path'.
+    pub path: String,
+
+    /// Verify ticket, and check if user have access 'privs' on 'path'.
+    pub privs: String,
+
+    /// Port for verifying terminal tickets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+}
+
+#[api]
+/// The API response for a ticket call.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct CreateTicketResponse {
+    /// The CSRF prevention token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "CSRFPreventionToken")]
+    pub csrfprevention_token: Option<String>,
+
+    /// The ticket as is supposed to be used in the authentication header. Not provided here if the
+    /// endpoint uses HttpOnly cookies to supply the actual ticket.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ticket: Option<String>,
+
+    /// Like a full ticket, except the signature is missing. Useful in HttpOnly-contexts
+    /// (browsers).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "ticket-info")]
+    pub ticket_info: Option<String>,
+
+    /// The userid.
+    pub username: Userid,
+}
+
+impl CreateTicketResponse {
+    pub fn new(username: Userid) -> Self {
+        Self {
+            csrfprevention_token: None,
+            ticket: None,
+            ticket_info: None,
+            username,
+        }
+    }
+}
+
 #[test]
 fn test_token_id() {
     let userid: Userid = "test@pam".parse().expect("parsing Userid failed");
@@ -705,6 +789,72 @@ fn test_token_id() {
         TokennameRef::new("bar").as_str()
     );
     assert_eq!(auth_id.to_string(), "test@pam!bar".to_string());
+}
+
+#[test]
+fn test_realm_validation() {
+    let empty_realm: Result<Realm, _> = "".to_string().try_into();
+    let one_char_realm: Result<Realm, _> = "a".to_string().try_into();
+    let two_char_realm: Result<Realm, _> = "aa".to_string().try_into();
+    let long_realm: Result<Realm, _> = "a".repeat(33).try_into();
+    let valid_realm: Result<Realm, _> = "pam".to_string().try_into();
+
+    assert!(empty_realm.is_err(), "Empty realm should fail validation");
+    assert!(
+        one_char_realm.is_err(),
+        "1-char realm should fail validation"
+    );
+    assert!(
+        two_char_realm.is_ok(),
+        "2-char realm should pass validation"
+    );
+    assert!(valid_realm.is_ok(), "Typical realm should pass validation");
+    assert!(
+        long_realm.is_err(),
+        "Realm >32 chars should fail validation"
+    );
+}
+
+#[test]
+fn test_userid_validation() {
+    let empty_str: Result<Userid, _> = "".parse();
+    let invalid_no_realm: Result<Userid, _> = "user".parse();
+    let invalid_empty_realm: Result<Userid, _> = "user@".parse();
+    let invalid_one_char_realm: Result<Userid, _> = "user@a".parse();
+    let valid_two_char_realm: Result<Userid, _> = "user@aa".parse();
+    let valid_long_realm: Result<Userid, _> = "user@pam".parse();
+    let invalid_long_realm: Result<Userid, _> = format!("user@{}", "a".repeat(33)).parse();
+    let invalid_empty_username: Result<Userid, _> = "@aa".parse();
+
+    assert!(empty_str.is_err(), "Empty userid should fail");
+    assert!(
+        invalid_no_realm.is_err(),
+        "Userid without realm should fail"
+    );
+    assert!(
+        invalid_empty_realm.is_err(),
+        "Userid with empty realm should fail"
+    );
+    assert!(
+        invalid_one_char_realm.is_err(),
+        "Userid with 1-char realm should fail"
+    );
+    assert!(
+        valid_two_char_realm.is_ok(),
+        "Userid with 2-char realm should pass"
+    );
+    assert!(
+        valid_long_realm.is_ok(),
+        "Userid with normal realm should pass"
+    );
+    assert!(
+        invalid_long_realm.is_err(),
+        "Userid with realm >32 chars should fail"
+    );
+    assert!(
+        invalid_empty_username.is_err(),
+        "Userid with empty username should fail"
+    );
 }
 
 serde_plain::derive_deserialize_from_fromstr!(Userid, "valid user id");

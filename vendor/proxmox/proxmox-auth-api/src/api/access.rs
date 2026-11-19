@@ -1,18 +1,22 @@
 //! Provides the "/access/ticket" API call.
 
-use anyhow::{bail, format_err, Error};
+use anyhow::{Error, bail, format_err};
+use http::Response;
+use http::request::Parts;
 use openssl::hash::MessageDigest;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use proxmox_rest_server::RestEnvironment;
-use proxmox_router::{http_err, Permission, RpcEnvironment};
-use proxmox_schema::{api, api_types::PASSWORD_SCHEMA};
+use proxmox_rest_server::{RestEnvironment, extract_cookie};
+use proxmox_router::{
+    ApiHandler, ApiMethod, ApiResponseFuture, Permission, RpcEnvironment, http_err,
+};
+use proxmox_schema::{AllOfSchema, ApiType, ObjectSchema, ParameterSchema, ReturnType, api};
 use proxmox_tfa::api::TfaChallenge;
 
 use super::ApiTicket;
-use super::{auth_context, HMACKey};
+use super::{HMACKey, auth_context};
 use crate::ticket::Ticket;
-use crate::types::{Authid, Userid};
+use crate::types::{Authid, CreateTicket, CreateTicketResponse, Userid, VerifyVNCTicket};
 
 #[allow(clippy::large_enum_variant)]
 enum AuthResult {
@@ -29,51 +33,14 @@ enum AuthResult {
 #[api(
     input: {
         properties: {
-            username: {
-                type: Userid,
-            },
-            password: {
-                schema: PASSWORD_SCHEMA,
-            },
-            path: {
-                type: String,
-                description: "Path for verifying terminal tickets.",
-                optional: true,
-            },
-            privs: {
-                type: String,
-                description: "Privilege for verifying terminal tickets.",
-                optional: true,
-            },
-            port: {
-                type: Integer,
-                description: "Port for verifying terminal tickets.",
-                optional: true,
-            },
-            "tfa-challenge": {
-                type: String,
-                description: "The signed TFA challenge string the user wants to respond to.",
-                optional: true,
-            },
+            create_params: {
+                type: CreateTicket,
+                flatten: true,
+            }
         },
     },
     returns: {
-        properties: {
-            username: {
-                type: String,
-                description: "User name.",
-            },
-            ticket: {
-                type: String,
-                description: "Auth ticket.",
-            },
-            CSRFPreventionToken: {
-                type: String,
-                description:
-                    "Cross Site Request Forgery Prevention Token. \
-                     For partial tickets this is the string \"invalid\".",
-            },
-        },
+        type: CreateTicketResponse,
     },
     protected: true,
     access: {
@@ -84,46 +51,231 @@ enum AuthResult {
 ///
 /// Returns: An authentication ticket with additional infos.
 pub async fn create_ticket(
-    username: Userid,
-    password: String,
-    path: Option<String>,
-    privs: Option<String>,
-    port: Option<u16>,
-    tfa_challenge: Option<String>,
+    create_params: CreateTicket,
     rpcenv: &mut dyn RpcEnvironment,
-) -> Result<Value, Error> {
+) -> Result<CreateTicketResponse, Error> {
     let env: &RestEnvironment = rpcenv
         .as_any()
         .downcast_ref::<RestEnvironment>()
         .ok_or_else(|| format_err!("detected wrong RpcEnvironment type"))?;
 
-    match authenticate_user(&username, &password, path, privs, port, tfa_challenge, env).await {
-        Ok(AuthResult::Success) => Ok(json!({ "username": username })),
+    handle_ticket_creation(create_params, true, env)
+        .await
+        // remove the superfluous ticket_info to not confuse clients
+        .map(|mut info| {
+            info.ticket_info = None;
+            info
+        })
+}
+
+#[api(
+    input: {
+        properties: {
+            verify_params: {
+                type: VerifyVNCTicket,
+                flatten: true,
+            }
+        },
+    },
+    protected: true,
+    access: {
+        permission: &Permission::World,
+    },
+)]
+/// Verify that a VNC ticket is valid for a given Authid, path and privilege(s).
+pub async fn verify_vnc_ticket(verify_params: VerifyVNCTicket) -> Result<(), Error> {
+    let auth_context = auth_context()?;
+    match auth_context.check_path_ticket(
+        &verify_params.authid,
+        &verify_params.vncticket,
+        verify_params.path,
+        verify_params.privs,
+        verify_params.port.unwrap_or_default(),
+    )? {
+        None => bail!("Checking VNC ticket failed"), // no path based tickets supported, just fall through.
+        Some(true) => Ok(()),
+        Some(false) => bail!("No such privilege"),
+    }
+}
+
+pub const API_METHOD_LOGOUT: ApiMethod = ApiMethod::new(
+    &ApiHandler::AsyncHttpBodyParameters(&logout_handler),
+    &ObjectSchema::new("", &[]),
+)
+.protected(true)
+.access(None, &Permission::World);
+
+fn logout_handler(
+    _parts: Parts,
+    _param: Value,
+    _info: &ApiMethod,
+    _rpcenv: Box<dyn RpcEnvironment>,
+) -> ApiResponseFuture {
+    Box::pin(async move {
+        // unset authentication cookie by setting an invalid one. needs the same `Path` and
+        // `Secure` parameter to not be rejected by some browsers. also use the same `HttpOnly` and
+        // `SameSite` parameters just in case.
+        let host_cookie = format!(
+            "{}=; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Secure; SameSite=Lax; HttpOnly; Path=/;",
+            auth_context()?.prefixed_auth_cookie_name()
+        );
+
+        Ok(Response::builder()
+            .header(hyper::header::SET_COOKIE, host_cookie)
+            .body(
+                json!({"data": {}, "status": 200, "success": true })
+                    .to_string()
+                    .into(),
+            )?)
+    })
+}
+
+pub const API_METHOD_CREATE_TICKET_HTTP_ONLY: ApiMethod = ApiMethod::new_full(
+    &ApiHandler::AsyncHttpBodyParameters(&create_ticket_http_only),
+    ParameterSchema::AllOf(&AllOfSchema::new(
+        "Get a new ticket as an HttpOnly cookie. Supports tickets via cookies.",
+        &[&CreateTicket::API_SCHEMA],
+    )),
+)
+.returns(ReturnType::new(false, &CreateTicketResponse::API_SCHEMA))
+.protected(true)
+.access(None, &Permission::World);
+
+fn create_ticket_http_only(
+    parts: Parts,
+    param: Value,
+    _info: &ApiMethod,
+    rpcenv: Box<dyn RpcEnvironment>,
+) -> ApiResponseFuture {
+    Box::pin(async move {
+        let auth_context = auth_context()?;
+        let host_cookie = auth_context.prefixed_auth_cookie_name();
+        let mut create_params: CreateTicket = serde_json::from_value(param)?;
+        let mut password = create_params.password.take();
+
+        // previously to refresh a ticket, the old ticket was provided as a password via this
+        // endpoint's parameters. however, once the ticket is set as an HttpOnly cookie, some
+        // clients won't have access to it anymore. so we need to check whether the ticket is set
+        // in a cookie here too.
+        //
+        // only check the newer `__Host-` prefixed cookies here as older tickets should be
+        // provided via the password parameter anyway.
+        create_params.password = parts
+            .headers
+            // there is a `cookie_from_header` function we could use, but it seems to fail when
+            // multiple cookie headers are set
+            .get_all(http::header::COOKIE)
+            .iter()
+            .filter_map(|c| c.to_str().ok())
+            // after this only `__Host-{Cookie Name}` cookies are in the iterator
+            .filter_map(|c| extract_cookie(c, host_cookie))
+            // so this should just give us the first one if it exists
+            .next()
+            // if nothing was provided via the cookie, fall back to the requests body again
+            .or_else(|| password.take());
+
+        let env: &RestEnvironment = rpcenv
+            .as_any()
+            .downcast_ref::<RestEnvironment>()
+            .ok_or(format_err!("detected wrong RpcEnvironment type"))?;
+
+        let mut ticket_response = handle_ticket_creation(create_params.clone(), true, env).await;
+
+        // if authentication failed via the cookie parameter, try the password from the body here.
+        // don't allow ticket refresh, though. this should only be done via the cookie if the
+        // client uses cookies for tickets.
+        if ticket_response.is_err() && password.is_some() {
+            create_params.password = password;
+            ticket_response = handle_ticket_creation(create_params, false, env).await;
+        }
+
+        let mut ticket_response = ticket_response?;
+
+        let mut response =
+            Response::builder().header(http::header::CONTENT_TYPE, "application/json");
+
+        // if `ticket_info` is set, we want to return the ticket in a `SET_COOKIE` header and not
+        // the response body
+        if ticket_response.ticket_info.is_some() {
+            // parse the ticket here, so we can use the correct timestamp of the `Expire` parameter
+            // take the ticket here, so the option will be `None` in the response
+            if let Some(ticket_str) = ticket_response.ticket.take() {
+                // this makes sure that ticket cookies:
+                // - Typically `__Host-`-prefixed: are only send to the specific domain that set
+                //   them and that scripts served via http cannot overwrite the cookie.
+                // - `Secure`: are only sent via https.
+                // - `SameSite=Lax`: are only sent on cross-site requests when the user is
+                //   navigating to the origin site from an external site.
+                // - `HttpOnly`: cookies are not readable to client-side javascript code.
+                // - don't set `Expire` to keep cookie a session cookie. otherwise, we may break
+                //   security assumptions made by users previously. the expiration limit is still
+                //   enforced server side.
+                let cookie =
+                    format!("{host_cookie}={ticket_str}; Secure; SameSite=Lax; HttpOnly; Path=/;");
+
+                response = response.header(hyper::header::SET_COOKIE, cookie);
+            }
+        }
+
+        Ok(response.body(
+            json!({"data": ticket_response, "status": 200, "success": true })
+                .to_string()
+                .into(),
+        )?)
+    })
+}
+
+async fn handle_ticket_creation(
+    create_params: CreateTicket,
+    allow_ticket_refresh: bool,
+    env: &RestEnvironment,
+) -> Result<CreateTicketResponse, Error> {
+    let username = create_params.username;
+    let password = create_params
+        .password
+        .ok_or(format_err!("no password provided"))?;
+
+    match authenticate_user(
+        &username,
+        &password,
+        create_params.path,
+        create_params.privs,
+        create_params.port,
+        create_params.tfa_challenge,
+        allow_ticket_refresh,
+        env,
+    )
+    .await
+    {
+        Ok(AuthResult::Success) => Ok(CreateTicketResponse::new(username)),
         Ok(AuthResult::CreateTicket) => {
             let auth_context = auth_context()?;
             let api_ticket = ApiTicket::Full(username.clone());
-            let ticket = Ticket::new(auth_context.auth_prefix(), &api_ticket)?
-                .sign(auth_context.keyring(), None)?;
-            let token = assemble_csrf_prevention_token(auth_context.csrf_secret(), &username);
+            let mut ticket = Ticket::new(auth_context.auth_prefix(), &api_ticket)?;
+            let csrfprevention_token =
+                assemble_csrf_prevention_token(auth_context.csrf_secret(), &username);
 
             env.log_auth(username.as_str());
 
-            Ok(json!({
-                "username": username,
-                "ticket": ticket,
-                "CSRFPreventionToken": token,
-            }))
+            Ok(CreateTicketResponse {
+                username,
+                ticket: Some(ticket.sign(auth_context.keyring(), None)?),
+                ticket_info: Some(ticket.ticket_info()),
+                csrfprevention_token: Some(csrfprevention_token),
+            })
         }
         Ok(AuthResult::Partial(challenge)) => {
             let auth_context = auth_context()?;
             let api_ticket = ApiTicket::Partial(challenge);
             let ticket = Ticket::new(auth_context.auth_prefix(), &api_ticket)?
                 .sign(auth_context.keyring(), Some(username.as_str()))?;
-            Ok(json!({
-                "username": username,
-                "ticket": ticket,
-                "CSRFPreventionToken": "invalid",
-            }))
+
+            Ok(CreateTicketResponse {
+                username,
+                ticket: Some(ticket),
+                csrfprevention_token: Some("invalid".to_string()),
+                ticket_info: None,
+            })
         }
         Err(err) => {
             env.log_failed_auth(Some(username.to_string()), &err.to_string());
@@ -132,6 +284,7 @@ pub async fn create_ticket(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn authenticate_user(
     userid: &Userid,
     password: &str,
@@ -139,6 +292,7 @@ async fn authenticate_user(
     privs: Option<String>,
     port: Option<u16>,
     tfa_challenge: Option<String>,
+    allow_ticket_refresh: bool,
     rpcenv: &RestEnvironment,
 ) -> Result<AuthResult, Error> {
     let auth_context = auth_context()?;
@@ -153,21 +307,24 @@ async fn authenticate_user(
         return authenticate_2nd(userid, &tfa_challenge, password);
     }
 
-    if password.starts_with(prefix) && password.as_bytes().get(prefix.len()).copied() == Some(b':')
-    {
-        if let Ok(ticket_userid) = Ticket::<Userid>::parse(password)
-            .and_then(|ticket| ticket.verify(auth_context.keyring(), prefix, None))
+    if allow_ticket_refresh {
+        if password.starts_with(prefix)
+            && password.as_bytes().get(prefix.len()).copied() == Some(b':')
         {
-            if *userid == ticket_userid {
-                return Ok(AuthResult::CreateTicket);
+            if let Ok(ticket_userid) = Ticket::<Userid>::parse(password)
+                .and_then(|ticket| ticket.verify(auth_context.keyring(), prefix, None))
+            {
+                if *userid == ticket_userid {
+                    return Ok(AuthResult::CreateTicket);
+                }
+                bail!("ticket login failed - wrong userid");
             }
-            bail!("ticket login failed - wrong userid");
-        }
-    } else if let Some(((path, privs), port)) = path.zip(privs).zip(port) {
-        match auth_context.check_path_ticket(userid, password, path, privs, port)? {
-            None => (), // no path based tickets supported, just fall through.
-            Some(true) => return Ok(AuthResult::Success),
-            Some(false) => bail!("No such privilege"),
+        } else if let Some(((path, privs), port)) = path.zip(privs).zip(port) {
+            match auth_context.check_path_ticket(&auth_id, password, path, privs, port)? {
+                None => (), // no path based tickets supported, just fall through.
+                Some(true) => return Ok(AuthResult::Success),
+                Some(false) => bail!("No such privilege"),
+            }
         }
     }
 
@@ -247,15 +404,13 @@ pub fn assemble_csrf_prevention_token(secret: &HMACKey, userid: &Userid) -> Stri
     let epoch = crate::time::epoch_i64();
 
     let data = csrf_token_data(epoch, userid);
-    let digest = base64::encode_config(
-        secret.sign(MessageDigest::sha3_256(), &data).unwrap(),
-        base64::STANDARD_NO_PAD,
-    );
-    format!("{:08X}:{}", epoch, digest)
+    let digest =
+        proxmox_base64::encode_no_pad(secret.sign(MessageDigest::sha3_256(), &data).unwrap());
+    format!("{epoch:08X}:{digest}")
 }
 
 fn csrf_token_data(timestamp: i64, userid: &Userid) -> Vec<u8> {
-    format!("{:08X}:{}:", timestamp, userid).as_bytes().to_vec()
+    format!("{timestamp:08X}:{userid}:").as_bytes().to_vec()
 }
 
 pub(crate) fn verify_csrf_prevention_token(
@@ -281,7 +436,7 @@ fn verify_csrf_prevention_token_do(
         .filter(|(_, sig)| !sig.contains(':'))
         .ok_or_else(|| format_err!("format error - wrong number of parts."))?;
 
-    let sig = base64::decode_config(sig, base64::STANDARD_NO_PAD)
+    let sig = proxmox_base64::decode_no_pad(sig)
         .map_err(|e| format_err!("could not base64 decode csrf signature - {e}"))?;
 
     let ttime = i64::from_str_radix(timestamp, 16)
@@ -297,7 +452,7 @@ fn verify_csrf_prevention_token_do(
         // legacy token verification code
         // TODO: remove once all dependent products had a major version release (PBS)
         let mut hasher = openssl::sha::Sha256::new();
-        let data = format!("{:08X}:{}:", ttime, userid);
+        let data = format!("{ttime:08X}:{userid}:");
         hasher.update(data.as_bytes());
         hasher.update(&secret.as_bytes()?);
         let old_digest = hasher.finish();
@@ -349,15 +504,15 @@ fn test_verify_legacy_csrf_tokens() {
     let epoch = crate::time::epoch_i64();
 
     let mut hasher = openssl::sha::Sha256::new();
-    let data = format!("{:08X}:{}:", epoch, userid);
+    let data = format!("{epoch:08X}:{userid}:");
     hasher.update(data.as_bytes());
     hasher.update(&key);
-    let old_digest = base64::encode_config(hasher.finish(), base64::STANDARD_NO_PAD);
+    let old_digest = proxmox_base64::encode_no_pad(hasher.finish());
 
-    let token = format!("{:08X}:{}", epoch, old_digest);
+    let token = format!("{epoch:08X}:{old_digest}");
 
     // load key into new hmackey wrapper and verify
-    let string = base64::encode_config(key.clone(), base64::STANDARD_NO_PAD);
+    let string = proxmox_base64::encode_no_pad(key.clone());
     let secret =
         HMACKey::from_base64(&string).expect("could not create HMAC key from base64 for testing");
     verify_csrf_prevention_token(&secret, &userid, &token, -300, 300).unwrap();

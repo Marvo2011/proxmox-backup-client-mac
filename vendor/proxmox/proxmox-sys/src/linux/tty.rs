@@ -2,7 +2,7 @@ use std::io::{self, IsTerminal, Read, Write};
 use std::mem::MaybeUninit;
 use std::os::unix::io::{AsRawFd, OwnedFd};
 
-use anyhow::{bail, format_err, Error};
+use anyhow::{Error, bail, format_err};
 use nix::fcntl::OFlag;
 use nix::sys::stat::Mode;
 
@@ -23,18 +23,6 @@ pub fn stdout_terminal_size() -> (usize, usize) {
     };
     unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut winsize) };
     (winsize.ws_row as usize, winsize.ws_col as usize)
-}
-
-/// Returns whether the current stdout is a tty.
-#[deprecated(note = "Use std::io::stdout().is_terminal()")]
-pub fn stdout_isatty() -> bool {
-    std::io::stdout().is_terminal()
-}
-
-/// Returns whether the current stdin is a tty.
-#[deprecated(note = "Use std::io::stdin().is_terminal()")]
-pub fn stdin_isatty() -> bool {
-    std::io::stdin().is_terminal()
 }
 
 pub enum TtyOutput {

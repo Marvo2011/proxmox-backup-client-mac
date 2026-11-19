@@ -1,19 +1,20 @@
+use std::borrow::Cow;
 use std::time::Duration;
 
 use lettre::message::header::{HeaderName, HeaderValue};
 use lettre::message::{Mailbox, MultiPart, SinglePart};
 use lettre::transport::smtp::client::{Tls, TlsParameters};
-use lettre::{message::header::ContentType, Message, SmtpTransport, Transport};
+use lettre::{Message, SmtpTransport, Transport, message::header::ContentType};
 use serde::{Deserialize, Serialize};
 
 use proxmox_schema::api_types::COMMENT_SCHEMA;
-use proxmox_schema::{api, Updater};
+use proxmox_schema::{Updater, api};
 
 use crate::context::context;
 use crate::endpoints::common::mail;
 use crate::renderer::TemplateType;
 use crate::schema::{EMAIL_SCHEMA, ENTITY_NAME_SCHEMA, USER_SCHEMA};
-use crate::{renderer, Content, Endpoint, Error, Notification, Origin};
+use crate::{Content, Endpoint, Error, Notification, Origin, renderer};
 
 pub(crate) const SMTP_TYPENAME: &str = "smtp";
 
@@ -115,6 +116,7 @@ pub struct SmtpConfig {
 #[api]
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+/// The set of properties that can be deleted from a smtp endpoint configuration.
 pub enum DeleteableSmtpProperty {
     /// Delete `author`
     Author,
@@ -212,8 +214,10 @@ impl Endpoint for SmtpEndpoint {
             .clone()
             .unwrap_or_else(|| context().default_sendmail_author());
 
+        let quoted_author = quote_name_if_needed(&author);
+
         let mut email_builder =
-            Message::builder().from(parse_address(&format!("{author} <{mail_from}>"))?);
+            Message::builder().from(parse_address(&format!("{quoted_author} <{mail_from}>"))?);
 
         for recipient in recipients {
             email_builder = email_builder.to(parse_address(&recipient)?);
@@ -250,97 +254,8 @@ impl Endpoint for SmtpEndpoint {
                     .map_err(|err| Error::NotifyFailed(self.name().into(), Box::new(err)))?
             }
             #[cfg(feature = "mail-forwarder")]
-            Content::ForwardedMail { ref raw, title, .. } => {
-                use lettre::message::header::ContentTransferEncoding;
-                use lettre::message::Body;
-
-                let parsed_message = mail_parser::Message::parse(raw)
-                    .ok_or_else(|| Error::Generic("could not parse forwarded email".to_string()))?;
-
-                let root_part = parsed_message
-                    .part(0)
-                    .ok_or_else(|| Error::Generic("root message part not present".to_string()))?;
-
-                let raw_body = parsed_message
-                    .raw_message()
-                    .get(root_part.offset_body..root_part.offset_end)
-                    .ok_or_else(|| Error::Generic("could not get raw body content".to_string()))?;
-
-                // We assume that the original message content is already properly
-                // encoded, thus we add the original message body in 'Binary' encoding.
-                // This prohibits lettre from trying to re-encode our raw body data.
-                // lettre will automatically set the `Content-Transfer-Encoding: binary` header,
-                // which we need to remove. The actual transfer encoding is later
-                // copied from the original message headers.
-                let body =
-                    Body::new_with_encoding(raw_body.to_vec(), ContentTransferEncoding::Binary)
-                        .map_err(|_| Error::Generic("could not create body".into()))?;
-                let mut message = email_builder
-                    .subject(title)
-                    .body(body)
-                    .map_err(|err| Error::NotifyFailed(self.name().into(), Box::new(err)))?;
-                message
-                    .headers_mut()
-                    .remove_raw("Content-Transfer-Encoding");
-
-                // Copy over all headers that are relevant to display the original body correctly.
-                // Unfortunately this is a bit cumbersome, as we use separate crates for mail parsing (mail-parser)
-                // and creating/sending mails (lettre).
-                // Note: Other MIME-Headers, such as Content-{ID,Description,Disposition} are only used
-                // for body-parts in multipart messages, so we can ignore them for the messages headers.
-                // Since we send the original raw body, the part-headers will be included any way.
-                for header in parsed_message.headers() {
-                    let header_name = header.name.as_str();
-                    // Email headers are case-insensitive, so convert to lowercase...
-                    let value = match header_name.to_lowercase().as_str() {
-                        "content-type" => {
-                            if let mail_parser::HeaderValue::ContentType(ct) = header.value() {
-                                // mail_parser does not give us access to the full decoded and unfolded
-                                // header value, so we unfortunately need to reassemble it ourselves.
-                                // Meh.
-                                let mut value = ct.ctype().to_string();
-                                if let Some(subtype) = ct.subtype() {
-                                    value.push('/');
-                                    value.push_str(subtype);
-                                }
-                                if let Some(attributes) = ct.attributes() {
-                                    use std::fmt::Write;
-
-                                    for attribute in attributes {
-                                        let _ = write!(
-                                            &mut value,
-                                            "; {}=\"{}\"",
-                                            attribute.0, attribute.1
-                                        );
-                                    }
-                                }
-                                Some(value)
-                            } else {
-                                None
-                            }
-                        }
-                        "content-transfer-encoding" | "mime-version" => {
-                            if let mail_parser::HeaderValue::Text(text) = header.value() {
-                                Some(text.to_string())
-                            } else {
-                                None
-                            }
-                        }
-                        _ => None,
-                    };
-
-                    if let Some(value) = value {
-                        match HeaderName::new_from_ascii(header_name.into()) {
-                            Ok(name) => {
-                                let header = HeaderValue::new(name, value);
-                                message.headers_mut().insert_raw(header);
-                            }
-                            Err(e) => log::error!("could not set header: {e}"),
-                        }
-                    }
-                }
-
-                message
+            Content::ForwardedMail { raw, .. } => {
+                build_forwarded_message(email_builder, self.name(), raw)?
             }
         };
 
@@ -367,5 +282,179 @@ impl Endpoint for SmtpEndpoint {
     /// Check if the endpoint is disabled
     fn disabled(&self) -> bool {
         self.config.disable.unwrap_or_default()
+    }
+}
+
+/// Construct a lettre `Message` from a raw email message.
+#[cfg(feature = "mail-forwarder")]
+fn build_forwarded_message(
+    email_builder: lettre::message::MessageBuilder,
+    endpoint_name: &str,
+    raw: &[u8],
+) -> Result<Message, Error> {
+    use lettre::message::Body;
+    use lettre::message::header::ContentTransferEncoding;
+    use tracing::error;
+
+    let parsed_message = mail_parser::MessageParser::default()
+        .parse(raw)
+        .ok_or_else(|| Error::Generic("could not parse forwarded email".to_string()))?;
+
+    let root_part = parsed_message
+        .part(0)
+        .ok_or_else(|| Error::Generic("root message part not present".to_string()))?;
+
+    let raw_body = &parsed_message.raw_message()
+        [root_part.offset_body as usize..root_part.offset_end as usize];
+
+    // We assume that the original message content is already properly
+    // encoded, thus we add the original message body in 'Binary' encoding.
+    // This prohibits lettre from trying to re-encode our raw body data.
+    // lettre will automatically set the `Content-Transfer-Encoding: binary` header,
+    // which we need to remove. The actual transfer encoding is later
+    // copied from the original message headers.
+    let body = Body::new_with_encoding(raw_body.to_vec(), ContentTransferEncoding::Binary)
+        .map_err(|_| Error::Generic("could not create body".into()))?;
+    let mut message = email_builder
+        .subject(parsed_message.subject().unwrap_or_default())
+        .body(body)
+        .map_err(|err| Error::NotifyFailed(endpoint_name.into(), Box::new(err)))?;
+    message
+        .headers_mut()
+        .remove_raw("Content-Transfer-Encoding");
+
+    // Copy over all headers that are relevant to display the original body correctly.
+    // Unfortunately this is a bit cumbersome, as we use separate crates for mail parsing (mail-parser)
+    // and creating/sending mails (lettre).
+    // Note: Other MIME-Headers, such as Content-{ID,Description,Disposition} are only used
+    // for body-parts in multipart messages, so we can ignore them for the messages headers.
+    // Since we send the original raw body, the part-headers will be included any way.
+    for header in parsed_message.headers() {
+        let header_name = header.name.as_str();
+        // Email headers are case-insensitive, so convert to lowercase...
+        let value = match header_name.to_lowercase().as_str() {
+            "content-type" => {
+                if let mail_parser::HeaderValue::ContentType(ct) = header.value() {
+                    // mail_parser does not give us access to the full decoded and unfolded
+                    // header value, so we unfortunately need to reassemble it ourselves.
+                    // Meh.
+                    let mut value = ct.ctype().to_string();
+                    if let Some(subtype) = ct.subtype() {
+                        value.push('/');
+                        value.push_str(subtype);
+                    }
+                    if let Some(attributes) = ct.attributes() {
+                        use std::fmt::Write;
+
+                        for attribute in attributes {
+                            let _ =
+                                write!(&mut value, "; {}=\"{}\"", attribute.name, attribute.value);
+                        }
+                    }
+                    Some(value)
+                } else {
+                    None
+                }
+            }
+            "content-transfer-encoding" | "mime-version" => {
+                if let mail_parser::HeaderValue::Text(text) = header.value() {
+                    Some(text.to_string())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+
+        if let Some(value) = value {
+            match HeaderName::new_from_ascii(header_name.into()) {
+                Ok(name) => {
+                    let header = HeaderValue::new(name, value);
+                    message.headers_mut().insert_raw(header);
+                }
+                Err(e) => error!("could not set header: {e}"),
+            }
+        }
+    }
+
+    Ok(message)
+}
+
+/// Quote mail name if required by RFC5322.
+fn quote_name_if_needed(name: &str) -> Cow<'_, str> {
+    // See https://datatracker.ietf.org/doc/html/rfc5322#section-3.2.3
+    let needs_quotes = name.chars().any(|c| {
+        matches!(
+            c,
+            '(' | ')' | '<' | '>' | '@' | ',' | ';' | ':' | '\\' | '"' | '[' | ']' | '='
+        )
+    });
+
+    if needs_quotes {
+        // Quoted strings may contain all printable chars except \ and ", they need to be
+        // escaped. Non-ASCII UTF-8 characters are later encoded by lettre, we do not
+        // need to care about them here.
+        let mut result = name.replace(r#"\"#, r#"\\"#);
+        result = result.replace(r#"""#, r#"\""#);
+        Cow::Owned(format!("\"{result}\""))
+    } else {
+        Cow::Borrowed(name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    use super::*;
+
+    #[test]
+    fn test_quote_mail_name() {
+        assert_eq!(
+            &quote_name_if_needed("Firstname Lastname"),
+            "Firstname Lastname"
+        );
+
+        assert_eq!(
+            &quote_name_if_needed("Firstname \"Nickname\" Lastname"),
+            "\"Firstname \\\"Nickname\\\" Lastname\""
+        );
+
+        assert_eq!(
+            &quote_name_if_needed("Proxmox VE (somehost)"),
+            "\"Proxmox VE (somehost)\""
+        );
+
+        assert_eq!(
+            &quote_name_if_needed("Firstname \\ Lastname"),
+            "\"Firstname \\\\ Lastname\""
+        );
+    }
+
+    #[cfg(feature = "mail-forwarder")]
+    #[test]
+    fn test_forward_message_from_raw() {
+        use lettre::message::header::Date;
+
+        let input = "testdata/test1.msg";
+        let reference = "testdata/test_forward_message_from_raw.ref";
+
+        let mut email_builder =
+            Message::builder().from("Sender <sender@example.com>".parse().unwrap());
+
+        email_builder = email_builder.to("Recipient <recipient@example.com>".parse().unwrap());
+
+        let raw_mail = std::fs::read(input).unwrap();
+        let mut message = build_forwarded_message(email_builder, "test", &raw_mail).unwrap();
+
+        // The Date header contains the current time, let's just remove it
+        // for this test.
+        message.headers_mut().remove::<Date>();
+
+        let formatted = message.formatted();
+
+        // Uncomment to update the reference file.
+        // std::fs::write(reference, &formatted).unwrap();
+
+        assert_eq!(formatted, std::fs::read(reference).unwrap());
     }
 }

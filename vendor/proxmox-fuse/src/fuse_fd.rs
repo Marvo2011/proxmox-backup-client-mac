@@ -72,7 +72,7 @@ impl FuseFd {
     /// We need to move it out since the polling thread runs in parallel and is edge triggered,
     /// meaning that if we get `READY_IN` and perform multiple `read()` calls, there's a race
     /// between seeing `-EAGAIN` and clearing the ready-bits where the polling thread adds them in.
-    pub(crate) fn poll_read_ready(&self, cx: &mut Context) -> Poll<io::Result<ReadyGuard>> {
+    pub(crate) fn poll_read_ready(&self, cx: &mut Context) -> Poll<io::Result<ReadyGuard<'_>>> {
         let ready = self
             .state
             .ready
@@ -357,10 +357,7 @@ fn poll_thread_inner(poll: Arc<Epoll>, fd: RawFd, state: Arc<PollState>) -> io::
     'outer: loop {
         let rc = poll.wait(&mut events)?;
         if rc >= events.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                "epoll_wait returned garbage",
-            ));
+            return Err(io::Error::other("epoll_wait returned garbage"));
         }
 
         for event in &events[0..rc] {
@@ -384,10 +381,7 @@ fn poll_thread_inner(poll: Arc<Epoll>, fd: RawFd, state: Arc<PollState>) -> io::
                     }
                 }
                 _ => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        "epoll_wait returned unexpected events",
-                    ))
+                    return Err(io::Error::other("epoll_wait returned unexpected events"));
                 }
             }
         }

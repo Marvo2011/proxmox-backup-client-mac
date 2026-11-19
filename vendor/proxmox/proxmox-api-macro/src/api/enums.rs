@@ -4,13 +4,67 @@ use anyhow::Error;
 
 use proc_macro2::{Ident, Span, TokenStream};
 use quote::quote_spanned;
+use syn::spanned::Spanned;
 
 use super::Schema;
+use super::attributes::CheckedAttributes;
+use super::attributes::EnumFieldAttributes;
 use crate::serde;
 use crate::util::{self, FieldName, JSONObject, JSONValue, Maybe};
 
 /// Enums, provided they're simple enums, simply get an enum string schema attached to them.
-pub fn handle_enum(
+pub fn handle_enum(attribs: JSONObject, enum_ty: syn::ItemEnum) -> Result<TokenStream, Error> {
+    let mut unit_variants = 0;
+    let mut unnamed_variants = 0;
+    let mut untagged_variants = false;
+    for variant in &enum_ty.variants {
+        let attrs = serde::VariantAttrib::try_from(&variant.attrs[..])?;
+        if attrs.untagged.is_some() {
+            if untagged_variants {
+                error!(
+                    variant.fields.span(),
+                    "api type enum with multiple untagged variants not supported"
+                );
+            }
+            untagged_variants = true;
+        }
+        match &variant.fields {
+            syn::Fields::Unit => {
+                if let Some(untagged) = attrs.untagged {
+                    error!(untagged, "untagged unit variants not supported");
+                }
+                unit_variants += 1;
+            }
+            syn::Fields::Unnamed(_) => {
+                unnamed_variants += 1;
+            }
+            syn::Fields::Named(_) => {
+                bail!(
+                    variant.fields.span(),
+                    "api type enums with named fields are not allowed"
+                )
+            }
+        }
+    }
+
+    if unnamed_variants == 0 {
+        return handle_string_enum(attribs, enum_ty);
+    }
+
+    if unit_variants == 0 {
+        return handle_section_config_enum(attribs, enum_ty);
+    }
+
+    if unnamed_variants == 1 && untagged_variants {
+        // we allow a single untagged unnamed variant
+        return handle_string_enum(attribs, enum_ty);
+    }
+
+    bail!(enum_ty => "mixed unnamed and unit variant enums not supported");
+}
+
+/// Enums, provided they're simple enums, simply get an enum string schema attached to them.
+fn handle_string_enum(
     mut attribs: JSONObject,
     mut enum_ty: syn::ItemEnum,
 ) -> Result<TokenStream, Error> {
@@ -32,6 +86,12 @@ pub fn handle_enum(
 
         if schema.description.is_none() {
             let (comment, span) = util::get_doc_comments(&enum_ty.attrs)?;
+            if comment.is_empty() {
+                error!(
+                    Span::call_site(),
+                    "missing doc comment on enum for api-schema description"
+                );
+            }
             schema.description = Maybe::Derived(syn::LitStr::new(comment.trim(), span));
         }
 
@@ -45,9 +105,22 @@ pub fn handle_enum(
     let mut default_value = None;
 
     let mut variants = TokenStream::new();
+    let mut untagged_other = None;
     for variant in &mut enum_ty.variants {
+        let checked_attrs = CheckedAttributes::from_slice(&variant.attrs);
+
+        let attrs = serde::VariantAttrib::try_from(&variant.attrs[..])?;
+
         match &variant.fields {
             syn::Fields::Unit => (),
+            syn::Fields::Unnamed(_) => {
+                if attrs.untagged.is_some() {
+                    untagged_other = Some(checked_attrs);
+                    continue;
+                } else {
+                    bail!(variant => "unnamed variants not supported in string enums");
+                }
+            }
             _ => bail!(variant => "api macro does not support enums with fields"),
         }
 
@@ -57,7 +130,6 @@ pub fn handle_enum(
             comment = "<missing description>".to_string();
         }
 
-        let attrs = serde::VariantAttrib::try_from(&variant.attrs[..])?;
         let variant_string = if let Some(renamed) = attrs.rename {
             renamed
         } else if let Some(rename_all) = container_attrs.rename_all {
@@ -68,22 +140,23 @@ pub fn handle_enum(
             syn::LitStr::new(&name.to_string(), name.span())
         };
 
-        if derives_default {
-            if let Some(attr) = variant.attrs.iter().find(|a| a.path().is_ident("default")) {
-                if let Some(default_value) = &default_value {
-                    error!(attr => "multiple default values defined");
-                    error!(default_value => "default previously defined here");
-                } else {
-                    default_value = Some(variant_string.clone());
-                    if let Some(span) = has_default_attrib {
-                        error!(attr => "#[default] attribute in use with 'default' #[api] key");
-                        error!(span, "'default' also defined here");
-                    }
+        if derives_default
+            && let Some(attr) = variant.attrs.iter().find(|a| a.path().is_ident("default"))
+        {
+            if let Some(default_value) = &default_value {
+                error!(attr => "multiple default values defined");
+                error!(default_value => "default previously defined here");
+            } else {
+                default_value = Some(variant_string.clone());
+                if let Some(span) = has_default_attrib {
+                    error!(attr => "#[default] attribute in use with 'default' #[api] key");
+                    error!(span, "'default' also defined here");
                 }
             }
         }
 
         variants.extend(quote_spanned! { variant.ident.span() =>
+            #checked_attrs
             ::proxmox_schema::EnumEntry {
                 value: #variant_string,
                 description: #comment,
@@ -98,6 +171,13 @@ pub fn handle_enum(
         None => TokenStream::new(),
     };
 
+    // Values outside of the enum are only valid if the fallback variant is actually compiled in.
+    let format_is_optional = match untagged_other.map(|attrs| attrs.cfg_predicate()) {
+        None => TokenStream::new(),
+        Some(None) => quote::quote! { .format_is_optional(true) },
+        Some(Some(predicate)) => quote::quote! { .format_is_optional(::core::cfg!(#predicate)) },
+    };
+
     Ok(quote_spanned! { name.span() =>
         #enum_ty
 
@@ -105,6 +185,7 @@ pub fn handle_enum(
             const API_SCHEMA: ::proxmox_schema::Schema =
                 #schema
                 .format(&::proxmox_schema::ApiStringFormat::Enum(&[#variants]))
+                #format_is_optional
                 #default_value
                 .schema();
         }
@@ -113,4 +194,246 @@ pub fn handle_enum(
             type Updater = Option<Self>;
         }
     })
+}
+
+struct SectionConfigAttribs {
+    id_schema: TokenStream,
+    id_property: syn::LitStr,
+    with_type_key: TokenStream,
+}
+
+impl SectionConfigAttribs {
+    fn extract(name: &Ident, attribs: &mut JSONObject) -> Result<Option<Self>, syn::Error> {
+        let id_schema = attribs.remove("id-schema");
+        let id_property = attribs.remove("id-property");
+        let type_key = attribs.remove("type-key");
+
+        if id_schema.is_none() && id_property.is_none() && type_key.is_none() {
+            return Ok(None);
+        }
+
+        let id_schema = {
+            let schema: Schema = match id_schema {
+                Some(schema) => schema.try_into()?,
+                None => {
+                    bail!(name => "missing 'id-schema' property for SectionConfig style enum")
+                }
+            };
+
+            let mut ts = TokenStream::new();
+            schema.to_typed_schema(&mut ts)?;
+            ts
+        };
+        let id_property: syn::LitStr = match id_property {
+            Some(name) => name.try_into()?,
+            None => bail!(name => "missing 'id-property' property for SectionConfig style enum"),
+        };
+        let with_type_key: TokenStream = match type_key {
+            Some(value) => {
+                let value: syn::LitStr = value.try_into()?;
+                quote_spanned!(value.span() => .with_type_key(#value))
+            }
+            None => TokenStream::new(),
+        };
+
+        Ok(Some(Self {
+            id_schema,
+            id_property,
+            with_type_key,
+        }))
+    }
+}
+
+fn handle_section_config_enum(
+    mut attribs: JSONObject,
+    mut enum_ty: syn::ItemEnum,
+) -> Result<TokenStream, Error> {
+    let name = &enum_ty.ident;
+
+    let description: syn::LitStr = match attribs.remove("description") {
+        Some(desc) => desc.try_into()?,
+        None => {
+            let (comment, span) = util::get_doc_comments(&enum_ty.attrs)?;
+            if comment.is_empty() {
+                error!(
+                    Span::call_site(),
+                    "missing doc comment on enum for api-schema description"
+                );
+            }
+            syn::LitStr::new(comment.trim(), span)
+        }
+    };
+
+    let section_config_attrs = SectionConfigAttribs::extract(name, &mut attribs)
+        .map_err(crate::add_error)
+        .unwrap_or(None);
+
+    let container_attrs = serde::ContainerAttrib::try_from(&enum_ty.attrs[..])?;
+    let Some(tag) = container_attrs.tag.as_ref() else {
+        bail!(name => r#"SectionConfig enum needs a `#[serde(tag = "...")]` container attribute"#);
+    };
+
+    let mut variants = Vec::new();
+    let mut type_enum = TokenStream::new();
+    let mut register_sections = TokenStream::new();
+    let mut to_type = TokenStream::new();
+    for variant in &mut enum_ty.variants {
+        let field = match &variant.fields {
+            syn::Fields::Unnamed(field) if field.unnamed.len() == 1 => &field.unnamed[0],
+            _ => bail!(variant => "SectionConfig style enum can only have newtype variants"),
+        };
+
+        let attrs = serde::VariantAttrib::try_from(&variant.attrs[..])?;
+
+        let (mut comment, _doc_span) = util::get_doc_comments(&variant.attrs)?;
+        if comment.is_empty() {
+            crate::add_warning(variant.ident.span(), "enum variant needs a description");
+            comment = "<missing description>".to_string();
+        }
+
+        let variant_string = if let Some(renamed) = attrs.rename {
+            renamed
+        } else if let Some(rename_all) = container_attrs.rename_all {
+            let name = rename_all.apply_to_variant(&variant.ident.to_string());
+            syn::LitStr::new(&name, variant.ident.span())
+        } else {
+            let name = &variant.ident;
+            syn::LitStr::new(&name.to_string(), name.span())
+        };
+
+        let field_attrs = EnumFieldAttributes::from_attributes(&mut variant.attrs);
+        let with_type_key = if let Some(key) = field_attrs.type_key() {
+            if section_config_attrs.is_none() {
+                error!(key => "type_key not allowed on a non-section-config enum");
+            }
+            quote_spanned!(key.span() => .with_type_key(#key))
+        } else {
+            TokenStream::new()
+        };
+
+        let checked_attrs = CheckedAttributes::from_slice(&variant.attrs);
+
+        type_enum.extend(quote_spanned! { variant.ident.span() =>
+            #checked_attrs
+            ::proxmox_schema::EnumEntry {
+                value: #variant_string,
+                description: #comment,
+            },
+        });
+
+        let variant_ident = &variant.ident;
+        let ty = &field.ty;
+        let variant_schema = build_variant_schema(variant_ident, ty, &container_attrs);
+        variants.push((
+            variant_string.value(),
+            quote_spanned! { variant.ident.span() =>
+                #checked_attrs
+                (#variant_string, #variant_schema),
+            },
+        ));
+        if let Some(section_config_attrs) = &section_config_attrs {
+            let id_property = &section_config_attrs.id_property;
+
+            register_sections.extend(quote_spanned! { variant.ident.span() =>
+                #checked_attrs
+                this.register_plugin(
+                    ::proxmox_section_config::SectionConfigPlugin::new(
+                        #variant_string.to_string(),
+                        Some(#id_property.to_string()),
+                        const {
+                            <#ty as ::proxmox_schema::ApiType>::API_SCHEMA
+                                .unwrap_any_object_schema()
+                        }
+                    )
+                    #with_type_key
+                );
+            });
+        }
+        to_type.extend(quote_spanned! { variant.ident.span() =>
+            #checked_attrs
+            Self::#variant_ident(_) => #variant_string,
+        });
+    }
+    variants.sort_by(|a, b| a.0.cmp(&b.0));
+    let variants = variants
+        .into_iter()
+        .map(|(_name, def)| def)
+        .collect::<TokenStream>();
+
+    let section_config_impl = match section_config_attrs {
+        None => TokenStream::new(),
+        Some(SectionConfigAttribs {
+            id_schema,
+            with_type_key,
+            id_property: _,
+        }) => {
+            quote_spanned! { name.span() =>
+                impl ::proxmox_section_config::typed::ApiSectionDataEntry for #name {
+                    const INTERNALLY_TAGGED: Option<&'static str> = Some(#tag);
+
+                    fn section_config() -> &'static ::proxmox_section_config::SectionConfig {
+                        static CONFIG: ::std::sync::OnceLock<::proxmox_section_config::SectionConfig> =
+                            ::std::sync::OnceLock::new();
+
+                        CONFIG.get_or_init(|| {
+                            const ID_SCHEMA: ::proxmox_schema::Schema = #id_schema.schema();
+                            let mut this = ::proxmox_section_config::SectionConfig::new(&ID_SCHEMA)
+                                #with_type_key;
+                            #register_sections
+                            this
+                        })
+                    }
+
+                    fn section_type(&self) -> &'static str {
+                        match self {
+                            #to_type
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    Ok(quote_spanned! { name.span() =>
+        #enum_ty
+
+        impl ::proxmox_schema::ApiType for #name {
+            const API_SCHEMA: ::proxmox_schema::Schema =
+                ::proxmox_schema::OneOfSchema::new(
+                    #description,
+                    &(
+                        #tag,
+                        false,
+                        &::proxmox_schema::StringSchema::new("Type of the object.")
+                            .format(&::proxmox_schema::ApiStringFormat::Enum(&[#type_enum]))
+                            .schema()
+                    ),
+                    &[#variants],
+                )
+                .schema();
+        }
+
+        #section_config_impl
+    })
+}
+
+fn build_variant_schema(
+    ident: &Ident,
+    ty: &syn::Type,
+    container_attrs: &serde::ContainerAttrib,
+) -> TokenStream {
+    if let Some(content) = &container_attrs.content {
+        let description = syn::LitStr::new(&format!("An instance of {ident}."), ident.span());
+        quote_spanned! { ident.span() =>
+            &::proxmox_schema::ObjectSchema::new(
+                #description,
+                &[(#content, false, &<#ty as ::proxmox_schema::ApiType>::API_SCHEMA)],
+            )
+            .schema()
+        }
+    } else {
+        quote_spanned! { ident.span() =>
+            &<#ty as ::proxmox_schema::ApiType>::API_SCHEMA
+        }
+    }
 }

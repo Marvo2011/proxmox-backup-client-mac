@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use pbs_datastore::dynamic_index::DynamicIndexReader;
 use pbs_datastore::file_formats::{DYNAMIC_SIZED_CHUNK_INDEX_1_0, FIXED_SIZED_CHUNK_INDEX_1_0};
-use pbs_datastore::fixed_index::FixedIndexReader;
+use pbs_datastore::fixed_index::{FIXED_CHUNK_SIZE, FixedIndexReader};
 use pbs_datastore::index::IndexFile;
 
 const HEADER_SIZE: usize = 4096;
@@ -55,7 +55,7 @@ fn test_dynamic_index_reader() {
 #[test]
 fn test_fixed_index_reader() {
     let count = 1000;
-    let chunk_size = 4096u64;
+    let chunk_size = FIXED_CHUNK_SIZE as u64;
     let mut header = vec![0u8; HEADER_SIZE];
     header[..8].copy_from_slice(&FIXED_SIZED_CHUNK_INDEX_1_0);
     header[64..72].copy_from_slice(&(count as u64 * chunk_size).to_le_bytes());

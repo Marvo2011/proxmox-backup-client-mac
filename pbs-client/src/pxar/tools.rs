@@ -2,32 +2,50 @@
 
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use anyhow::{bail, Context, Error};
+use anyhow::{Context, Error, bail, format_err};
 use nix::sys::stat::Mode;
 
-use pxar::{format::StatxTimestamp, mode, Entry, EntryKind, Metadata};
+use pathpatterns::MatchType;
+use pxar::accessor::ReadAt;
+use pxar::accessor::aio::{Accessor, Directory, FileEntry};
+use pxar::format::StatxTimestamp;
+use pxar::{Entry, EntryKind, Metadata, mode};
+
+use pbs_api_types::BackupArchiveName;
+use pbs_datastore::catalog::{ArchiveEntry, CatalogEntryType, DirEntryAttribute};
+
+use pbs_datastore::BackupManifest;
+use pbs_datastore::dynamic_index::{BufferedDynamicReader, LocalDynamicReadAt};
+use pbs_datastore::index::IndexFile;
+use pbs_tools::crypt_config::CryptConfig;
+use proxmox_log::{debug, info};
+
+use crate::{BackupReader, RemoteChunkReader};
 
 /// Get the file permissions as `nix::Mode`
-pub fn perms_from_metadata(meta: &Metadata) -> Result<Mode, Error> {
+pub(crate) fn perms_from_metadata(meta: &Metadata) -> Result<Mode, Error> {
     let mode = meta.stat.get_permission_bits();
 
     libc::mode_t::try_from(mode)
         .context("couldn't narrow permission bits")
         .and_then(|mode| {
             Mode::from_bits(mode)
-                .with_context(|| format!("mode contains illegal bits: 0x{:x} (0o{:o})", mode, mode))
+                .with_context(|| format!("mode contains illegal bits: 0x{mode:x} (0o{mode:o})"))
         })
 }
 
 /// Make sure path is relative and not '.' or '..'.
-pub fn assert_relative_path<S: AsRef<OsStr> + ?Sized>(path: &S) -> Result<(), Error> {
+pub(crate) fn assert_relative_path<S: AsRef<OsStr> + ?Sized>(path: &S) -> Result<(), Error> {
     assert_relative_path_do(Path::new(path))
 }
 
 /// Make sure path is a single component and not '.' or '..'.
-pub fn assert_single_path_component<S: AsRef<OsStr> + ?Sized>(path: &S) -> Result<(), Error> {
+pub(crate) fn assert_single_path_component<S: AsRef<OsStr> + ?Sized>(
+    path: &S,
+) -> Result<(), Error> {
     assert_single_path_component_do(Path::new(path))
 }
 
@@ -56,6 +74,35 @@ fn assert_single_path_component_do(path: &Path) -> Result<(), Error> {
     }
 
     Ok(())
+}
+
+pub fn normalize_lexically<S: AsRef<OsStr> + ?Sized>(path: &S) -> PathBuf {
+    // FIXME: Once std::path::normalize_lexically is stabilized we can
+    // switch to that
+    use std::path::Component;
+
+    let path = Path::new(path);
+    let has_trailing_slash = path
+        .as_os_str()
+        .as_encoded_bytes()
+        .ends_with(std::path::MAIN_SEPARATOR_STR.as_bytes());
+    let mut new = PathBuf::new();
+    let iter = path.components();
+    for component in iter {
+        match component {
+            Component::RootDir => new.push(Component::RootDir),
+            Component::Prefix(p) => new.push(Component::Prefix(p)),
+            Component::CurDir => continue,
+            Component::ParentDir => {
+                new.pop();
+            }
+            Component::Normal(n) => new.push(n),
+        };
+    }
+    if has_trailing_slash {
+        new.push("");
+    }
+    new
 }
 
 #[rustfmt::skip]
@@ -128,25 +175,42 @@ pub fn format_single_line_entry(entry: &Entry) -> String {
 
     let meta = entry.metadata();
 
-    let (size, link) = match entry.kind() {
-        EntryKind::File { size, .. } => (format!("{}", *size), String::new()),
-        EntryKind::Symlink(link) => ("0".to_string(), format!(" -> {:?}", link.as_os_str())),
-        EntryKind::Hardlink(link) => ("0".to_string(), format!(" -> {:?}", link.as_os_str())),
-        EntryKind::Device(dev) => (format!("{},{}", dev.major, dev.minor), String::new()),
-        _ => ("0".to_string(), String::new()),
+    let (size, link, payload_offset) = match entry.kind() {
+        EntryKind::File {
+            size,
+            payload_offset,
+            ..
+        } => (format!("{}", *size), String::new(), *payload_offset),
+        EntryKind::Symlink(link) => ("0".to_string(), format!(" -> {:?}", link.as_os_str()), None),
+        EntryKind::Hardlink(link) => ("0".to_string(), format!(" -> {:?}", link.as_os_str()), None),
+        EntryKind::Device(dev) => (format!("{},{}", dev.major, dev.minor), String::new(), None),
+        _ => ("0".to_string(), String::new(), None),
     };
 
     let owner_string = format!("{}/{}", meta.stat.uid, meta.stat.gid);
 
-    format!(
-        "{} {:<13} {} {:>8} {:?}{}",
-        mode_string,
-        owner_string,
-        format_mtime(&meta.stat.mtime),
-        size,
-        entry.path(),
-        link,
-    )
+    if let Some(offset) = payload_offset {
+        format!(
+            "{} {:<13} {} {:>8} {:?}{} {}",
+            mode_string,
+            owner_string,
+            format_mtime(&meta.stat.mtime),
+            size,
+            entry.path(),
+            link,
+            offset,
+        )
+    } else {
+        format!(
+            "{} {:<13} {} {:>8} {:?}{}",
+            mode_string,
+            owner_string,
+            format_mtime(&meta.stat.mtime),
+            size,
+            entry.path(),
+            link,
+        )
+    }
 }
 
 pub fn format_multi_line_entry(entry: &Entry) -> String {
@@ -155,6 +219,12 @@ pub fn format_multi_line_entry(entry: &Entry) -> String {
     let meta = entry.metadata();
 
     let (size, link, type_name) = match entry.kind() {
+        EntryKind::Version(version) => (format!("{version:?}"), String::new(), "version"),
+        EntryKind::Prelude(prelude) => (
+            "0".to_string(),
+            format!("raw data: {:?} bytes", prelude.data.len()),
+            "prelude",
+        ),
         EntryKind::File { size, .. } => (format!("{}", *size), String::new(), "file"),
         EntryKind::Symlink(link) => (
             "0".to_string(),
@@ -203,4 +273,215 @@ pub fn format_multi_line_entry(entry: &Entry) -> String {
         meta.stat.gid,
         format_mtime(&meta.stat.mtime),
     )
+}
+
+/// Look up the directory entries of the given directory `path` in a pxar archive via it's given
+/// `accessor` and return the entries formatted as [`ArchiveEntry`]'s, compatible with reading
+/// entries from the catalog.
+///
+/// If the optional `path_prefix` is given, all returned entry paths will be prefixed with it.
+pub async fn pxar_metadata_catalog_lookup<T: Clone + ReadAt>(
+    accessor: Accessor<T>,
+    path: &OsStr,
+    path_prefix: Option<&str>,
+) -> Result<Vec<ArchiveEntry>, Error> {
+    let root = accessor.open_root().await?;
+    let dir_entry = root
+        .lookup(&path)
+        .await
+        .map_err(|err| format_err!("lookup failed - {err}"))?
+        .ok_or_else(|| format_err!("lookup failed - error opening '{path:?}'"))?;
+
+    let mut entries = Vec::new();
+    if let EntryKind::Directory = dir_entry.kind() {
+        let dir_entry = dir_entry
+            .enter_directory()
+            .await
+            .map_err(|err| format_err!("failed to enter directory - {err}"))?;
+
+        let mut entries_iter = dir_entry.read_dir();
+        while let Some(entry) = entries_iter.next().await {
+            let entry = entry?.decode_entry().await?;
+
+            let entry_attr = match DirEntryAttribute::try_from(&entry) {
+                Ok(attr) => attr,
+                Err(_) => continue,
+            };
+
+            let entry_path = crate::pxar::tools::entry_path_with_prefix(&entry, path_prefix);
+            entries.push(ArchiveEntry::new(
+                entry_path.as_os_str().as_bytes(),
+                Some(&entry_attr),
+            ));
+        }
+    } else {
+        bail!(format!(
+            "expected directory entry, got entry kind '{:?}'",
+            dir_entry.kind()
+        ));
+    }
+
+    Ok(entries)
+}
+
+/// Decode possible format version and prelude entries before getting the root directory
+/// entry.
+///
+/// Returns the root directory entry and, if present, the prelude entry
+pub fn handle_root_with_optional_format_version_prelude<R: pxar::decoder::SeqRead>(
+    decoder: &mut pxar::decoder::sync::Decoder<R>,
+) -> Result<(pxar::Entry, Option<pxar::Entry>), Error> {
+    let first = decoder
+        .next()
+        .ok_or_else(|| format_err!("missing root entry"))??;
+    match first.kind() {
+        pxar::EntryKind::Directory => {
+            let version = pxar::format::FormatVersion::Version1;
+            debug!("pxar format version '{version:?}'");
+            Ok((first, None))
+        }
+        pxar::EntryKind::Version(version) => {
+            debug!("pxar format version '{version:?}'");
+            let second = decoder
+                .next()
+                .ok_or_else(|| format_err!("missing root entry"))??;
+            match second.kind() {
+                pxar::EntryKind::Directory => Ok((second, None)),
+                pxar::EntryKind::Prelude(_prelude) => {
+                    let third = decoder
+                        .next()
+                        .ok_or_else(|| format_err!("missing root entry"))??;
+                    Ok((third, Some(second)))
+                }
+                _ => bail!("unexpected entry kind {:?}", second.kind()),
+            }
+        }
+        _ => bail!("unexpected entry kind {:?}", first.kind()),
+    }
+}
+
+pub async fn get_remote_pxar_reader(
+    archive_name: &BackupArchiveName,
+    client: Arc<BackupReader>,
+    manifest: &BackupManifest,
+    crypt_config: Option<Arc<CryptConfig>>,
+) -> Result<(LocalDynamicReadAt<RemoteChunkReader>, u64), Error> {
+    let index = client
+        .download_dynamic_index(manifest, archive_name)
+        .await?;
+    let most_used = index.find_most_used_chunks(8);
+
+    let file_info = manifest.lookup_file_info(archive_name)?;
+    let chunk_reader = RemoteChunkReader::new(
+        client.clone(),
+        crypt_config,
+        file_info.chunk_crypt_mode(),
+        most_used,
+    );
+
+    let reader = BufferedDynamicReader::new(index, chunk_reader);
+    let archive_size = reader.archive_size();
+
+    Ok((LocalDynamicReadAt::new(reader), archive_size))
+}
+
+/// Generate entry path for given [`FileEntry`], prefixed by given `path_prefix` component(s).
+pub(crate) fn entry_path_with_prefix<T: Clone + ReadAt>(
+    entry: &FileEntry<T>,
+    path_prefix: Option<&str>,
+) -> PathBuf {
+    if let Some(prefix) = path_prefix {
+        let mut entry_path = PathBuf::from(prefix);
+        match entry.path().strip_prefix("/") {
+            Ok(path) => entry_path.push(path),
+            Err(_) => entry_path.push(entry.path()),
+        }
+        entry_path
+    } else {
+        PathBuf::from(entry.path())
+    }
+}
+
+/// Read a sorted list of pxar archive entries from given parent entry via the pxar accessor.
+pub(crate) async fn pxar_metadata_read_dir<T: Clone + Send + Sync + ReadAt>(
+    parent_dir: Directory<T>,
+) -> Result<Vec<FileEntry<T>>, Error> {
+    let mut entries_iter = parent_dir.read_dir();
+    let mut entries = Vec::new();
+    while let Some(entry) = entries_iter.next().await {
+        let entry = entry?.decode_entry().await?;
+        entries.push(entry);
+    }
+    entries.sort_unstable_by(|a, b| a.path().cmp(b.path()));
+    Ok(entries)
+}
+
+/// Recursively iterate over pxar archive entries and dump them using the same format used to dump
+/// entries from a catalog.
+pub async fn pxar_metadata_catalog_dump_dir<T: Clone + Send + Sync + ReadAt>(
+    parent_dir: Directory<T>,
+    path_prefix: Option<&str>,
+) -> Result<(), Error> {
+    let entries = pxar_metadata_read_dir(parent_dir).await?;
+    for entry in entries {
+        let entry_path = entry_path_with_prefix(&entry, path_prefix);
+
+        Box::pin(async move {
+            if let Ok(attr) = DirEntryAttribute::try_from(&entry) {
+                let etype = CatalogEntryType::from(&attr);
+                match attr {
+                    DirEntryAttribute::File { size, mtime } => {
+                        let mut mtime_string = mtime.to_string();
+                        if let Ok(s) = proxmox_time::strftime_local("%FT%TZ", mtime) {
+                            mtime_string = s;
+                        }
+                        info!("{etype} {entry_path:?} {size} {mtime_string}");
+                    }
+                    DirEntryAttribute::Directory { .. } => {
+                        info!("{etype} {entry_path:?}");
+                        let dir = entry.enter_directory().await?;
+                        pxar_metadata_catalog_dump_dir(dir, path_prefix).await?;
+                    }
+                    _ => info!("{etype} {entry_path:?}"),
+                }
+            }
+
+            Ok::<(), Error>(())
+        })
+        .await?;
+    }
+    Ok(())
+}
+
+/// Recursively iterate over pxar archive entries and call the callback on entries matching the
+/// match patterns.
+pub async fn pxar_metadata_catalog_find<'future, T: Clone + Send + Sync + ReadAt + 'future>(
+    parent_dir: Directory<T>,
+    match_list: &'future (impl pathpatterns::MatchList<'future> + Sync),
+    callback: &'future (dyn Fn(&[u8]) -> Result<(), Error> + Send + Sync),
+) -> Result<(), Error> {
+    let entries = pxar_metadata_read_dir(parent_dir).await?;
+    for entry in entries {
+        Box::pin(async move {
+            let file_mode = entry.metadata().file_type() as u32;
+            let entry_path = entry_path_with_prefix(&entry, Some("/"))
+                .as_os_str()
+                .to_owned();
+
+            match match_list.matches(entry_path.as_bytes(), file_mode) {
+                Ok(Some(MatchType::Exclude)) => return Ok::<(), Error>(()),
+                Ok(Some(MatchType::Include)) => callback(entry_path.as_bytes())?,
+                _ => (),
+            }
+
+            if let EntryKind::Directory = entry.kind() {
+                let dir_entry = entry.enter_directory().await?;
+                pxar_metadata_catalog_find(dir_entry, match_list, callback).await?;
+            }
+
+            Ok(())
+        })
+        .await?;
+    }
+    Ok(())
 }

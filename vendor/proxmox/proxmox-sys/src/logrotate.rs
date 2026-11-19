@@ -1,14 +1,14 @@
 //! Log rotation helper
 
-use std::fs::{rename, File};
+use std::fs::{File, rename};
 use std::io::Read;
 use std::os::unix::io::{FromRawFd, IntoRawFd};
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Error};
+use anyhow::{Error, bail};
 use nix::unistd;
 
-use crate::fs::{make_tmp_file, CreateOptions};
+use crate::fs::{CreateOptions, make_tmp_file};
 
 /// Used for rotating log files and iterating over them
 pub struct LogRotate {
@@ -64,7 +64,7 @@ impl LogRotate {
         options: &CreateOptions,
     ) -> Result<(), Error> {
         let mut source = File::open(source_path)?;
-        let (fd, tmp_path) = make_tmp_file(target_path, options.clone())?;
+        let (fd, tmp_path) = make_tmp_file(target_path, *options)?;
         let target = unsafe { File::from_raw_fd(fd.into_raw_fd()) };
         let mut encoder = match zstd::stream::write::Encoder::new(target, 0) {
             Ok(encoder) => encoder,

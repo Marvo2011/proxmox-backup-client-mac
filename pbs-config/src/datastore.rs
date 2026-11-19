@@ -1,17 +1,17 @@
-use anyhow::Error;
-use lazy_static::lazy_static;
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
+use anyhow::Error;
+
+use proxmox_product_config::replace_privileged_config;
 use proxmox_schema::{AllOfSchema, ApiType};
 use proxmox_section_config::{SectionConfig, SectionConfigData, SectionConfigPlugin};
 
-use pbs_api_types::{DataStoreConfig, DATASTORE_SCHEMA};
+use pbs_api_types::{DATASTORE_SCHEMA, DataStoreConfig, DatastoreBackendConfig, DatastoreTuning};
 
-use crate::{open_backup_lockfile, replace_backup_config, BackupLockGuard, ConfigVersionCache};
+use crate::{BackupLockGuard, ConfigVersionCache, open_backup_lockfile};
 
-lazy_static! {
-    pub static ref CONFIG: SectionConfig = init();
-}
+pub static CONFIG: LazyLock<SectionConfig> = LazyLock::new(init);
 
 fn init() -> SectionConfig {
     const OBJ_SCHEMA: &AllOfSchema = DataStoreConfig::API_SCHEMA.unwrap_all_of_schema();
@@ -46,7 +46,7 @@ pub fn config() -> Result<(SectionConfigData, [u8; 32]), Error> {
 
 pub fn save_config(config: &SectionConfigData) -> Result<(), Error> {
     let raw = CONFIG.write(DATASTORE_CFG_FILENAME, config)?;
-    replace_backup_config(DATASTORE_CFG_FILENAME, raw.as_bytes())?;
+    replace_privileged_config(DATASTORE_CFG_FILENAME, raw.as_bytes())?;
 
     // used in pbs-datastore
     let version_cache = ConfigVersionCache::new()?;
@@ -63,6 +63,20 @@ pub fn complete_datastore_name(_arg: &str, _param: &HashMap<String, String>) -> 
     }
 }
 
+pub fn complete_removable_datastore_name(
+    _arg: &str,
+    _param: &HashMap<String, String>,
+) -> Vec<String> {
+    match config() {
+        Ok((data, _digest)) => data
+            .sections
+            .into_iter()
+            .filter_map(|(name, (_, c))| c.get("backing-device").map(|_| name))
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
 pub fn complete_acl_path(_arg: &str, _param: &HashMap<String, String>) -> Vec<String> {
     let mut list = vec![
         String::from("/"),
@@ -72,7 +86,7 @@ pub fn complete_acl_path(_arg: &str, _param: &HashMap<String, String>) -> Vec<St
 
     if let Ok((data, _digest)) = config() {
         for id in data.sections.keys() {
-            list.push(format!("/datastore/{}", id));
+            list.push(format!("/datastore/{id}"));
         }
     }
 
@@ -99,4 +113,22 @@ pub fn complete_calendar_event(_arg: &str, _param: &HashMap<String, String>) -> 
         .iter()
         .map(|s| String::from(*s))
         .collect()
+}
+
+/// Parse the backend configuration from a datastore config.
+pub fn parse_backend_config(config: &DataStoreConfig) -> Result<DatastoreBackendConfig, Error> {
+    config.backend.as_deref().unwrap_or("").parse()
+}
+
+/// Parse the datastore tuning options from a datastore config.
+pub fn parse_datastore_tuning_options(config: &DataStoreConfig) -> Result<DatastoreTuning, Error> {
+    config.tuning.as_deref().unwrap_or("").parse()
+}
+
+/// Returns the datastore backend type from its name.
+pub fn datastore_backend_type(store: &str) -> Result<pbs_api_types::DatastoreBackendType, Error> {
+    let (config, _) = self::config()?;
+    let store_config: DataStoreConfig = config.lookup("datastore", store)?;
+
+    Ok(parse_backend_config(&store_config)?.ty.unwrap_or_default())
 }

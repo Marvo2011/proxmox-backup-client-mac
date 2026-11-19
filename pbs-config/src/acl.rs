@@ -2,37 +2,37 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, LazyLock, RwLock};
 
-use anyhow::{bail, Error};
+use anyhow::{Error, bail};
 
-use lazy_static::lazy_static;
-
+use proxmox_product_config::replace_privileged_config;
 use proxmox_schema::{ApiStringFormat, ApiType, Schema, StringSchema};
 
-use pbs_api_types::{Authid, Role, Userid, ROLE_NAME_NO_ACCESS};
+use pbs_api_types::{Authid, ROLE_NAME_NO_ACCESS, Role, Userid};
 
-use crate::{open_backup_lockfile, replace_backup_config, BackupLockGuard};
+use crate::{BackupLockGuard, ConfigVersionCache, open_backup_lockfile};
 
-lazy_static! {
-    /// Map of pre-defined [Roles](Role) to their associated [privileges](PRIVILEGES) combination
-    /// and description.
-    pub static ref ROLE_NAMES: HashMap<&'static str, (u64, &'static str)> = {
-        let mut map = HashMap::new();
+/// Map of pre-defined [Roles](Role) to their associated
+/// [privileges](pbs_api_types::PRIVILEGES) combination and description.
+pub static ROLE_NAMES: LazyLock<HashMap<&'static str, (u64, &'static str)>> = LazyLock::new(|| {
+    let mut map = HashMap::new();
 
-        let list = match Role::API_SCHEMA {
-            Schema::String(StringSchema { format: Some(ApiStringFormat::Enum(list)), .. }) => list,
-            _ => unreachable!(),
-        };
-
-        for entry in list.iter() {
-            let privs: u64 = Role::from_str(entry.value).unwrap() as u64;
-            map.insert(entry.value, (privs, entry.description));
-        }
-
-        map
+    let list = match Role::API_SCHEMA {
+        Schema::String(StringSchema {
+            format: Some(ApiStringFormat::Enum(list)),
+            ..
+        }) => list,
+        _ => unreachable!(),
     };
-}
+
+    for entry in list.iter() {
+        let privs: u64 = Role::from_str(entry.value).unwrap() as u64;
+        map.insert(entry.value, (privs, entry.description));
+    }
+
+    map
+});
 
 pub fn split_acl_path(path: &str) -> Vec<&str> {
     let items = path.split('/');
@@ -81,17 +81,14 @@ pub fn check_acl_path(path: &str) -> Result<(), Error> {
             }
         }
         "datastore" => {
-            // /datastore/{store}
-            if components_len <= 2 {
-                return Ok(());
-            }
-            if components_len > 2 && components_len <= 2 + pbs_api_types::MAX_NAMESPACE_DEPTH {
+            // /datastore/{store}/{namespace}
+            if components_len <= 2 + pbs_api_types::MAX_NAMESPACE_DEPTH {
                 return Ok(());
             }
         }
         "remote" => {
-            // /remote/{remote}/{store}
-            if components_len <= 3 {
+            // /remote/{remote}/{store}/{namespace}
+            if components_len <= 3 + pbs_api_types::MAX_NAMESPACE_DEPTH {
                 return Ok(());
             }
         }
@@ -129,6 +126,12 @@ pub fn check_acl_path(path: &str) -> Result<(), Error> {
                             }
                         }
                         _ => {}
+                    }
+                }
+                "s3-endpoint" | "encryption-keys" => {
+                    // /system/<matched-component>/{id}
+                    if components_len <= 3 {
+                        return Ok(());
                     }
                 }
                 _ => {}
@@ -346,10 +349,7 @@ impl AclTree {
         let mut node = &self.root;
         for outer in path {
             for comp in outer.split('/') {
-                node = match node.children.get(comp) {
-                    Some(n) => n,
-                    None => return None,
-                };
+                node = node.children.get(comp)?;
             }
         }
         Some(node)
@@ -359,10 +359,7 @@ impl AclTree {
         let mut node = &mut self.root;
         for outer in path {
             for comp in outer.split('/') {
-                node = match node.children.get_mut(comp) {
-                    Some(n) => n,
-                    None => return None,
-                };
+                node = node.children.get_mut(comp)?;
             }
         }
         Some(node)
@@ -453,7 +450,7 @@ impl AclTree {
 
         for (auth_id, roles) in &node.users {
             // no need to save, because root is always 'Administrator'
-            if !auth_id.is_token() && auth_id.user() == "root@pam" {
+            if !auth_id.is_token() && auth_id.user() == Userid::root_userid() {
                 continue;
             }
             for (role, propagate) in roles {
@@ -469,7 +466,7 @@ impl AclTree {
 
         for (group, roles) in &node.groups {
             for (role, propagate) in roles {
-                let group = format!("@{}", group);
+                let group = format!("@{group}");
                 if *propagate {
                     role_ug_map1.entry(role).or_default().insert(group);
                 } else {
@@ -537,7 +534,7 @@ impl AclTree {
         }
 
         for (name, child) in node.children.iter() {
-            let child_path = format!("{}/{}", path, name);
+            let child_path = format!("{path}/{name}");
             Self::write_node_config(child, &child_path, w)?;
         }
 
@@ -650,8 +647,8 @@ impl AclTree {
     /// - iterate over all intermediate nodes along `path` and collect roles with `propagate` set
     /// - get all (propagating and non-propagating) roles for last component of path
     /// - more specific role maps replace less specific role maps
-    /// -- user/token is more specific than group at each level
-    /// -- roles lower in the tree are more specific than those higher up along the path
+    ///   -- user/token is more specific than group at each level
+    ///   -- roles lower in the tree are more specific than those higher up along the path
     pub fn roles(&self, auth_id: &Authid, path: &[&str]) -> HashMap<String, bool> {
         let mut node = &self.root;
         let mut role_map = node.extract_roles(auth_id, path.is_empty());
@@ -722,13 +719,13 @@ pub fn cached_config() -> Result<Arc<AclTree>, Error> {
         last_mtime_nsec: i64,
     }
 
-    lazy_static! {
-        static ref CACHED_CONFIG: RwLock<ConfigCache> = RwLock::new(ConfigCache {
+    static CACHED_CONFIG: LazyLock<RwLock<ConfigCache>> = LazyLock::new(|| {
+        RwLock::new(ConfigCache {
             data: None,
             last_mtime: 0,
-            last_mtime_nsec: 0
-        });
-    }
+            last_mtime_nsec: 0,
+        })
+    });
 
     let stat = match nix::sys::stat::stat(ACL_CFG_FILENAME) {
         Ok(stat) => Some(stat),
@@ -771,7 +768,14 @@ pub fn save_config(acl: &AclTree) -> Result<(), Error> {
 
     acl.write_config(&mut raw)?;
 
-    replace_backup_config(ACL_CFG_FILENAME, &raw)
+    replace_privileged_config(ACL_CFG_FILENAME, &raw)?;
+
+    // increase acl version
+    // We use this in CachedUserInfo
+    let version_cache = ConfigVersionCache::new()?;
+    version_cache.increase_acl_cache_generation();
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -793,8 +797,7 @@ mod test {
 
         assert_eq!(
             roles, expected_roles,
-            "\nat check_roles for '{}' on '{}'",
-            auth_id, path
+            "\nat check_roles for '{auth_id}' on '{path}'"
         );
     }
 
@@ -945,9 +948,10 @@ acl:1:/storage/store1:user1@pbs:DatastoreBackup
         );
 
         // user2 has no privileges under "/store/store2/store3" --> return empty
-        assert!(tree
-            .get_child_paths(&user2, &["store", "store2", "store3"],)?
-            .is_empty());
+        assert!(
+            tree.get_child_paths(&user2, &["store", "store2", "store3"],)?
+                .is_empty()
+        );
 
         // user2 has DatastoreReader privileges under "/store/store2/store31" --> return paths
         let paths = tree.get_child_paths(&user2, &["store/store2/store31"])?;
@@ -956,15 +960,17 @@ acl:1:/storage/store1:user1@pbs:DatastoreBackup
         );
 
         // user2 has no privileges under "/store/store2/foo/bar/baz"
-        assert!(tree
-            .get_child_paths(&user2, &["store", "store2", "foo/bar/baz"])?
-            .is_empty());
+        assert!(
+            tree.get_child_paths(&user2, &["store", "store2", "foo/bar/baz"])?
+                .is_empty()
+        );
 
         // user2 has DatastoreReader privileges on "/store/store2/store31/store4/store6", but not
         // on any child paths --> return empty
-        assert!(tree
-            .get_child_paths(&user2, &["store/store2/store31/store4/store6"],)?
-            .is_empty());
+        assert!(
+            tree.get_child_paths(&user2, &["store/store2/store31/store4/store6"],)?
+                .is_empty()
+        );
 
         Ok(())
     }
@@ -1047,14 +1053,14 @@ acl:1:/storage/store1:user1@pbs:DatastoreBackup
             let node = tree.find_node(path);
             assert!(node.is_some());
             if let Some(node) = node {
-                assert!(node.users.get(&user1).is_none());
+                assert!(!node.users.contains_key(&user1));
             }
         }
         for path in &user2_paths {
             let node = tree.find_node(path);
             assert!(node.is_some());
             if let Some(node) = node {
-                assert!(node.users.get(&user2).is_some());
+                assert!(node.users.contains_key(&user2));
             }
         }
 
@@ -1064,7 +1070,7 @@ acl:1:/storage/store1:user1@pbs:DatastoreBackup
             let node = tree.find_node(path);
             assert!(node.is_some());
             if let Some(node) = node {
-                assert!(node.users.get(&user2).is_none());
+                assert!(!node.users.contains_key(&user2));
             }
         }
 

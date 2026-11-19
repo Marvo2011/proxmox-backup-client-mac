@@ -1,13 +1,14 @@
 [package]
 name = "proxmox-shared-memory"
-version = "0.3.0"
+description = "Shared memory helpers and shared mutex implementation"
+version = "1.0.2"
+
 authors.workspace = true
 edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Shared memory helpers and shared mutex implementation"
-
-exclude.workspace = true
 
 [dependencies]
 anyhow.workspace = true

@@ -1,9 +1,9 @@
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, LazyLock, RwLock};
 
-use anyhow::{bail, Error};
-use lazy_static::lazy_static;
+use anyhow::{Error, bail};
 
+use proxmox_product_config::replace_privileged_config;
 use proxmox_schema::*;
 use proxmox_section_config::{SectionConfig, SectionConfigData, SectionConfigPlugin};
 
@@ -11,11 +11,9 @@ use pbs_api_types::{ApiToken, Authid, User, Userid};
 
 use crate::ConfigVersionCache;
 
-use crate::{open_backup_lockfile, replace_backup_config, BackupLockGuard};
+use crate::{BackupLockGuard, open_backup_lockfile};
 
-lazy_static! {
-    pub static ref CONFIG: SectionConfig = init();
-}
+pub static CONFIG: LazyLock<SectionConfig> = LazyLock::new(init);
 
 fn init() -> SectionConfig {
     let mut config = SectionConfig::new(&Authid::API_SCHEMA);
@@ -56,8 +54,9 @@ pub fn config() -> Result<(SectionConfigData, [u8; 32]), Error> {
 
     let digest = openssl::sha::sha256(content.as_bytes());
     let mut data = CONFIG.parse(USER_CFG_FILENAME, &content)?;
+    let root_user = Userid::root_userid().as_str();
 
-    if data.sections.get("root@pam").is_none() {
+    if !data.sections.contains_key(root_user) {
         let user: User = User {
             userid: Userid::root_userid().clone(),
             comment: Some("Superuser".to_string()),
@@ -67,7 +66,7 @@ pub fn config() -> Result<(SectionConfigData, [u8; 32]), Error> {
             lastname: None,
             email: None,
         };
-        data.set_data("root@pam", "user", &user).unwrap();
+        data.set_data(root_user, "user", &user).unwrap();
     }
 
     Ok((data, digest))
@@ -80,13 +79,13 @@ pub fn cached_config() -> Result<Arc<SectionConfigData>, Error> {
         last_mtime_nsec: i64,
     }
 
-    lazy_static! {
-        static ref CACHED_CONFIG: RwLock<ConfigCache> = RwLock::new(ConfigCache {
+    static CACHED_CONFIG: LazyLock<RwLock<ConfigCache>> = LazyLock::new(|| {
+        RwLock::new(ConfigCache {
             data: None,
             last_mtime: 0,
-            last_mtime_nsec: 0
-        });
-    }
+            last_mtime_nsec: 0,
+        })
+    });
 
     let stat = match nix::sys::stat::stat(USER_CFG_FILENAME) {
         Ok(stat) => Some(stat),
@@ -124,7 +123,7 @@ pub fn cached_config() -> Result<Arc<SectionConfigData>, Error> {
 
 pub fn save_config(config: &SectionConfigData) -> Result<(), Error> {
     let raw = CONFIG.write(USER_CFG_FILENAME, config)?;
-    replace_backup_config(USER_CFG_FILENAME, raw.as_bytes())?;
+    replace_privileged_config(USER_CFG_FILENAME, raw.as_bytes())?;
 
     // increase user version
     // We use this in CachedUserInfo

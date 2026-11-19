@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use anyhow::{bail, Error};
+use anyhow::{Error, bail};
 
 pub struct ConfigVersionCache {
     _private: (),
@@ -32,6 +32,26 @@ impl ConfigVersionCache {
     }
 
     pub fn increase_datastore_generation(&self) -> usize {
+        unreachable!()
+    }
+
+    pub fn datastore_generation(&self) -> usize {
+        unreachable!()
+    }
+
+    pub fn token_shadow_generation(&self) -> usize {
+        unreachable!()
+    }
+
+    pub fn increase_token_shadow_generation(&self) -> usize {
+        unreachable!()
+    }
+
+    pub fn acl_cache_generation(&self) -> usize {
+        unreachable!()
+    }
+
+    pub fn increase_acl_cache_generation(&self) {
         unreachable!()
     }
 }

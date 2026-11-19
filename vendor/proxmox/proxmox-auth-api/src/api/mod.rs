@@ -1,12 +1,12 @@
 use std::future::Future;
 use std::net::IpAddr;
 use std::pin::Pin;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
-use anyhow::{format_err, Error};
+use anyhow::{Error, format_err};
 use percent_encoding::percent_decode_str;
 
-use proxmox_rest_server::{extract_cookie, AuthError};
+use proxmox_rest_server::{AuthError, extract_cookie};
 use proxmox_tfa::api::{OpenUserChallengeData, TfaConfig};
 
 use crate::auth_key::{HMACKey, Keyring};
@@ -18,7 +18,10 @@ mod ticket;
 use crate::ticket::Ticket;
 use access::verify_csrf_prevention_token;
 
-pub use access::{assemble_csrf_prevention_token, create_ticket, API_METHOD_CREATE_TICKET};
+pub use access::{
+    API_METHOD_CREATE_TICKET, API_METHOD_CREATE_TICKET_HTTP_ONLY, API_METHOD_LOGOUT,
+    API_METHOD_VERIFY_VNC_TICKET, assemble_csrf_prevention_token, create_ticket, verify_vnc_ticket,
+};
 pub use ticket::{ApiTicket, PartialTicket};
 
 /// Authentication realms are used to manage users: authenticate, change password or remove.
@@ -63,7 +66,7 @@ pub trait AuthContext: Send + Sync {
     /// Access the TFA config with an exclusive lock.
     fn tfa_config_write_lock(&self) -> Result<Box<dyn LockedTfaConfig>, Error>;
 
-    /// Check if a userid is enabled and return a [`UserInformation`] handle.
+    /// Check if a userid is enabled.
     fn auth_id_is_active(&self, auth_id: &Authid) -> Result<bool, Error>;
 
     /// CSRF prevention token secret data.
@@ -75,14 +78,24 @@ pub trait AuthContext: Send + Sync {
     /// Check path based tickets. (Used for terminal tickets).
     fn check_path_ticket(
         &self,
-        userid: &Userid,
+        auth_id: &Authid,
         password: &str,
         path: String,
         privs: String,
         port: u16,
     ) -> Result<Option<bool>, Error> {
-        let _ = (userid, password, path, privs, port);
+        let _ = (auth_id, password, path, privs, port);
         Ok(None)
+    }
+
+    /// The auth cookie with a prefix. Usually this will be `__Host-`. However, products that don't
+    /// want a prefix or need a different one such as `__Secure-` should override the default
+    /// implementation.
+    ///
+    /// See: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Set-Cookie#cookie_prefixes>
+    fn prefixed_auth_cookie_name(&self) -> &'static str {
+        static HOST_COOKIE: OnceLock<String> = OnceLock::new();
+        HOST_COOKIE.get_or_init(|| format!("__Host-{}", self.auth_cookie_name()))
     }
 }
 
@@ -108,11 +121,7 @@ pub fn set_auth_context(auth_context: &'static dyn AuthContext) {
 }
 
 fn auth_context() -> Result<&'static dyn AuthContext, Error> {
-    AUTH_CONTEXT
-        .lock()
-        .unwrap()
-        .clone()
-        .ok_or_else(|| format_err!("no realm access configured"))
+    (*AUTH_CONTEXT.lock().unwrap()).ok_or_else(|| format_err!("no realm access configured"))
 }
 
 struct UserAuthData {
@@ -197,16 +206,34 @@ fn extract_auth_data(
     auth_context: &dyn AuthContext,
     headers: &http::HeaderMap,
 ) -> Option<AuthData> {
-    if let Some(raw_cookie) = headers.get(http::header::COOKIE) {
-        if let Ok(cookie) = raw_cookie.to_str() {
-            if let Some(ticket) = extract_cookie(cookie, auth_context.auth_cookie_name()) {
-                let csrf_token = match headers.get("CSRFPreventionToken").map(|v| v.to_str()) {
-                    Some(Ok(v)) => Some(v.to_owned()),
-                    _ => None,
-                };
-                return Some(AuthData::User(UserAuthData { ticket, csrf_token }));
-            }
+    let mut ticket = None;
+    let cookie_name = auth_context.auth_cookie_name();
+    let host_cookie = auth_context.prefixed_auth_cookie_name();
+    let cookies = headers
+        .get_all(http::header::COOKIE)
+        .iter()
+        .filter_map(|c| c.to_str().ok());
+
+    for cookie in cookies {
+        // check if we got a `__Host-` prefixed cookie first and break the loop if we do so we use
+        // that cookie.
+        if let Some(extracted_ticket) = extract_cookie(cookie, host_cookie) {
+            ticket = Some(extracted_ticket);
+            break;
+        // if no such prefixed cookie exists, try to fall back to a non-prefixed one
+        // TODO: remove this once we do not support less secure non-prefixed cookies anymore
+        } else if let Some(extracted_ticket) = extract_cookie(cookie, cookie_name) {
+            ticket = Some(extracted_ticket)
         }
+    }
+
+    if let Some(ticket) = ticket {
+        let csrf_token = match headers.get("CSRFPreventionToken").map(|v| v.to_str()) {
+            Some(Ok(v)) => Some(v.to_owned()),
+            _ => None,
+        };
+
+        return Some(AuthData::User(UserAuthData { ticket, csrf_token }));
     }
 
     let token_prefix = auth_context.auth_token_prefix();

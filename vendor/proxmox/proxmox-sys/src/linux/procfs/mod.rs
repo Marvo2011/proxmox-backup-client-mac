@@ -5,11 +5,10 @@ use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
-use std::sync::RwLock;
+use std::sync::{LazyLock, RwLock};
 use std::time::Instant;
 
-use anyhow::{bail, format_err, Error};
-use lazy_static::lazy_static;
+use anyhow::{Error, bail, format_err};
 use nix::unistd::Pid;
 use serde::Serialize;
 
@@ -21,15 +20,13 @@ pub use mountinfo::MountInfo;
 
 /// POSIX sysconf call
 pub fn sysconf(name: i32) -> i64 {
-    extern "C" {
+    unsafe extern "C" {
         fn sysconf(name: i32) -> i64;
     }
     unsafe { sysconf(name) }
 }
 
-lazy_static! {
-    pub static ref CLOCK_TICKS: f64 = sysconf(libc::_SC_CLK_TCK) as f64;
-}
+pub static CLOCK_TICKS: LazyLock<f64> = LazyLock::new(|| sysconf(libc::_SC_CLK_TCK) as f64);
 
 /// Selected contents of the `/proc/PID/stat` file.
 pub struct PidStat {
@@ -48,8 +45,7 @@ impl PidStat {
     /// Retrieve the `stat` file contents of a process.
     pub fn read_from_pid(pid: Pid) -> Result<Self, Error> {
         let stat = Self::parse(std::str::from_utf8(&std::fs::read(format!(
-            "/proc/{}/stat",
-            pid
+            "/proc/{pid}/stat"
         ))?)?)?;
         if stat.pid != pid {
             bail!(
@@ -223,19 +219,18 @@ pub struct ProcFsStat {
     pub iowait_percent: f64,
 }
 
-lazy_static! {
-    static ref PROC_LAST_STAT: RwLock<(ProcFsStat, Instant, bool)> =
-        RwLock::new((ProcFsStat::default(), Instant::now(), true));
-}
+static PROC_LAST_STAT: LazyLock<RwLock<(ProcFsStat, Instant, bool)>> =
+    LazyLock::new(|| RwLock::new((ProcFsStat::default(), Instant::now(), true)));
 
 /// reads `/proc/stat`. For now only total host CPU usage is handled as the
 /// other metrics are not really interesting
 pub fn read_proc_stat() -> Result<ProcFsStat, Error> {
     let sample_time = Instant::now();
     let update_duration;
-    let mut stat =
-        parse_proc_stat(unsafe { std::str::from_utf8_unchecked(&std::fs::read("/proc/stat")?) })
-            .unwrap();
+    let mut stat = {
+        let bytes = std::fs::read("/proc/stat")?;
+        parse_proc_stat(unsafe { std::str::from_utf8_unchecked(&bytes) }).unwrap()
+    };
 
     {
         // read lock scope
@@ -409,23 +404,44 @@ fn test_read_proc_stat() {
 }
 
 #[derive(Debug, Serialize)]
+/// Memory stats relevant for Proxmox projects.
+///
+/// NOTE: Unlike the name would suggest this is not a 1:1 representation of /proc/meminfo and also
+/// includes some other metrics like KSM shared pages gathered from sysfs.
+/// Ensure this is what you want if you return this type from your code for others to consume.
 pub struct ProcFsMemInfo {
+    /// Total usable RAM, i.e. installed memory minus bad regions and kernel binary code.
     pub memtotal: u64,
+    /// Memory that's guaranteed completely unused, almost always quite a bit smaller than the
+    /// amount of memory actually available for programs.
     pub memfree: u64,
+    /// The amount of memory that is available for a new workload, without pushing the system into
+    /// swap.
+    pub memavailable: u64,
+    /// Calculated from subtracting MemAvailable from MemTotal.
     pub memused: u64,
+    /// Memory shared through the Kernel Same-Page Merging mechanism. Metric gathered from sysfs.
     pub memshared: u64,
+    /// Total amount of swap space available.
     pub swaptotal: u64,
+    //// Amount of swap space that is currently unused.
     pub swapfree: u64,
+    /// Used swap, i.e., swaptotal - swapfree.
     pub swapused: u64,
 }
 
 pub fn read_meminfo() -> Result<ProcFsMemInfo, Error> {
     let path = "/proc/meminfo";
-    let file = OpenOptions::new().read(true).open(path)?;
 
+    let meminfo_str = std::fs::read_to_string(path)?;
+    parse_proc_meminfo(&meminfo_str)
+}
+
+fn parse_proc_meminfo(text: &str) -> Result<ProcFsMemInfo, Error> {
     let mut meminfo = ProcFsMemInfo {
         memtotal: 0,
         memfree: 0,
+        memavailable: 0,
         memused: 0,
         memshared: 0,
         swaptotal: 0,
@@ -433,35 +449,107 @@ pub fn read_meminfo() -> Result<ProcFsMemInfo, Error> {
         swapused: 0,
     };
 
-    let (mut buffers, mut cached) = (0, 0);
-    for line in BufReader::new(&file).lines() {
-        let content = line?;
-        let mut content_iter = content.split_whitespace();
+    for line in text.lines() {
+        let mut content_iter = line.split_whitespace();
         if let (Some(key), Some(value)) = (content_iter.next(), content_iter.next()) {
             match key {
                 "MemTotal:" => meminfo.memtotal = value.parse::<u64>()? * 1024,
                 "MemFree:" => meminfo.memfree = value.parse::<u64>()? * 1024,
+                "MemAvailable:" => meminfo.memavailable = value.parse::<u64>()? * 1024,
                 "SwapTotal:" => meminfo.swaptotal = value.parse::<u64>()? * 1024,
                 "SwapFree:" => meminfo.swapfree = value.parse::<u64>()? * 1024,
-                "Buffers:" => buffers = value.parse::<u64>()? * 1024,
-                "Cached:" => cached = value.parse::<u64>()? * 1024,
                 _ => continue,
             }
         }
     }
 
-    meminfo.memfree += buffers + cached;
-    meminfo.memused = meminfo.memtotal - meminfo.memfree;
+    // NOTE: MemAvailable is the only metric that will actually represent how much memory is
+    // available for a new workload, without pushing the system into swap, no amount of calculating
+    // with BUFFER, CACHE, .. will get you there, only the kernel can know this.
+    // For details see https://git.kernel.org/torvalds/c/34e431b0ae398fc54ea69ff85ec700722c9da773
+    meminfo.memused = meminfo.memtotal - meminfo.memavailable;
 
     meminfo.swapused = meminfo.swaptotal - meminfo.swapfree;
 
     meminfo.memshared = match read_firstline("/sys/kernel/mm/ksm/pages_sharing") {
         Ok(spages_line) => spages_line.trim_end().parse::<u64>()? * 4096,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => 0,
         Err(err) => bail!("unable to get KSM pages_sharing - {err}"),
     };
 
     Ok(meminfo)
+}
+
+#[test]
+fn test_read_proc_meminfo() {
+    let meminfo = parse_proc_meminfo(
+        "MemTotal:       32752584 kB
+MemFree:         2106048 kB
+MemAvailable:   13301592 kB
+Buffers:               0 kB
+Cached:           490072 kB
+SwapCached:            0 kB
+Active:           658700 kB
+Inactive:          59528 kB
+Active(anon):     191996 kB
+Inactive(anon):    49880 kB
+Active(file):     466704 kB
+Inactive(file):     9648 kB
+Unevictable:       16008 kB
+Mlocked:           12936 kB
+SwapTotal:             3 kB
+SwapFree:              2 kB
+Zswap:                 0 kB
+Zswapped:              0 kB
+Dirty:                 0 kB
+Writeback:             0 kB
+AnonPages:        244204 kB
+Mapped:            66032 kB
+Shmem:              9960 kB
+KReclaimable:   11525744 kB
+Slab:           21002876 kB
+SReclaimable:   11525744 kB
+SUnreclaim:      9477132 kB
+KernelStack:        6816 kB
+PageTables:         4812 kB
+SecPageTables:         0 kB
+NFS_Unstable:          0 kB
+Bounce:                0 kB
+WritebackTmp:          0 kB
+CommitLimit:    16376292 kB
+Committed_AS:     316368 kB
+VmallocTotal:   34359738367 kB
+VmallocUsed:      983836 kB
+VmallocChunk:          0 kB
+Percpu:            12096 kB
+HardwareCorrupted:     0 kB
+AnonHugePages:         0 kB
+ShmemHugePages:        0 kB
+ShmemPmdMapped:        0 kB
+FileHugePages:         0 kB
+FilePmdMapped:         0 kB
+Unaccepted:            0 kB
+HugePages_Total:       0
+HugePages_Free:        0
+HugePages_Rsvd:        0
+HugePages_Surp:        0
+Hugepagesize:       2048 kB
+Hugetlb:               0 kB
+DirectMap4k:      237284 kB
+DirectMap2M:    13281280 kB
+DirectMap1G:    22020096 kB
+",
+    )
+    .expect("successful parsed a sample /proc/meminfo entry");
+
+    assert_eq!(meminfo.memtotal, 33538646016);
+    assert_eq!(meminfo.memused, 19917815808);
+    assert_eq!(meminfo.memfree, 2156593152);
+    assert_eq!(meminfo.memavailable, 13620830208);
+    assert_eq!(meminfo.swapfree, 2048);
+    assert_eq!(meminfo.swaptotal, 3072);
+    assert_eq!(meminfo.swapused, 1024);
 }
 
 #[derive(Clone, Debug)]
@@ -753,14 +841,15 @@ pub fn read_loadavg() -> Result<Loadavg, Error> {
     Loadavg::read()
 }
 
-/// Load avarage: floating point values for 1, 5 and 15 minutes of runtime.
+/// Load average: floating point values for 1, 5 and 15 minutes of runtime.
 #[derive(Clone, Debug)]
 pub struct Loadavg(pub f64, pub f64, pub f64);
 
 impl Loadavg {
     /// Read the load avage from `/proc/loadavg`.
     pub fn read() -> Result<Self, Error> {
-        Self::parse(unsafe { std::str::from_utf8_unchecked(&std::fs::read("/proc/loadavg")?) })
+        let bytes = std::fs::read("/proc/loadavg")?;
+        Self::parse(unsafe { std::str::from_utf8_unchecked(&bytes) })
     }
 
     /// Parse the value triplet.

@@ -99,7 +99,7 @@ pub unsafe fn vec_new_uninitialized<T>(len: usize) -> Vec<T> {
 }
 
 pub fn io_err_other<E: std::fmt::Display>(err: E) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, err.to_string())
+    io::Error::other(err.to_string())
 }
 
 pub fn poll_result_once<T, R>(mut fut: T) -> io::Result<R>

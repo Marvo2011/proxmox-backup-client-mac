@@ -1,7 +1,7 @@
 name: macOS release
 
 # Builds the client and the pxar tool for macOS on Apple Silicon and publishes
-# them as a GitHub release tagged with the client version (e.g. v3.2.4-20261119).
+# them as a GitHub release tagged with the client version (e.g. v4.2.10-20261119).
 #
 # The version is the upstream version plus the date of the port's release. Pushes
 # without a version bump update the existing release: its binaries are replaced
@@ -81,7 +81,7 @@ jobs:
           done
 
       # The workspace version is the upstream version plus the build date of the port as
-      # semver build metadata (3.2.4+20261119). Tags and file names use "-" instead of "+".
+      # semver build metadata (4.2.10+20261119). Tags and file names use "-" instead of "+".
       - name: Determine version
         id: version
         run: |

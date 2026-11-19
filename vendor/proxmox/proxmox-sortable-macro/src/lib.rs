@@ -1,3 +1,5 @@
+#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+
 extern crate proc_macro;
 extern crate proc_macro2;
 
@@ -7,10 +9,10 @@ use std::mem;
 use proc_macro::TokenStream as TokenStream_1;
 use proc_macro2::TokenStream;
 use quote::quote;
+use syn::Error;
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::visit_mut::VisitMut;
-use syn::Error;
 
 macro_rules! format_err {
     ($span:expr => $($msg:tt)*) => { Error::new_spanned($span, format!($($msg)*)) };
@@ -65,9 +67,7 @@ fn sort_data(data: TokenStream) -> Result<TokenStream, Error> {
     let mut array: syn::ExprArray = syn::parse2(data)?;
     let span = array.span();
 
-    let mut fields: Vec<syn::Expr> = mem::replace(&mut array.elems, Punctuated::new())
-        .into_iter()
-        .collect();
+    let mut fields: Vec<syn::Expr> = std::mem::take(&mut array.elems).into_iter().collect();
 
     let mut err = None;
     fields.sort_by(|a, b| {

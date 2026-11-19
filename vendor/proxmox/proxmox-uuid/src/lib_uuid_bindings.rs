@@ -4,7 +4,7 @@ use crate::Uuid;
 
 // on macOS the uuid functions are part of libSystem
 #[cfg_attr(not(target_os = "macos"), link(name = "uuid"))]
-extern "C" {
+unsafe extern "C" {
     pub fn uuid_generate(out: *mut [u8; 16]);
     fn uuid_unparse_lower(input: *const [u8; 16], out: *mut u8);
     fn uuid_unparse_upper(input: *const [u8; 16], out: *mut u8);

@@ -1,39 +1,55 @@
 [workspace]
 members = [
+    "pbs-api-types",
+    "proxmox-acme",
+    "proxmox-acme-api",
     "proxmox-api-macro",
+    "proxmox-apt-api-types",
     "proxmox-async",
     "proxmox-auth-api",
+    "proxmox-base64",
     "proxmox-borrow",
     "proxmox-compression",
+    "proxmox-config-digest",
+    "proxmox-const-utils",
+    "proxmox-fixed-string",
     "proxmox-http",
     "proxmox-http-error",
     "proxmox-human-byte",
     "proxmox-io",
     "proxmox-lang",
+    "proxmox-log",
+    "proxmox-match-expression",
     "proxmox-notify",
+    "proxmox-product-config",
+    "proxmox-rate-limiter",
     "proxmox-router",
+    "proxmox-s3-client",
     "proxmox-schema",
     "proxmox-section-config",
+    "proxmox-sendmail",
     "proxmox-serde",
     "proxmox-shared-memory",
     "proxmox-sortable-macro",
     "proxmox-sys",
+    "proxmox-systemd",
     "proxmox-time",
     "proxmox-uuid",
+    "proxmox-worker-task",
 ]
 exclude = [
     "build",
 ]
-resolver = "2"
+resolver = "3"
 
 [workspace.package]
 authors = ["Proxmox Support Team <support@proxmox.com>"]
-edition = "2021"
+edition = "2024"
 license = "AGPL-3"
 repository = "https://git.proxmox.com/?p=proxmox.git"
 homepage = "https://proxmox.com"
 exclude = [ "debian" ]
-rust-version = "1.70"
+rust-version = "1.88"
 
 [workspace.dependencies]
 # any features enabled here are enabled on all members using 'workspace = true'!
@@ -41,72 +57,120 @@ rust-version = "1.70"
 # external dependencies
 anyhow = "1.0"
 base32 = "0.4"
-base64 = "0.13"
-bitflags = "1.2.1"
+base64 = "0.22"
+bitflags = "2.4"
 bytes = "1.0"
 const_format = "0.2"
 crc32fast = "1"
 crossbeam-channel = "0.5"
 endian_trait = "0.6"
-env_logger = "0.10"
+env_logger = "0.11"
 flate2 = "1.0"
+foreign-types = "0.3"
 form_urlencoded = "1.1"
 futures = "0.3"
-handlebars = "3.0"
+handlebars = "5"
 hex = "0.4"
-http = "0.2"
-hyper = "0.14.5"
-lazy_static = "1.4"
+http = "1"
+http-body = "1"
+http-body-util = "0.1"
+hyper = "1"
+hyper-util = "0.1.12"
+iso8601 = "0.6.1"
+jiff = "0.2"
 ldap3 = { version = "0.11", default-features = false }
 lettre = "0.11.1"
 libc = "0.2.107"
 log = "0.4.17"
-mail-parser = "0.8.2"
+mail-parser = "0.11"
+md5 = "0.7.0"
 native-tls = "0.2"
-nix = "0.26.1"
+nix = "0.29"
+nom = "7"
+# used by proxmox-disks, can be replaced by OnceLock from std once it supports get_or_try_init
 once_cell = "1.3.1"
 openssl = "0.10"
 pam-sys = "0.5"
 percent-encoding = "2.1"
 pin-utils = "0.1.0"
+pretty_assertions = "1.4"
 proc-macro2 = "1.0"
+quick-xml = "0.36.1"
 quote = "1.0"
 regex = "1.5"
 serde = "1.0"
+serde-xml-rs = "0.5"
 serde_cbor = "0.11.1"
 serde_json = "1.0"
 serde_plain = "1.0"
+serde_regex = "1.1"
 syn = { version = "2", features = [ "full", "visit-mut" ] }
+sync_wrapper = "1"
 tar = "0.4"
+termcolor = "1.1.2"
+thiserror = "2"
 tokio = "1.6"
 tokio-openssl = "0.6.1"
 tokio-stream = "0.1.0"
+tokio-util = "0.7"
 tower-service = "0.3.0"
+tracing = "0.1"
+tracing-journald = "0.3.1"
+tracing-log = { version = "0.2", default-features = false }
+tracing-subscriber = "0.3.16"
+udev = "0.9"
 url = "2.2"
 walkdir = "2"
-webauthn-rs = "0.3"
-zstd = { version = "0.12", features = [ "bindgen" ] }
+zstd = "0.13"
 
 # workspace dependencies
-proxmox-acme = {  version = "0.5.2", path = "proxmox-acme", default-features = false }
-proxmox-api-macro = { version = "1.0.8", path = "proxmox-api-macro" }
-proxmox-async = { version = "0.4.1", path = "proxmox-async" }
-proxmox-compression = { version = "0.2.0", path = "proxmox-compression" }
-proxmox-http = { version = "0.9.0", path = "proxmox-http" }
-proxmox-http-error = { version = "0.1.0", path = "proxmox-http-error" }
-proxmox-human-byte = { version = "0.1.0", path = "proxmox-human-byte" }
-proxmox-io = { version = "1.0.0", path = "proxmox-io" }
-proxmox-lang = { version = "1.1", path = "proxmox-lang" }
-proxmox-login = { version = "0.1.0", path = "proxmox-login" }
-proxmox-product-config = { version = "0.1.0", path = "proxmox-product-config" }
-proxmox-config-digest = { version = "0.1.0", path = "proxmox-config-digest" }
-proxmox-rest-server = { version = "0.5.2", path = "proxmox-rest-server" }
-proxmox-router = { version = "2.1.3", path = "proxmox-router" }
-proxmox-schema = { version = "3.1.1", path = "proxmox-schema" }
-proxmox-section-config = { version = "2.0.0", path = "proxmox-section-config" }
-proxmox-serde = { version = "0.1.1", path = "proxmox-serde", features = [ "serde_json" ] }
+proxmox-access-control = { version = "1.3.0", path = "proxmox-access-control" }
+proxmox-acme-api = { version = "1.0.2", path = "proxmox-acme-api" }
+proxmox-acme = {  version = "1.1.0", path = "proxmox-acme", default-features = false }
+proxmox-api-macro = { version = "1.7.1", path = "proxmox-api-macro" }
+proxmox-apt = { version = "1.0.1", path = "proxmox-apt" }
+proxmox-apt-api-types = { version = "3.0.0", path = "proxmox-apt-api-types" }
+proxmox-auth-api = { version = "1.0.5", path = "proxmox-auth-api" }
+proxmox-async = { version = "0.5.0", path = "proxmox-async" }
+proxmox-base64 = {  version = "1.0.0", path = "proxmox-base64" }
+proxmox-compression = { version = "1.0.2", path = "proxmox-compression" }
+proxmox-const-utils = { version = "0.1.0", path = "proxmox-const-utils" }
+proxmox-daemon = { version = "1.0.0", path = "proxmox-daemon" }
+proxmox-disks = { version = "0.2.0", path = "proxmox-disks" }
+proxmox-fixed-string = { version = "0.1.0", path = "proxmox-fixed-string" }
+proxmox-http = { version = "1.0.7", path = "proxmox-http" }
+proxmox-http-error = { version = "1.0.0", path = "proxmox-http-error" }
+proxmox-human-byte = { version = "1.0.0", path = "proxmox-human-byte" }
+proxmox-ini = { version = "0.1.1", path = "proxmox-ini" }
+proxmox-io = { version = "1.3.0", path = "proxmox-io" }
+proxmox-lang = { version = "1.5", path = "proxmox-lang" }
+proxmox-log = { version = "1.0.0", path = "proxmox-log" }
+proxmox-login = { version = "1.0.0", path = "proxmox-login" }
+proxmox-match-expression = { version = "0.1", path = "proxmox-match-expression" }
+proxmox-network-types = { version = "1.2.0", path = "proxmox-network-types" }
+proxmox-parallel-handler = { version = "1.0.0", path = "proxmox-parallel-handler" }
+proxmox-pgp = { version = "1.0.0", path = "proxmox-pgp" }
+proxmox-procfs = { version = "0.1.0", path = "proxmox-procfs" }
+proxmox-product-config = { version = "1.1.0", path = "proxmox-product-config" }
+proxmox-config-digest = { version = "1.0.0", path = "proxmox-config-digest" }
+proxmox-rate-limiter = { version = "1.0.1", path = "proxmox-rate-limiter" }
+proxmox-rest-server = { version = "1.3.0", path = "proxmox-rest-server" }
+proxmox-router = { version = "3.4.0", path = "proxmox-router" }
+proxmox-s3-client = { version = "1.4.2", path = "proxmox-s3-client" }
+proxmox-schema = { version = "5.6.0", path = "proxmox-schema" }
+proxmox-section-config = { version = "3.3.0", path = "proxmox-section-config" }
+proxmox-sendmail = { version = "1.0.2", path = "proxmox-sendmail" }
+proxmox-serde = { version = "1.0.0", path = "proxmox-serde", features = [ "serde_json" ] }
+proxmox-shared-memory = { version = "1.0.1", path = "proxmox-shared-memory" }
 proxmox-sortable-macro = { version = "0.1.3", path = "proxmox-sortable-macro" }
-proxmox-sys = { version = "0.5.5", path = "proxmox-sys" }
-proxmox-tfa = { version = "4.0.4", path = "proxmox-tfa" }
-proxmox-time = { version = "1.1.6", path = "proxmox-time" }
-proxmox-uuid = { version = "1.0.1", path = "proxmox-uuid" }
+proxmox-sys = { version = "1.0.1", path = "proxmox-sys" }
+proxmox-systemd = { version = "1.0.0", path = "proxmox-systemd" }
+proxmox-tfa = { version = "6.0.0", path = "proxmox-tfa" }
+proxmox-time = { version = "2.1.0", path = "proxmox-time" }
+proxmox-uuid = { version = "1.1.1", path = "proxmox-uuid" }
+proxmox-worker-task = { version = "1.0.0", path = "proxmox-worker-task" }
+proxmox-node-status = { version = "1.0.0", path = "proxmox-node-status" }
+
+[workspace.dependencies.http_1]
+package = "http"
+version = "1"

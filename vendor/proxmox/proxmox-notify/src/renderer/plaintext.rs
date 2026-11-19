@@ -1,8 +1,7 @@
 use std::collections::HashMap;
 
 use handlebars::{
-    Context, Handlebars, Helper, HelperResult, Output, RenderContext,
-    RenderError as HandlebarsRenderError,
+    Context, Handlebars, Helper, HelperResult, Output, RenderContext, RenderErrorReason,
 };
 use serde_json::Value;
 
@@ -42,9 +41,10 @@ fn render_plaintext_table(
 ) -> HelperResult {
     let param = h
         .param(0)
-        .ok_or_else(|| HandlebarsRenderError::new("parameter not found"))?;
+        .ok_or_else(|| RenderErrorReason::ParamNotFoundForIndex("table", 0))?;
     let value = param.value();
-    let table: Table = serde_json::from_value(value.clone())?;
+    let table: Table = serde_json::from_value(value.clone())
+        .map_err(|err| RenderErrorReason::NestedError(err.into()))?;
     let widths = optimal_column_widths(&table);
 
     // Write header
@@ -84,12 +84,15 @@ fn render_object(
 ) -> HelperResult {
     let param = h
         .param(0)
-        .ok_or_else(|| HandlebarsRenderError::new("parameter not found"))?;
+        .ok_or_else(|| RenderErrorReason::ParamNotFoundForIndex("object", 0))?;
 
     let value = param.value();
 
     out.write("\n")?;
-    out.write(&serde_json::to_string_pretty(&value)?)?;
+    out.write(
+        &serde_json::to_string_pretty(&value)
+            .map_err(|err| RenderErrorReason::NestedError(err.into()))?,
+    )?;
     out.write("\n")?;
 
     Ok(())

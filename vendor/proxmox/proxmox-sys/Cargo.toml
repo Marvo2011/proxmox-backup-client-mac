@@ -1,21 +1,21 @@
 [package]
 name = "proxmox-sys"
-version = "0.5.5"
+description = "System tools (using nix)."
+version = "1.0.3"
+
 authors.workspace = true
 edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "System tools (using nix)."
-
-exclude.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-base64.workspace = true
-lazy_static.workspace = true
 libc.workspace = true
 log.workspace = true
-nix.workspace = true
+nix = { workspace = true, features = [ "dir", "fs", "ioctl", "mman", "net", "process", "signal", "socket", "user" ] }
 openssl = { workspace = true, optional = true }
 regex.workspace = true
 serde_json.workspace = true
@@ -24,7 +24,6 @@ zstd = { workspace = true, optional = true}
 
 proxmox-io.workspace = true
 proxmox-lang.workspace = true
-proxmox-time.workspace = true
 
 [features]
 default = []

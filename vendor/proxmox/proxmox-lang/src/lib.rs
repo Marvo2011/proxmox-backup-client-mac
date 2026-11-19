@@ -4,6 +4,8 @@
 //! sometimes also types from nightly `std` which are simple enough to do just haven't been
 //! bikeshedded and stabilized in the standard library yet.
 
+#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+
 mod constnamedbitmap;
 
 pub mod error;
@@ -29,7 +31,6 @@ pub mod ops;
 /// })
 /// .map_err(|e| format_err!("my try block returned an error - {}", e));
 /// ```
-
 #[macro_export]
 macro_rules! try_block {
     { $($token:tt)* } => {{ (|| -> Result<_,_> { $($token)* })() }}
@@ -65,35 +66,6 @@ macro_rules! static_assert_size {
     };
 }
 
-/// Evaluates to the offset (in bytes) of a given member within a struct
-///
-/// ```
-/// # use proxmox_lang::offsetof;
-///
-/// #[repr(C)]
-/// struct Stuff {
-///     first: u32,
-///     second: u32,
-/// }
-///
-/// assert_eq!(offsetof!(Stuff, second), 4);
-///
-/// ```
-// FIXME: With 1.56 we get `const transmute` which may help making this usable `const fn` as we can
-// avoid dereferencing the raw pointer by transmuting `0usize` into a proper reference instead.
-//
-// So with 1.56, do this instead:
-//
-//     unsafe { &(std::mem::transmute::<_, &$ty>(0usize).$field) as *const _ as usize }
-#[macro_export]
-macro_rules! offsetof {
-    // The null pointer dereference used previously is undefined behavior and gets caught by the
-    // debug assertions of newer Rust versions.
-    ($ty:ty, $field:ident) => {
-        std::mem::offset_of!($ty, $field)
-    };
-}
-
 /// Shortcut for generating an `&'static CStr`.
 ///
 /// This takes a *string* (*not* a *byte-string*), appends a terminating zero, and calls
@@ -105,9 +77,8 @@ macro_rules! offsetof {
 /// unsafe { ::std::ffi::CStr::from_bytes_with_nul_unchecked(bytes.as_bytes()) }
 /// # ;
 /// ```
+#[deprecated = "use c\"literals\" instead"]
 #[macro_export]
 macro_rules! c_str {
-    ($data:expr) => {{
-        unsafe { ::std::ffi::CStr::from_bytes_with_nul_unchecked(concat!($data, "\0").as_bytes()) }
-    }};
+    ($data:expr) => {{ unsafe { ::std::ffi::CStr::from_bytes_with_nul_unchecked(concat!($data, "\0").as_bytes()) } }};
 }

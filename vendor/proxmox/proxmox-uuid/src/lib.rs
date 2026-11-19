@@ -1,5 +1,7 @@
 //! Simple bindings to libuuid's `uuid_generate`.
 
+#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+
 use std::borrow::{Borrow, BorrowMut};
 use std::fmt;
 
@@ -42,7 +44,7 @@ fn hex_digit(b: u8) -> Result<u8, UuidError> {
 ///
 /// let uuid = Uuid::generate();
 /// println!("Generated uuid: {}", uuid);
-/// // prints somethign like:
+/// // prints something like:
 /// //    Generated uuid: 65b85639-78d7-4330-85c6-39502b2f9b01
 ///
 /// let bytes: &[u8] = uuid.as_ref();
@@ -59,10 +61,9 @@ pub struct Uuid(Box<[u8; 16]>);
 impl Uuid {
     /// Generate a uuid with `uuid_generate(3)`.
     pub fn generate() -> Self {
-        use std::alloc::{alloc, Layout};
-        let uuid = unsafe { alloc(Layout::new::<[u8; 16]>()) as *mut [u8; 16] };
-        unsafe { uuid_generate(uuid) };
-        Self(unsafe { Box::from_raw(uuid) })
+        let mut uuid = Box::new_uninit();
+        unsafe { uuid_generate(uuid.as_mut_ptr()) };
+        Self(unsafe { uuid.assume_init() })
     }
 
     /// Get a reference to the internal 16 byte array.
@@ -80,51 +81,48 @@ impl Uuid {
     /// ```
     /// use proxmox_uuid::Uuid;
     ///
-    /// let gen = Uuid::generate();
-    /// let text = format!("{}", gen);
+    /// let uuid = Uuid::generate();
+    /// let text = format!("{}", uuid);
     /// let parsed: Uuid = text.parse().unwrap();
-    /// assert_eq!(gen, parsed);
+    /// assert_eq!(uuid, parsed);
     ///
     /// let uuid1: Uuid = "65b8563978d7433085c639502b2f9b01".parse().unwrap();
     /// let uuid2: Uuid = "65b85639-78d7-4330-85c6-39502b2f9b01".parse().unwrap();
     /// assert_eq!(uuid1, uuid2);
     /// ```
     pub fn parse_str(src: &str) -> Result<Self, UuidError> {
-        use std::alloc::{alloc, Layout};
-        let uuid: *mut [u8; 16] = unsafe { alloc(Layout::new::<[u8; 16]>()) as *mut [u8; 16] };
+        let mut uuid = [0; 16];
         if src.len() == 36 {
-            // Unfortunately the manpage of `uuid_parse(3)` states that it technically requiers a
+            // Unfortunately the manpage of `uuid_parse(3)` states that it technically requires a
             // terminating null byte at the end, which we don't have, so do this manually:
-            let uuid: &mut [u8] = unsafe { &mut (&mut *uuid)[..] };
             let src = src.as_bytes();
             if src[8] != b'-' || src[13] != b'-' || src[18] != b'-' || src[23] != b'-' {
                 return Err(UuidError);
             }
             for i in 0..4 {
-                uuid[i] = hex_digit(src[2 * i])? << 4 | hex_digit(src[2 * i + 1])?;
+                uuid[i] = (hex_digit(src[2 * i])? << 4) | hex_digit(src[2 * i + 1])?;
             }
             for i in 4..6 {
-                uuid[i] = hex_digit(src[2 * i + 1])? << 4 | hex_digit(src[2 * i + 2])?;
+                uuid[i] = (hex_digit(src[2 * i + 1])? << 4) | hex_digit(src[2 * i + 2])?;
             }
             for i in 6..8 {
-                uuid[i] = hex_digit(src[2 * i + 2])? << 4 | hex_digit(src[2 * i + 3])?;
+                uuid[i] = (hex_digit(src[2 * i + 2])? << 4) | hex_digit(src[2 * i + 3])?;
             }
             for i in 8..10 {
-                uuid[i] = hex_digit(src[2 * i + 3])? << 4 | hex_digit(src[2 * i + 4])?;
+                uuid[i] = (hex_digit(src[2 * i + 3])? << 4) | hex_digit(src[2 * i + 4])?;
             }
             for i in 10..16 {
-                uuid[i] = hex_digit(src[2 * i + 4])? << 4 | hex_digit(src[2 * i + 5])?;
+                uuid[i] = (hex_digit(src[2 * i + 4])? << 4) | hex_digit(src[2 * i + 5])?;
             }
         } else if src.len() == 32 {
-            let uuid: &mut [u8] = unsafe { &mut (&mut *uuid)[..] };
             let src = src.as_bytes();
             for i in 0..16 {
-                uuid[i] = hex_digit(src[2 * i])? << 4 | hex_digit(src[2 * i + 1])?;
+                uuid[i] = (hex_digit(src[2 * i])? << 4) | hex_digit(src[2 * i + 1])?;
             }
         } else {
             return Err(UuidError);
         }
-        Ok(Self(unsafe { Box::from_raw(uuid) }))
+        Ok(Self(Box::new(uuid)))
     }
 }
 
@@ -199,7 +197,7 @@ impl<'de> serde::Deserialize<'de> for Uuid {
 
         struct ForwardToStrVisitor;
 
-        impl<'a> serde::de::Visitor<'a> for ForwardToStrVisitor {
+        impl serde::de::Visitor<'_> for ForwardToStrVisitor {
             type Value = Uuid;
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {

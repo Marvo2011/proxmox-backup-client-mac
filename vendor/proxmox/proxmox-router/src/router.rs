@@ -9,8 +9,11 @@ use http::request::Parts;
 #[cfg(feature = "server")]
 use http::{Method, Response};
 #[cfg(feature = "server")]
-use hyper::Body;
+use hyper::body::Incoming;
 use percent_encoding::percent_decode_str;
+#[cfg(feature = "server")]
+use proxmox_http::Body;
+use serde::Serialize;
 use serde_json::Value;
 
 use proxmox_schema::{ObjectSchema, ParameterSchema, ReturnType, Schema};
@@ -41,10 +44,12 @@ use crate::SerializableReturn;
 ///    &ObjectSchema::new("Hello World Example", &[])
 /// );
 /// ```
-pub type ApiHandlerFn = &'static (dyn Fn(Value, &ApiMethod, &mut dyn RpcEnvironment) -> Result<Value, Error>
-              + Send
-              + Sync
-              + 'static);
+pub type ApiHandlerFn = &'static (
+             dyn Fn(Value, &ApiMethod, &mut dyn RpcEnvironment) -> Result<Value, Error>
+                 + Send
+                 + Sync
+                 + 'static
+         );
 
 /// A synchronous API handler gets a json Value as input and returns a serializable return value as output.
 ///
@@ -64,18 +69,169 @@ pub type ApiHandlerFn = &'static (dyn Fn(Value, &ApiMethod, &mut dyn RpcEnvironm
 /// }
 ///
 /// const API_METHOD_HELLO: ApiMethod = ApiMethod::new(
-///    &ApiHandler::StreamingSync(&hello),
+///    &ApiHandler::SerializingSync(&hello),
 ///    &ObjectSchema::new("Hello World Example", &[])
 /// );
 /// ```
-pub type StreamingApiHandlerFn = &'static (dyn Fn(
+pub type SerializingApiHandlerFn = &'static (
+             dyn Fn(
     Value,
     &ApiMethod,
     &mut dyn RpcEnvironment,
 ) -> Result<Box<dyn SerializableReturn + Send>, Error>
-              + Send
-              + Sync
-              + 'static);
+                 + Send
+                 + Sync
+                 + 'static
+         );
+
+/// A record for a streaming API call. This contains a `Result<Value, Error>` and allows formatting
+/// as a `json-seq` formatted string.
+pub struct Record {
+    // direct access is only for the CLI code
+    pub(crate) data: crate::stream::Record<Value>,
+}
+
+impl Record {
+    /// Create a new successful record from a serializeable element.
+    pub fn new<T: Serialize>(data: T) -> Self {
+        Self {
+            data: crate::stream::Record::Data(
+                serde_json::to_value(data).expect("failed to create json string"),
+            ),
+        }
+    }
+
+    /// Create a new error record from an error value.
+    ///
+    /// Only the error's message is sent, see [`error_value`](Self::error_value) for errors that a
+    /// client should be able to tell apart.
+    pub fn error<E: Into<Error>>(error: E) -> Self {
+        Self {
+            data: crate::stream::Record::Error(error.into().to_string().into()),
+        }
+    }
+
+    /// Create a new error record from an error message.
+    pub fn error_msg<T: fmt::Display>(msg: T) -> Self {
+        Self {
+            data: crate::stream::Record::Error(msg.to_string().into()),
+        }
+    }
+
+    /// Create a new structured error record from an error value.
+    ///
+    /// The value is sent as it serializes, so a client can act on its content rather than parse a
+    /// message, for example an application envelope such as `{"kind": .., "message": ..}`. The
+    /// [`stream`](crate::stream) module shows how a client reads it back.
+    pub fn error_value<T: Serialize>(error: T) -> Self {
+        Self {
+            data: crate::stream::Record::Error(
+                serde_json::to_value(error).expect("failed to create json string"),
+            ),
+        }
+    }
+
+    /// Create a new error record from `Result`.
+    pub fn from_result<T, E>(result: Result<T, E>) -> Self
+    where
+        T: Serialize,
+        E: Into<Error>,
+    {
+        match result {
+            Ok(res) => Self::new(&res),
+            Err(err) => Self::error(err),
+        }
+    }
+
+    /// Create/get the bytes for a complete record to be streamed as a json sequence according to
+    /// RFC7464: the data is prefixed with a record separator (`\x1E`) and ends with a newline
+    /// (`'\n').
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.push(b'\x1E');
+        // We assume json serialization doesn't fail.
+        // Don't return special objects that can fail to serialize.
+        // As for "normal" data - we don't expect spurious errors, otherwise they could also happen
+        // when serializing *errors*...
+        serde_json::to_writer(&mut data, &self.data).expect("failed to create JSON record");
+        data.push(b'\n');
+        data
+    }
+}
+
+impl<T> From<crate::stream::Record<T>> for Record
+where
+    T: Serialize,
+{
+    fn from(data: crate::stream::Record<T>) -> Self {
+        match data {
+            crate::stream::Record::Data(data) => Self::new(data),
+            crate::stream::Record::Error(err) => Self {
+                data: crate::stream::Record::Error(err),
+            },
+        }
+    }
+}
+
+/// A synchronous API handler returns an [`Iterator`] over items which should be serialized.
+///
+/// ```
+/// # use anyhow::Error;
+/// # use serde_json::{json, Value};
+/// use proxmox_router::{ApiHandler, ApiMethod, Record, RpcEnvironment, SyncStream};
+/// use proxmox_schema::ObjectSchema;
+///
+/// fn hello(
+///    param: Value,
+///    info: &ApiMethod,
+///    rpcenv: &mut dyn RpcEnvironment,
+/// ) -> Result<SyncStream, Error> {
+///     Ok([Record::new(&3u32)].into())
+/// }
+///
+/// const API_METHOD_HELLO: ApiMethod = ApiMethod::new(
+///    &ApiHandler::StreamSync(&hello),
+///    &ObjectSchema::new("Hello World Example", &[])
+/// );
+/// ```
+pub type StreamApiHandlerFn = &'static (
+             dyn Fn(Value, &ApiMethod, &mut dyn RpcEnvironment) -> Result<SyncStream, Error>
+                 + Send
+                 + Sync
+                 + 'static
+         );
+
+pub struct SyncStream {
+    inner: Box<dyn Iterator<Item = Record> + Send>,
+}
+
+impl SyncStream {
+    pub fn from_boxed(inner: Box<dyn Iterator<Item = Record> + Send>) -> Self {
+        Self { inner }
+    }
+
+    pub fn into_inner(self) -> Box<dyn Iterator<Item = Record> + Send> {
+        self.inner
+    }
+
+    #[cfg(feature = "stream")]
+    pub fn try_collect(self) -> Result<Value, Error> {
+        let mut acc = Vec::new();
+        for i in self.inner {
+            acc.push(i.data.into_result()?);
+        }
+        Ok(Value::Array(acc))
+    }
+}
+
+impl<I> From<I> for SyncStream
+where
+    I: IntoIterator<Item: IntoRecord, IntoIter: Send> + Send + 'static,
+{
+    fn from(iter: I) -> Self {
+        Self::from_boxed(Box::new(iter.into_iter().map(IntoRecord::into_record)))
+    }
+}
 
 /// Asynchronous API handlers
 ///
@@ -103,19 +259,21 @@ pub type StreamingApiHandlerFn = &'static (dyn Fn(
 ///    &ObjectSchema::new("Hello World Example (async)", &[])
 /// );
 /// ```
-pub type ApiAsyncHandlerFn = &'static (dyn for<'a> Fn(Value, &'static ApiMethod, &'a mut dyn RpcEnvironment) -> ApiFuture<'a>
-              + Send
-              + Sync);
+pub type ApiAsyncHandlerFn = &'static (
+             dyn for<'a> Fn(Value, &'static ApiMethod, &'a mut dyn RpcEnvironment) -> ApiFuture<'a>
+                 + Send
+                 + Sync
+         );
 
 pub type ApiFuture<'a> = Pin<Box<dyn Future<Output = Result<Value, anyhow::Error>> + Send + 'a>>;
 
-/// Streaming asynchronous API handlers
+/// Serializing asynchronous API handlers
 ///
 /// Returns a future Value.
 /// ```
 /// # use serde_json::{json, Value};
 /// #
-/// use proxmox_router::{ApiFuture, ApiHandler, ApiMethod, RpcEnvironment, StreamingApiFuture, SerializableReturn};
+/// use proxmox_router::{ApiFuture, ApiHandler, ApiMethod, RpcEnvironment, SerializingApiFuture, SerializableReturn};
 /// use proxmox_schema::ObjectSchema;
 ///
 ///
@@ -123,7 +281,7 @@ pub type ApiFuture<'a> = Pin<Box<dyn Future<Output = Result<Value, anyhow::Error
 ///    param: Value,
 ///    info: &ApiMethod,
 ///    rpcenv: &'a mut dyn RpcEnvironment,
-/// ) -> StreamingApiFuture<'a> {
+/// ) -> SerializingApiFuture<'a> {
 ///    Box::pin(async move {
 ///        let res: Box<dyn SerializableReturn + Send> = Box::new(format!("Hello World!"));
 ///        Ok(res)
@@ -131,21 +289,209 @@ pub type ApiFuture<'a> = Pin<Box<dyn Future<Output = Result<Value, anyhow::Error
 /// }
 ///
 /// const API_METHOD_HELLO_FUTURE: ApiMethod = ApiMethod::new(
-///    &ApiHandler::StreamingAsync(&hello_future),
+///    &ApiHandler::SerializingAsync(&hello_future),
 ///    &ObjectSchema::new("Hello World Example (async)", &[])
 /// );
 /// ```
-pub type StreamingApiAsyncHandlerFn = &'static (dyn for<'a> Fn(
+pub type SerializingApiAsyncHandlerFn = &'static (
+             dyn for<'a> Fn(
     Value,
     &'static ApiMethod,
     &'a mut dyn RpcEnvironment,
-) -> StreamingApiFuture<'a>
-              + Send
-              + Sync);
+) -> SerializingApiFuture<'a>
+                 + Send
+                 + Sync
+         );
 
-pub type StreamingApiFuture<'a> = Pin<
+pub type SerializingApiFuture<'a> = Pin<
     Box<dyn Future<Output = Result<Box<dyn SerializableReturn + Send>, anyhow::Error>> + Send + 'a>,
 >;
+
+/// Streaming asynchronous API handlers
+///
+/// Returns a future Value.
+/// ```
+/// # use serde_json::{json, Value};
+/// use proxmox_router::{
+///     ApiFuture, ApiHandler, ApiMethod, Record, RpcEnvironment, Stream, StreamApiFuture,
+/// };
+/// use proxmox_schema::ObjectSchema;
+///
+///
+/// fn hello_future<'a>(
+///    param: Value,
+///    info: &ApiMethod,
+///    rpcenv: &'a mut dyn RpcEnvironment,
+/// ) -> StreamApiFuture<'a> {
+///     let stream = Stream::from_producer(|mut records| async move {
+///         records.send(Record::new("data")).await?;
+///         records.send(Record::new("more data")).await?;
+///         // ...
+///         Ok(())
+///     });
+///     Box::pin(async move { Ok(stream) })
+/// }
+///
+/// const API_METHOD_HELLO_FUTURE: ApiMethod = ApiMethod::new(
+///    &ApiHandler::StreamAsync(&hello_future),
+///    &ObjectSchema::new("Hello World Example (async)", &[])
+/// );
+/// ```
+pub type StreamApiAsyncHandlerFn = &'static (
+             dyn for<'a> Fn(
+    Value,
+    &'static ApiMethod,
+    &'a mut dyn RpcEnvironment,
+) -> StreamApiFuture<'a>
+                 + Send
+                 + Sync
+         );
+
+pub type StreamApiFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Stream, anyhow::Error>> + Send + 'a>>;
+
+pub struct Stream {
+    inner: Pin<Box<dyn futures::Stream<Item = Record> + Send>>,
+}
+
+impl Stream {
+    pub fn from_boxed(inner: Pin<Box<dyn futures::Stream<Item = Record> + Send>>) -> Self {
+        Self { inner }
+    }
+
+    pub fn into_inner(self) -> Pin<Box<dyn futures::Stream<Item = Record> + Send>> {
+        self.inner
+    }
+
+    #[cfg(feature = "stream")]
+    pub async fn try_collect(mut self) -> Result<Value, Error> {
+        use futures::StreamExt;
+
+        let mut acc = Vec::new();
+        while let Some(i) = self.inner.next().await {
+            acc.push(i.data.into_result()?);
+        }
+        Ok(Value::Array(acc))
+    }
+}
+
+impl Stream {
+    /// Build a stream from a producer that sends its records through the given sender.
+    ///
+    /// The producer is polled as part of the stream: it runs only while the stream is read and is
+    /// dropped together with it. A handler whose client disconnects thus stops at once, with no
+    /// task left behind. The stream ends once the producer has returned and the records it sent
+    /// are delivered, even if it dropped its sender earlier. An error it returns follows these
+    /// records as the final error record.
+    pub fn from_producer<F, Fut>(producer: F) -> Self
+    where
+        F: FnOnce(RecordSender) -> Fut,
+        Fut: Future<Output = Result<(), Error>> + Send + 'static,
+    {
+        let (sender, receiver) = futures::channel::mpsc::channel(0);
+        let producer = producer(RecordSender { sender });
+        Self::from_boxed(Box::pin(ProducerStream {
+            producer: Some(Box::pin(producer)),
+            receiver,
+            error: None,
+        }))
+    }
+}
+
+/// Sends the records of a producer given to [`Stream::from_producer`].
+pub struct RecordSender {
+    sender: futures::channel::mpsc::Sender<Record>,
+}
+
+impl RecordSender {
+    /// Send a record, waiting until the stream takes it.
+    ///
+    /// Fails only if the stream is gone, which can happen when the sender was moved to another
+    /// task; the producer itself is dropped with the stream.
+    pub async fn send(&mut self, record: Record) -> Result<(), Error> {
+        use futures::SinkExt;
+
+        self.sender
+            .send(record)
+            .await
+            .map_err(|_| anyhow::format_err!("record stream was dropped"))
+    }
+}
+
+type ProducerFuture = Pin<Box<dyn Future<Output = Result<(), Error>> + Send>>;
+
+struct ProducerStream {
+    /// The producer, until it finished.
+    producer: Option<ProducerFuture>,
+    receiver: futures::channel::mpsc::Receiver<Record>,
+    /// The producer's error, delivered after the records it sent before.
+    error: Option<Error>,
+}
+
+impl futures::Stream for ProducerStream {
+    type Item = Record;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Record>> {
+        use std::task::Poll;
+
+        loop {
+            match Pin::new(&mut self.receiver).poll_next(cx) {
+                Poll::Ready(Some(record)) => return Poll::Ready(Some(record)),
+                // All senders are gone, their records delivered and the producer has returned.
+                Poll::Ready(None) if self.producer.is_none() => {
+                    return Poll::Ready(self.error.take().map(Record::error));
+                }
+                // A producer may drop its sender before it returns, so keep polling it until then.
+                Poll::Ready(None) | Poll::Pending => {}
+            }
+            let Some(producer) = self.producer.as_mut() else {
+                // The producer finished, but a sender it handed to another task still lives.
+                return Poll::Pending;
+            };
+            match producer.as_mut().poll(cx) {
+                Poll::Ready(result) => {
+                    self.producer = None;
+                    self.error = result.err();
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
+impl<I> From<I> for Stream
+where
+    I: futures::Stream<Item: IntoRecord> + Send + 'static,
+{
+    fn from(stream: I) -> Self {
+        use futures::stream::StreamExt;
+        Self::from_boxed(Box::pin(stream.map(IntoRecord::into_record)))
+    }
+}
+
+/// Helper trait to allow [`Stream`] and [`SyncStream`] to be constructed from both
+/// regular streams and "`TryStreams`".
+pub trait IntoRecord {
+    fn into_record(self) -> Record;
+}
+
+impl IntoRecord for Record {
+    fn into_record(self) -> Record {
+        self
+    }
+}
+
+impl IntoRecord for Result<Record, Error> {
+    fn into_record(self) -> Record {
+        match self {
+            Ok(record) => record,
+            Err(err) => Record::error(err),
+        }
+    }
+}
 
 /// Asynchronous HTTP API handlers
 ///
@@ -154,14 +500,15 @@ pub type StreamingApiFuture<'a> = Pin<
 /// ```
 /// # use serde_json::{json, Value};
 /// #
-/// use hyper::{Body, Response, http::request::Parts};
+/// use hyper::{Response, body::Incoming, http::request::Parts};
 ///
+/// use proxmox_http::Body;
 /// use proxmox_router::{ApiHandler, ApiMethod, ApiResponseFuture, RpcEnvironment};
 /// use proxmox_schema::ObjectSchema;
 ///
 /// fn low_level_hello(
 ///    parts: Parts,
-///    req_body: Body,
+///    req_body: Incoming,
 ///    param: Value,
 ///    info: &ApiMethod,
 ///    rpcenv: Box<dyn RpcEnvironment>,
@@ -169,7 +516,7 @@ pub type StreamingApiFuture<'a> = Pin<
 ///    Box::pin(async move {
 ///        let response = http::Response::builder()
 ///            .status(200)
-///            .body(Body::from("Hello world!"))?;
+///            .body(Body::from("Hello world!".to_string()))?;
 ///        Ok(response)
 ///    })
 /// }
@@ -180,31 +527,78 @@ pub type StreamingApiFuture<'a> = Pin<
 /// );
 /// ```
 #[cfg(feature = "server")]
-pub type ApiAsyncHttpHandlerFn = &'static (dyn Fn(
+pub type ApiAsyncHttpHandlerFn = &'static (
+             dyn Fn(
     Parts,
-    Body,
+    Incoming,
     Value,
     &'static ApiMethod,
     Box<dyn RpcEnvironment>,
 ) -> ApiResponseFuture
-              + Send
-              + Sync
-              + 'static);
+                 + Send
+                 + Sync
+                 + 'static
+         );
 
 /// The output of an asynchronous API handler is a future yielding a `Response`.
 #[cfg(feature = "server")]
 pub type ApiResponseFuture =
     Pin<Box<dyn Future<Output = Result<Response<Body>, anyhow::Error>> + Send>>;
 
+/// Asynchronous HTTP API handlers with parameters specified in their bodies
+///
+/// They get low level access to request and response data, but it is also possible to specify
+/// their parameters in the request body.
+///
+/// ```
+/// use serde_json::Value;
+///
+/// use hyper::{Response, http::request::Parts};
+///
+/// use proxmox_http::Body;
+/// use proxmox_router::{ApiHandler, ApiMethod, ApiResponseFuture, RpcEnvironment};
+/// use proxmox_schema::ObjectSchema;
+///
+/// fn low_level_hello(
+///    parts: Parts,
+///    param: Value,
+///    info: &ApiMethod,
+///    rpcenv: Box<dyn RpcEnvironment>,
+/// ) -> ApiResponseFuture {
+///    Box::pin(async move {
+///        let response = http::Response::builder()
+///            .status(200)
+///            .body(Body::from("Hello world!".to_string()))?;
+///        Ok(response)
+///    })
+/// }
+///
+/// const API_METHOD_LOW_LEVEL_HELLO_BODY_PARAMETER: ApiMethod = ApiMethod::new(
+///    &ApiHandler::AsyncHttpBodyParameters(&low_level_hello),
+///    &ObjectSchema::new("Hello World Example (low level)", &[])
+/// );
+/// ```
+#[cfg(feature = "server")]
+pub type ApiAsyncHttpHandlerBodyParametersFn = &'static (
+             dyn Fn(Parts, Value, &'static ApiMethod, Box<dyn RpcEnvironment>) -> ApiResponseFuture
+                 + Send
+                 + Sync
+                 + 'static
+         );
+
 /// Enum for different types of API handler functions.
 #[non_exhaustive]
 pub enum ApiHandler {
     Sync(ApiHandlerFn),
-    StreamingSync(StreamingApiHandlerFn),
+    SerializingSync(SerializingApiHandlerFn),
+    StreamSync(StreamApiHandlerFn),
     Async(ApiAsyncHandlerFn),
-    StreamingAsync(StreamingApiAsyncHandlerFn),
+    SerializingAsync(SerializingApiAsyncHandlerFn),
+    StreamAsync(StreamApiAsyncHandlerFn),
     #[cfg(feature = "server")]
     AsyncHttp(ApiAsyncHttpHandlerFn),
+    #[cfg(feature = "server")]
+    AsyncHttpBodyParameters(ApiAsyncHttpHandlerBodyParametersFn),
 }
 
 #[cfg(feature = "test-harness")]
@@ -214,23 +608,35 @@ impl Eq for ApiHandler {}
 impl PartialEq for ApiHandler {
     fn eq(&self, rhs: &Self) -> bool {
         unsafe {
+            #[allow(clippy::missing_transmute_annotations)]
             match (self, rhs) {
                 (ApiHandler::Sync(l), ApiHandler::Sync(r)) => {
                     core::mem::transmute::<_, usize>(l) == core::mem::transmute::<_, usize>(r)
                 }
-                (ApiHandler::StreamingSync(l), ApiHandler::StreamingSync(r)) => {
+                (ApiHandler::SerializingSync(l), ApiHandler::SerializingSync(r)) => {
+                    core::mem::transmute::<_, usize>(l) == core::mem::transmute::<_, usize>(r)
+                }
+                (ApiHandler::StreamSync(l), ApiHandler::StreamSync(r)) => {
                     core::mem::transmute::<_, usize>(l) == core::mem::transmute::<_, usize>(r)
                 }
                 (ApiHandler::Async(l), ApiHandler::Async(r)) => {
                     core::mem::transmute::<_, usize>(l) == core::mem::transmute::<_, usize>(r)
                 }
-                (ApiHandler::StreamingAsync(l), ApiHandler::StreamingAsync(r)) => {
+                (ApiHandler::SerializingAsync(l), ApiHandler::SerializingAsync(r)) => {
+                    core::mem::transmute::<_, usize>(l) == core::mem::transmute::<_, usize>(r)
+                }
+                (ApiHandler::StreamAsync(l), ApiHandler::StreamAsync(r)) => {
                     core::mem::transmute::<_, usize>(l) == core::mem::transmute::<_, usize>(r)
                 }
                 #[cfg(feature = "server")]
                 (ApiHandler::AsyncHttp(l), ApiHandler::AsyncHttp(r)) => {
                     core::mem::transmute::<_, usize>(l) == core::mem::transmute::<_, usize>(r)
                 }
+                #[cfg(feature = "server")]
+                (
+                    ApiHandler::AsyncHttpBodyParameters(l),
+                    ApiHandler::AsyncHttpBodyParameters(r),
+                ) => core::mem::transmute::<_, usize>(l) == core::mem::transmute::<_, usize>(r),
                 _ => false,
             }
         }
@@ -492,6 +898,8 @@ pub struct ApiMethod {
     /// The protected flag indicates that the provides function should be forwarded
     /// to the daemon running in privileged mode.
     pub protected: bool,
+    /// Whether this method is still experimental or already stable.
+    pub unstable: bool,
     /// This flag indicates that the provided method may change the local timezone, so the server
     /// should do a tzset afterwards
     pub reload_timezone: bool,
@@ -516,6 +924,71 @@ impl std::fmt::Debug for ApiMethod {
     }
 }
 
+// const helpers to check privilege parameters
+
+// mirrors the splitting done by check_api_permission: a component can contain multiple '/'
+// separated parts, each of which may be a '{name}' parameter reference
+const fn check_privilege_path_components(component: &str, parameters: ParameterSchema) {
+    let bytes = component.as_bytes();
+    // early return for strings that can't interpolate
+    if bytes.len() < 2 {
+        return;
+    }
+    let mut component_start = 0;
+    let mut pos = 0;
+    while pos <= bytes.len() {
+        if pos == bytes.len() || bytes[pos] == b'/' {
+            let component_len = pos - component_start;
+            if component_len >= 2 && bytes[component_start] == b'{' && bytes[pos - 1] == b'}' {
+                if component_len == 2 {
+                    panic!("empty parameter declaration");
+                }
+                // double split_at because range slicing is not const
+                let name = bytes.split_at(pos - 1).0.split_at(component_start + 1).1;
+                if !parameters.const_has_parameter(name, true) {
+                    panic!(
+                        "privilege path references a parameter that does not exist in the method's \
+                        parameter schema"
+                    );
+                }
+            }
+            component_start = pos + 1;
+        }
+        pos += 1;
+    }
+}
+
+const fn assert_path_parameters_exist(perm: &Permission, parameters: ParameterSchema) {
+    match perm {
+        Permission::WithParam(name, permission) => {
+            if !parameters.const_has_parameter(name.as_bytes(), true) {
+                panic!("given user parameter does not exist");
+            }
+            assert_path_parameters_exist(permission, parameters)
+        }
+        Permission::UserParam(name) => {
+            if !parameters.const_has_parameter(name.as_bytes(), true) {
+                panic!("given user parameter does not exist");
+            }
+        }
+        Permission::Privilege(paths, _, _) => {
+            let mut i = 0;
+            while i < paths.len() {
+                check_privilege_path_components(paths[i], parameters);
+                i += 1;
+            }
+        }
+        Permission::And(permissions) | Permission::Or(permissions) => {
+            let mut i = 0;
+            while i < permissions.len() {
+                assert_path_parameters_exist(permissions[i], parameters);
+                i += 1;
+            }
+        }
+        _ => (),
+    }
+}
+
 impl ApiMethod {
     pub const fn new_full(handler: &'static ApiHandler, parameters: ParameterSchema) -> Self {
         Self {
@@ -523,6 +996,7 @@ impl ApiMethod {
             handler,
             returns: ReturnType::new(false, &NULL_SCHEMA),
             protected: false,
+            unstable: false,
             reload_timezone: false,
             access: ApiAccess {
                 description: None,
@@ -541,6 +1015,7 @@ impl ApiMethod {
             handler: &DUMMY_HANDLER,
             returns: ReturnType::new(false, &NULL_SCHEMA),
             protected: false,
+            unstable: false,
             reload_timezone: false,
             access: ApiAccess {
                 description: None,
@@ -561,22 +1036,261 @@ impl ApiMethod {
         self
     }
 
+    pub const fn unstable(mut self, unstable: bool) -> Self {
+        self.unstable = unstable;
+
+        self
+    }
+
     pub const fn reload_timezone(mut self, reload_timezone: bool) -> Self {
         self.reload_timezone = reload_timezone;
 
         self
     }
 
+    /// Set the access permissions.
+    ///
+    /// This asserts that every '{name}' parameter reference in `Privilege` permission paths, and
+    /// the parameters in `UserParam` and `WithParam` exists in the method's parameter schema,
+    /// since such a parameter could otherwise never match at runtime. Since API methods are usually
+    /// built in a const context, a violation is a compile time error.
     pub const fn access(
         mut self,
         description: Option<&'static str>,
         permission: &'static Permission,
     ) -> Self {
+        assert_path_parameters_exist(permission, self.parameters);
+
         self.access = ApiAccess {
             description,
             permission,
         };
 
         self
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    use proxmox_schema::StringSchema;
+
+    const STRING_SCHEMA: Schema = StringSchema::new("test").schema();
+
+    const PARAMETERS: ObjectSchema = ObjectSchema::new(
+        "test parameters",
+        &[
+            ("bar", true, &STRING_SCHEMA),
+            ("foo", false, &STRING_SCHEMA),
+        ],
+    );
+
+    const ADDITIONAL_PARAMETERS: ObjectSchema =
+        ObjectSchema::new("test parameters", &[]).additional_properties(true);
+
+    // compile time check that valid parameter references are accepted
+    const _: ApiMethod = ApiMethod::new_dummy(&PARAMETERS).access(
+        None,
+        &Permission::And(&[
+            &Permission::Privilege(&["foo", "{foo}", "{bar}"], 1, true),
+            &Permission::Privilege(&["foo", "{foo}/{bar}"], 1, true),
+            &Permission::WithParam(
+                "foo",
+                &Permission::Or(&[&Permission::Privilege(&["foo", "{foo}"], 1, true)]),
+            ),
+            &Permission::Privilege(&["/"], 1, true),
+            &Permission::Privilege(&["/foo"], 1, true),
+        ]),
+    );
+
+    #[test]
+    #[should_panic(expected = "privilege path references a parameter")]
+    fn missing_privilege_path_parameter() {
+        let _ = ApiMethod::new_dummy(&PARAMETERS)
+            .access(None, &Permission::Privilege(&["foo", "{baz}"], 1, true));
+    }
+
+    #[test]
+    #[should_panic(expected = "given user parameter does not exist")]
+    fn missing_privilege_user_parameter() {
+        let _ = ApiMethod::new_dummy(&PARAMETERS).access(
+            None,
+            &Permission::WithParam(
+                "not-existing",
+                &Permission::Privilege(&["foo", "{baz}"], 1, true),
+            ),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "given user parameter does not exist")]
+    fn missing_user_parameter() {
+        let _ =
+            ApiMethod::new_dummy(&PARAMETERS).access(None, &Permission::UserParam("not-existing"));
+    }
+
+    #[test]
+    #[should_panic(expected = "empty parameter declaration")]
+    fn missing_privilege_path_parameter_name() {
+        let _ = ApiMethod::new_dummy(&PARAMETERS)
+            .access(None, &Permission::Privilege(&["foo", "{}"], 1, true));
+    }
+
+    #[test]
+    #[should_panic(expected = "privilege path references a parameter")]
+    fn missing_parameter_in_combined_component() {
+        let _ = ApiMethod::new_dummy(&PARAMETERS).access(
+            None,
+            &Permission::Or(&[&Permission::Privilege(
+                &["datastore", "{foo}/{baz}"],
+                0b01,
+                true,
+            )]),
+        );
+    }
+
+    #[test]
+    fn malformed_parameter_in_combined_component() {
+        // should work, components are not enclosed in brackets properly so no interpolation should
+        // be done
+        let _ = ApiMethod::new_dummy(&PARAMETERS).access(
+            None,
+            &Permission::Or(&[&Permission::Privilege(&["foo", "bar/{baz/}"], 1, true)]),
+        );
+
+        let _ = ApiMethod::new_dummy(&PARAMETERS).access(
+            None,
+            &Permission::Or(&[&Permission::Privilege(&["foo", "{bar/baz}/"], 1, true)]),
+        );
+    }
+
+    #[test]
+    fn additional_properties_allow_any_parameter() {
+        let _ = ApiMethod::new_dummy(&ADDITIONAL_PARAMETERS)
+            .access(None, &Permission::Privilege(&["foo", "{baz}"], 1, true));
+    }
+}
+
+#[cfg(test)]
+mod producer_stream_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use futures::{FutureExt, StreamExt};
+
+    use super::*;
+
+    #[test]
+    fn records_arrive_in_order_and_an_error_ends_the_stream() {
+        let stream = Stream::from_producer(|mut records| async move {
+            records.send(Record::new("one")).await?;
+            records.send(Record::new("two")).await?;
+            anyhow::bail!("source failed");
+        });
+        let records: Vec<_> = futures::executor::block_on(stream.into_inner().collect());
+        let bytes: Vec<String> = records
+            .iter()
+            .map(|record| String::from_utf8(record.to_bytes()).unwrap())
+            .collect();
+        assert_eq!(
+            bytes,
+            [
+                "\x1e{\"data\":\"one\"}\n",
+                "\x1e{\"data\":\"two\"}\n",
+                "\x1e{\"error\":\"source failed\"}\n",
+            ]
+        );
+    }
+
+    #[test]
+    fn dropping_the_stream_drops_the_producer() {
+        struct Guard(Arc<AtomicBool>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(AtomicBool::new(false));
+        let guard = Guard(Arc::clone(&dropped));
+        let mut stream = Stream::from_producer(|mut records| async move {
+            let _guard = guard;
+            records.send(Record::new("first")).await?;
+            futures::future::pending::<()>().await;
+            Ok(())
+        })
+        .into_inner();
+        let first = futures::executor::block_on(stream.next()).unwrap();
+        assert_eq!(first.to_bytes(), b"\x1e{\"data\":\"first\"}\n");
+        assert!(!dropped.load(Ordering::SeqCst));
+        drop(stream);
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    fn to_strings(records: Vec<Record>) -> Vec<String> {
+        records
+            .iter()
+            .map(|record| String::from_utf8(record.to_bytes()).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn an_error_without_any_record_ends_the_stream() {
+        // the sender is dropped when the closure returns, before the stream polls the producer
+        let stream = Stream::from_producer(|_records| async {
+            Err(anyhow::format_err!(
+                "source failed before producing a record"
+            ))
+        });
+        let records = futures::executor::block_on(stream.into_inner().collect());
+        assert_eq!(
+            to_strings(records),
+            ["\x1e{\"error\":\"source failed before producing a record\"}\n"]
+        );
+    }
+
+    #[test]
+    fn an_error_after_dropping_the_sender_is_delivered() {
+        let (release, released) = futures::channel::oneshot::channel::<()>();
+        let mut stream = Stream::from_producer(|records| async move {
+            drop(records);
+            let _ = released.await;
+            anyhow::bail!("final work failed");
+        })
+        .into_inner();
+        assert!(stream.next().now_or_never().is_none());
+        release.send(()).unwrap();
+        let records = futures::executor::block_on(stream.collect());
+        assert_eq!(
+            to_strings(records),
+            ["\x1e{\"error\":\"final work failed\"}\n"]
+        );
+    }
+
+    #[test]
+    fn queued_records_arrive_before_a_later_error() {
+        let (release, released) = futures::channel::oneshot::channel::<()>();
+        let mut stream = Stream::from_producer(|mut records| async move {
+            records.send(Record::new("sent")).await?;
+            // the record stays queued when the send is given up and the sender dropped
+            assert!(records.send(Record::new("queued")).now_or_never().is_none());
+            drop(records);
+            let _ = released.await;
+            anyhow::bail!("final work failed");
+        })
+        .into_inner();
+        let first = futures::executor::block_on(stream.next()).unwrap();
+        let second = futures::executor::block_on(stream.next()).unwrap();
+        assert_eq!(
+            to_strings(vec![first, second]),
+            ["\x1e{\"data\":\"sent\"}\n", "\x1e{\"data\":\"queued\"}\n"]
+        );
+        assert!(stream.next().now_or_never().is_none());
+        release.send(()).unwrap();
+        let records = futures::executor::block_on(stream.collect());
+        assert_eq!(
+            to_strings(records),
+            ["\x1e{\"error\":\"final work failed\"}\n"]
+        );
     }
 }

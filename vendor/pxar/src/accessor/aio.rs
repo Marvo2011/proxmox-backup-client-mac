@@ -7,18 +7,17 @@
 use std::future::Future;
 use std::io;
 use std::mem;
-use std::ops::Range;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use crate::accessor::{self, cache::Cache, MaybeReady, ReadAt, ReadAtOperation};
+use crate::accessor::{self, ContentRange, MaybeReady, ReadAt, ReadAtOperation, cache::Cache};
 use crate::decoder::aio::Decoder;
 use crate::format::GoodbyeItem;
 use crate::util;
-use crate::Entry;
+use crate::{Entry, PxarVariant};
 
 use super::sync::{FileReader, FileRefReader};
 
@@ -39,7 +38,7 @@ impl<T: FileExt> Accessor<FileReader<T>> {
     /// by a blocking file.
     #[inline]
     pub async fn from_file_and_size(input: T, size: u64) -> io::Result<Self> {
-        Accessor::new(FileReader::new(input), size).await
+        Accessor::new(PxarVariant::Unified(FileReader::new(input)), size).await
     }
 }
 
@@ -75,7 +74,7 @@ where
         input: T,
         size: u64,
     ) -> io::Result<Accessor<FileRefReader<T>>> {
-        Accessor::new(FileRefReader::new(input), size).await
+        Accessor::new(PxarVariant::Unified(FileRefReader::new(input)), size).await
     }
 }
 
@@ -85,7 +84,9 @@ impl<T: ReadAt> Accessor<T> {
     ///
     /// Note that the `input`'s `SeqRead` implementation must always return `Poll::Ready` and is
     /// not allowed to use the `Waker`, as this will cause a `panic!`.
-    pub async fn new(input: T, size: u64) -> io::Result<Self> {
+    /// Optionally take the file payloads from the provided input stream rather than the regular
+    /// pxar stream.
+    pub async fn new(input: PxarVariant<T, (T, u64)>, size: u64) -> io::Result<Self> {
         Ok(Self {
             inner: accessor::AccessorImpl::new(input, size).await?,
         })
@@ -151,13 +152,16 @@ impl<T: Clone + ReadAt> Accessor<T> {
     ///
     /// This will provide a reader over an arbitrary range of the archive file, so unless this
     /// comes from a actual file entry data, the contents might not make much sense.
-    pub unsafe fn open_contents_at_range(&self, range: Range<u64>) -> FileContents<T> {
-        FileContents {
-            inner: unsafe { self.inner.open_contents_at_range(range) },
+    pub async fn open_contents_at_range(
+        &self,
+        range: &ContentRange,
+    ) -> io::Result<FileContents<T>> {
+        Ok(FileContents {
+            inner: self.inner.open_contents_at_range(range).await?,
             at: 0,
             buffer: Vec::new(),
             future: None,
-        }
+        })
     }
 
     /// Following a hardlink.
@@ -205,7 +209,7 @@ impl<T: Clone + ReadAt> Directory<T> {
     }
 
     /// Get an iterator over the directory's contents.
-    pub fn read_dir(&self) -> ReadDir<T> {
+    pub fn read_dir(&self) -> ReadDir<'_, T> {
         ReadDir {
             inner: self.inner.read_dir(),
         }
@@ -233,7 +237,7 @@ impl<T: Clone + ReadAt> FileEntry<T> {
     }
 
     /// For use with unsafe accessor methods.
-    pub fn content_range(&self) -> io::Result<Option<Range<u64>>> {
+    pub fn content_range(&self) -> io::Result<Option<ContentRange>> {
         self.inner.content_range()
     }
 
@@ -313,7 +317,7 @@ pub struct DirEntry<'a, T: Clone + ReadAt> {
     inner: accessor::DirEntryImpl<'a, T>,
 }
 
-impl<'a, T: Clone + ReadAt> DirEntry<'a, T> {
+impl<T: Clone + ReadAt> DirEntry<'_, T> {
     /// Get the current file name.
     pub fn file_name(&self) -> &Path {
         self.inner.file_name()
@@ -382,7 +386,12 @@ impl<T: Clone + ReadAt> tokio::io::AsyncRead for FileContents<T> {
                     // store this in a pinned self. T maybe a reference with a non-'static life
                     // time, but then it cannot be a self-reference into Self, so this should be
                     // valid in all cases:
-                    this.future = Some(unsafe { mem::transmute(future) });
+                    this.future = Some(unsafe {
+                        mem::transmute::<
+                            Pin<Box<dyn Future<Output = io::Result<ReadResult>> + '_>>,
+                            Pin<Box<dyn Future<Output = io::Result<ReadResult>> + 'static>>,
+                        >(future)
+                    });
                 }
                 Some(mut fut) => match fut.as_mut().poll(cx) {
                     Poll::Pending => {

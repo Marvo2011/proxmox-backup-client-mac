@@ -10,7 +10,6 @@ use anyhow::Error;
 use futures::ready;
 use tokio::io::{AsyncRead, AsyncSeek, ReadBuf};
 
-use proxmox_lang::error::io_err_other;
 use proxmox_lang::io_format_err;
 
 use pbs_tools::async_lru_cache::{AsyncCacher, AsyncLruCache};
@@ -82,7 +81,11 @@ impl<I: IndexFile, R: AsyncReadChunk + Send + Sync + 'static> CachedChunkReader<
                 let info = self.index.chunk_info(chunk.0).unwrap();
 
                 // will never be None, see AsyncChunkCacher
-                let data = self.cache.access(info.digest, &self.cacher).await?.unwrap();
+                let data = self
+                    .cache
+                    .access(info.digest, &self.cacher, |_| Ok(()))
+                    .await?
+                    .unwrap();
 
                 let want_bytes = ((info.range.end - cur_offset) as usize).min(size - read);
                 let slice = &mut buf[read..(read + want_bytes)];
@@ -182,7 +185,7 @@ where
                 this.position += read as u64;
                 Ok(())
             }
-            Err(err) => Err(io_err_other(err)),
+            Err(err) => Err(std::io::Error::other(err)),
         };
 
         // future completed, drop

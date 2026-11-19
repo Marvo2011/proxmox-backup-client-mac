@@ -6,13 +6,11 @@
 /// # use proxmox_schema::{api_string_type, ApiStringFormat};
 /// # use proxmox_api_macro::api;
 /// # const PROXMOX_SAFE_ID_FORMAT: ApiStringFormat = ApiStringFormat::Enum(&[]);
-/// use serde::{Deserialize, Serialize};
 ///
 /// api_string_type! {
 ///     #[api(format: &PROXMOX_SAFE_ID_FORMAT)]
 ///     /// ACME account name.
-///     #[derive(Debug, Clone, Eq, PartialEq, Hash, Deserialize, Serialize)]
-///     #[serde(transparent)]
+///     #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 ///     pub struct AccountName(String);
 /// }
 /// ```
@@ -21,6 +19,7 @@
 /// * `Display` as a pass-through to `String`'s `Display`
 /// * `Deref`
 /// * `DerefMut`
+/// * `FromStr`
 /// * `AsRef<str>`
 /// * `TryFrom<String>`
 /// * `fn into_string(self) -> String`
@@ -28,6 +27,17 @@
 /// * `fn from_string(inner: String) -> Result<Self, anyhow::Error>` using
 ///   `StringSchema::check_constraints`.
 /// * `unsafe fn from_string_unchecked(inner: String) -> Self`
+///
+/// [`serde::Serialize`] and [`serde::Deserialize`] are not automatically implemented in order to
+/// leave the implementation to the user. It can be forwarded to [`std::str::FromStr`] /
+/// [`std::fmt::Display`] by using the macros inside the proxmox_serde crate:
+///
+/// ```ignore (needs extra dependency)
+/// proxmox_serde::forward_serialize_to_display!(AccountName);
+/// proxmox_serde::forward_deserialize_to_from_str!(AccountName);
+/// ```
+///
+/// This will use the format specified in the API macro for validating on deserialization.
 #[macro_export]
 macro_rules! api_string_type {
     (
@@ -68,6 +78,17 @@ macro_rules! api_string_type {
             }
         }
 
+        impl ::std::str::FromStr for $name {
+            type Err = ::anyhow::Error;
+
+            fn from_str(inner: &str) -> Result<Self, Self::Err> {
+                use $crate::ApiType;
+                let schema = const { Self::API_SCHEMA.unwrap_string_schema() };
+                schema.check_constraints(inner)?;
+                Ok(Self(inner.to_string()))
+            }
+        }
+
         impl $name {
             /// Get the contained string.
             pub fn into_string(self) -> String {
@@ -95,10 +116,8 @@ macro_rules! api_string_type {
             /// method.
             pub fn from_string(inner: String) -> Result<Self, ::anyhow::Error> {
                 use $crate::ApiType;
-                match &Self::API_SCHEMA {
-                    $crate::Schema::String(s) => s.check_constraints(&inner)?,
-                    _ => unreachable!(),
-                }
+                let schema = const { Self::API_SCHEMA.unwrap_string_schema() };
+                schema.check_constraints(&inner)?;
                 Ok(Self(inner))
             }
         }

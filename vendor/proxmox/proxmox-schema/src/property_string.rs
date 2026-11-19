@@ -43,7 +43,7 @@ impl<'a> Iterator for PropertyIterator<'a> {
 type NextProperty<'a> = (Option<&'a str>, Cow<'a, str>, &'a str);
 
 /// Returns an optional key, its value, and the remainder of `data`.
-pub(crate) fn next_property(mut data: &str) -> Option<Result<NextProperty, Error>> {
+pub(crate) fn next_property(mut data: &str) -> Option<Result<NextProperty<'_>, Error>> {
     if data.is_empty() {
         return None;
     }
@@ -85,7 +85,7 @@ pub(crate) fn next_property(mut data: &str) -> Option<Result<NextProperty, Error
     Some(Ok((key, value, data)))
 }
 
-impl<'a> std::iter::FusedIterator for PropertyIterator<'a> {}
+impl std::iter::FusedIterator for PropertyIterator<'_> {}
 
 /// Parse a quoted string and move `data` to after the closing quote.
 ///
@@ -95,7 +95,7 @@ impl<'a> std::iter::FusedIterator for PropertyIterator<'a> {}
 ///
 /// If no escape sequence is found, `Cow::Borrowed` is returned, otherwise an owned `String` is
 /// returned.
-fn parse_quoted_string<'s>(data: &'_ mut &'s str) -> Result<Cow<'s, str>, Error> {
+pub(crate) fn parse_quoted_string<'s>(data: &'_ mut &'s str) -> Result<Cow<'s, str>, Error> {
     let data_out = data;
     let data = data_out.as_bytes();
 
@@ -196,14 +196,18 @@ fn iterate_over_property_string() {
     );
     assert!(iter.next().is_none());
 
-    assert!(PropertyIterator::new(r#"key="open \\ value"#)
-        .next()
-        .unwrap()
-        .is_err());
-    assert!(PropertyIterator::new(r#"key="open \\ value\""#)
-        .next()
-        .unwrap()
-        .is_err());
+    assert!(
+        PropertyIterator::new(r#"key="open \\ value"#)
+            .next()
+            .unwrap()
+            .is_err()
+    );
+    assert!(
+        PropertyIterator::new(r#"key="open \\ value\""#)
+            .next()
+            .unwrap()
+            .is_err()
+    );
 }
 
 /// A wrapper for a de/serializable type which is stored as a property string.
@@ -267,11 +271,11 @@ where
     where
         D: serde::Deserializer<'de>,
     {
-        use crate::de::{set_in_property_string, InPropertyStringGuard};
+        use crate::de::{InPropertyStringGuard, set_in_property_string};
 
         use std::marker::PhantomData;
 
-        struct V<T>(InPropertyStringGuard, PhantomData<T>);
+        struct V<T>(InPropertyStringGuard, PhantomData<fn() -> T>);
 
         impl<'de, T> serde::de::Visitor<'de> for V<T>
         where
@@ -349,9 +353,9 @@ pub fn print<T: Serialize + ApiType>(value: &T) -> Result<String, Error> {
 }
 
 /// Deserialize a value from a property string.
-pub fn parse<T: ApiType>(value: &str) -> Result<T, Error>
+pub fn parse<T>(value: &str) -> Result<T, Error>
 where
-    T: for<'de> Deserialize<'de>,
+    T: for<'de> Deserialize<'de> + ApiType,
 {
     parse_with_schema(value, &T::API_SCHEMA)
 }
@@ -367,6 +371,7 @@ where
 #[cfg(test)]
 mod test {
     use serde::{Deserialize, Serialize};
+    use std::collections::HashMap;
 
     use crate::schema::*;
 
@@ -467,5 +472,68 @@ mod test {
         assert_eq!(obj, deserialized, "deserialized does not equal original");
 
         Ok(())
+    }
+
+    #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+    pub struct NetworkCard {
+        model: String,
+        macaddr: String,
+        disconnected: Option<bool>,
+    }
+
+    impl ApiType for NetworkCard {
+        const API_SCHEMA: Schema = ObjectSchema::new(
+            "A network card",
+            &[
+                // MUST BE SORTED
+                (
+                    "disconnected",
+                    true,
+                    &BooleanSchema::new("disconnected").schema(),
+                ),
+                ("macaddr", false, &StringSchema::new("macaddr").schema()),
+                ("model", false, &StringSchema::new("model").schema()),
+            ],
+        )
+        .key_alias_info(crate::schema::KeyAliasInfo::new(
+            "model",
+            &["e1000", "virtio"],
+            "macaddr",
+        ))
+        .schema();
+    }
+
+    #[test]
+    fn test_key_alias_info() -> Result<(), super::Error> {
+        let deserialized: NetworkCard = super::parse("virtio=aa:bb:cc:dd:ee,disconnected=0")
+            .expect("failed to parse property string");
+
+        assert_eq!(
+            deserialized,
+            NetworkCard {
+                model: "virtio".to_string(),
+                macaddr: "aa:bb:cc:dd:ee".to_string(),
+                disconnected: Some(false),
+            },
+            "KeyAliasInfo deserialization failed"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_map_serialization() {
+        #[derive(Serialize, PartialEq)]
+        struct Outer(HashMap<String, u32>);
+
+        impl ApiType for Outer {
+            const API_SCHEMA: Schema = ObjectSchema::new("Outer", &[])
+                .additional_properties(true)
+                .schema();
+        }
+
+        let mut map = HashMap::with_capacity(2);
+        map.insert("a".to_owned(), 1);
+        assert_eq!(super::print(&Outer(map)).expect("property string"), "a=1");
     }
 }

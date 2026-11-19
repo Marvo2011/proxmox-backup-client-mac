@@ -2,110 +2,124 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::hash::BuildHasher;
 use std::os::unix::io::{AsRawFd, OwnedFd};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::{bail, format_err, Error};
+use anyhow::{Error, bail, format_err};
 use futures::future::FutureExt;
 use futures::select;
 use futures::stream::{StreamExt, TryStreamExt};
-use nix::unistd::{fork, ForkResult};
+use nix::unistd::{ForkResult, fork};
 use serde_json::Value;
-use tokio::signal::unix::{signal, SignalKind};
+use tokio::signal::unix::{SignalKind, signal};
 
-use proxmox_router::{cli::*, ApiHandler, ApiMethod, RpcEnvironment};
+use proxmox_router::{ApiHandler, ApiMethod, RpcEnvironment, cli::*};
 use proxmox_schema::*;
 use proxmox_sortable_macro::sortable;
 
-use pbs_api_types::BackupNamespace;
-use pbs_client::tools::key_source::get_encryption_key_password;
-use pbs_client::{BackupReader, RemoteChunkReader};
+use pbs_api_types::{ArchiveType, BackupArchiveName};
+use pbs_client::tools::key_source::{
+    IGNORE_MISSING_SIGNATURE_SCHEMA, crypto_parameters, format_key_source,
+    get_encryption_key_password,
+};
+use pbs_client::{BackupReader, BackupTargetArgs, RemoteChunkReader};
 use pbs_datastore::cached_chunk_reader::CachedChunkReader;
-use pbs_datastore::dynamic_index::BufferedDynamicReader;
 use pbs_datastore::index::IndexFile;
-use pbs_key_config::load_and_decrypt_key;
+use pbs_key_config::decrypt_key;
 use pbs_tools::crypt_config::CryptConfig;
 use pbs_tools::json::required_string_param;
 
+use crate::helper;
 use crate::{
     complete_group_or_snapshot, complete_img_archive_name, complete_namespace,
     complete_pxar_archive_name, complete_repository, connect, dir_or_last_from_group,
-    extract_repository_from_value, optional_ns_param, record_repository, BufferedDynamicReadAt,
-    REPO_URL_SCHEMA,
+    extract_repository_from_value, optional_ns_param, record_repository,
 };
 
 #[sortable]
-const API_METHOD_MOUNT: ApiMethod = ApiMethod::new(
+const API_METHOD_MOUNT: ApiMethod = ApiMethod::new_full(
     &ApiHandler::Sync(&mount),
-    &ObjectSchema::new(
+    ParameterSchema::AllOf(&AllOfSchema::new(
         "Mount pxar archive.",
-        &sorted!([
-            ("ns", true, &BackupNamespace::API_SCHEMA,),
-            (
-                "snapshot",
-                false,
-                &StringSchema::new("Group/Snapshot path.").schema()
-            ),
-            (
-                "archive-name",
-                false,
-                &StringSchema::new("Backup archive name.").schema()
-            ),
-            (
-                "target",
-                false,
-                &StringSchema::new("Target directory path.").schema()
-            ),
-            ("repository", true, &REPO_URL_SCHEMA),
-            (
-                "keyfile",
-                true,
-                &StringSchema::new("Path to encryption key.").schema()
-            ),
-            (
-                "verbose",
-                true,
-                &BooleanSchema::new("Verbose output and stay in foreground.")
-                    .default(false)
-                    .schema()
-            ),
-        ]),
-    ),
+        &[
+            &ObjectSchema::new(
+                "<mount parameters>",
+                &sorted!([
+                    (
+                        "snapshot",
+                        false,
+                        &StringSchema::new("Group/Snapshot path.").schema()
+                    ),
+                    ("archive-name", false, &BackupArchiveName::API_SCHEMA),
+                    (
+                        "target",
+                        false,
+                        &StringSchema::new("Target directory path.").schema()
+                    ),
+                    (
+                        "keyfile",
+                        true,
+                        &StringSchema::new("Path to encryption key.").schema()
+                    ),
+                    (
+                        "ignore-missing-signature",
+                        true,
+                        &IGNORE_MISSING_SIGNATURE_SCHEMA
+                    ),
+                    (
+                        "verbose",
+                        true,
+                        &BooleanSchema::new("Verbose output and stay in foreground.")
+                            .default(false)
+                            .schema()
+                    ),
+                ]),
+            )
+            .schema(),
+            &BackupTargetArgs::API_SCHEMA,
+        ],
+    )),
 );
 
 #[sortable]
-const API_METHOD_MAP: ApiMethod = ApiMethod::new(
+const API_METHOD_MAP: ApiMethod = ApiMethod::new_full(
     &ApiHandler::Sync(&mount),
-    &ObjectSchema::new(
-        "Map a drive image from a VM backup to a local loopback device. Use 'unmap' to undo.
-WARNING: Only do this with *trusted* backups!",
-        &sorted!([
-            ("ns", true, &BackupNamespace::API_SCHEMA,),
-            (
-                "snapshot",
-                false,
-                &StringSchema::new("Group/Snapshot path.").schema()
-            ),
-            (
-                "archive-name",
-                false,
-                &StringSchema::new("Backup archive name.").schema()
-            ),
-            ("repository", true, &REPO_URL_SCHEMA),
-            (
-                "keyfile",
-                true,
-                &StringSchema::new("Path to encryption key.").schema()
-            ),
-            (
-                "verbose",
-                true,
-                &BooleanSchema::new("Verbose output and stay in foreground.")
-                    .default(false)
-                    .schema()
-            ),
-        ]),
-    ),
+    ParameterSchema::AllOf(&AllOfSchema::new(
+        "Map a drive image from a VM backup to a local loopback device. Use 'unmap' to undo.\n\
+         WARNING: Only do this with *trusted* backups!",
+        &[
+            &ObjectSchema::new(
+                "<map parameters>",
+                &sorted!([
+                    (
+                        "snapshot",
+                        false,
+                        &StringSchema::new("Group/Snapshot path.").schema()
+                    ),
+                    ("archive-name", false, &BackupArchiveName::API_SCHEMA),
+                    (
+                        "keyfile",
+                        true,
+                        &StringSchema::new("Path to encryption key.").schema()
+                    ),
+                    (
+                        "ignore-missing-signature",
+                        true,
+                        &IGNORE_MISSING_SIGNATURE_SCHEMA
+                    ),
+                    (
+                        "verbose",
+                        true,
+                        &BooleanSchema::new("Verbose output and stay in foreground.")
+                            .default(false)
+                            .schema()
+                    ),
+                ]),
+            )
+            .schema(),
+            &BackupTargetArgs::API_SCHEMA,
+        ],
+    )),
 );
 
 #[sortable]
@@ -156,7 +170,7 @@ fn complete_mapping_names<S: BuildHasher>(
 ) -> Vec<String> {
     match pbs_fuse_loop::find_all_mappings() {
         Ok(mappings) => mappings
-            .filter_map(|(name, _)| proxmox_sys::systemd::unescape_unit(&name).ok())
+            .filter_map(|(name, _)| proxmox_systemd::unescape_unit(&name).ok())
             .collect(),
         Err(_) => Vec::new(),
     }
@@ -177,13 +191,21 @@ fn mount(
     // Process should be daemonized.
     // Make sure to fork before the async runtime is instantiated to avoid troubles.
     let (pr, pw) = proxmox_sys::pipe()?;
-    let pr: OwnedFd = pr.into(); // until next sys bump
-    let pw: OwnedFd = pw.into();
     match unsafe { fork() } {
         Ok(ForkResult::Parent { .. }) => {
             drop(pw);
             // Blocks the parent process until we are ready to go in the child
-            let _res = nix::unistd::read(pr.as_raw_fd(), &mut [0]).unwrap();
+            let mut buffer = [0u8];
+            nix::unistd::read(pr.as_raw_fd(), &mut buffer).unwrap();
+
+            // Read buffer didn't change, which indicates that nothing has been read and the file
+            // descriptor has probably been closed. This means that there was an error in the child
+            // process and it did not daemonize correctly.
+            if buffer[0] == 0 {
+                // Wait for the child process to finish, so it can return a nice error.
+                nix::sys::wait::wait().unwrap();
+            }
+
             Ok(Value::Null)
         }
         Ok(ForkResult::Child) => {
@@ -197,7 +219,8 @@ fn mount(
 
 async fn mount_do(param: Value, pipe: Option<OwnedFd>) -> Result<Value, Error> {
     let repo = extract_repository_from_value(&param)?;
-    let archive_name = required_string_param(&param, "archive-name")?;
+    let server_archive_name: BackupArchiveName =
+        required_string_param(&param, "archive-name")?.try_into()?;
     let client = connect(&repo)?;
 
     let target = param["target"].as_str();
@@ -208,27 +231,27 @@ async fn mount_do(param: Value, pipe: Option<OwnedFd>) -> Result<Value, Error> {
     let path = required_string_param(&param, "snapshot")?;
     let backup_dir = dir_or_last_from_group(&client, &repo, &backup_ns, path).await?;
 
-    let keyfile = param["keyfile"].as_str().map(PathBuf::from);
-    let crypt_config = match keyfile {
+    let crypto = crypto_parameters(&param)?;
+
+    let crypt_config = match crypto.enc_key {
         None => None,
-        Some(path) => {
-            log::info!("Encryption key file: '{:?}'", path);
-            let (key, _, fingerprint) = load_and_decrypt_key(&path, &get_encryption_key_password)?;
-            log::info!("Encryption key fingerprint: '{}'", fingerprint);
-            Some(Arc::new(CryptConfig::new(key)?))
+        Some(key) => {
+            log::info!("{}", format_key_source(&key.source, "encryption"));
+            let (key, _created, fingerprint) = decrypt_key(&key.key, &get_encryption_key_password)?;
+            log::info!("Encryption key fingerprint: '{fingerprint}'");
+            let crypt_config = CryptConfig::new(key)?;
+            Some(Arc::new(crypt_config))
         }
     };
 
-    let server_archive_name = if archive_name.ends_with(".pxar") {
+    if server_archive_name.has_pxar_filename_extension() {
         if target.is_none() {
             bail!("use the 'mount' command to mount pxar archives");
         }
-        format!("{}.didx", archive_name)
-    } else if archive_name.ends_with(".img") {
+    } else if server_archive_name.ends_with(".img.fidx") {
         if target.is_some() {
             bail!("use the 'map' command to map drive images");
         }
-        format!("{}.fidx", archive_name)
     } else {
         bail!("Can only mount/map pxar archives and drive images.");
     };
@@ -243,10 +266,9 @@ async fn mount_do(param: Value, pipe: Option<OwnedFd>) -> Result<Value, Error> {
     )
     .await?;
 
-    let (manifest, _) = client.download_manifest().await?;
+    let ignore_missing_signature = param["ignore-missing-signature"].as_bool().unwrap_or(false);
+    let (manifest, _) = client.download_manifest(ignore_missing_signature).await?;
     manifest.check_fingerprint(crypt_config.as_ref().map(Arc::as_ref))?;
-
-    let file_info = manifest.lookup_file_info(&server_archive_name)?;
 
     let daemonize = || -> Result<(), Error> {
         if let Some(pipe) = pipe {
@@ -266,7 +288,7 @@ async fn mount_do(param: Value, pipe: Option<OwnedFd>) -> Result<Value, Error> {
             }
             // Signal the parent process that we are done with the setup and it can
             // terminate.
-            nix::unistd::write(pipe.as_raw_fd(), &[0u8])?;
+            nix::unistd::write(&pipe, &[1u8])?;
             let _: OwnedFd = pipe;
         }
 
@@ -282,21 +304,14 @@ async fn mount_do(param: Value, pipe: Option<OwnedFd>) -> Result<Value, Error> {
     let mut interrupt =
         futures::future::select(interrupt_int.recv().boxed(), interrupt_term.recv().boxed());
 
-    if server_archive_name.ends_with(".didx") {
-        let index = client
-            .download_dynamic_index(&manifest, &server_archive_name)
-            .await?;
-        let most_used = index.find_most_used_chunks(8);
-        let chunk_reader = RemoteChunkReader::new(
+    if server_archive_name.archive_type() == ArchiveType::DynamicIndex {
+        let decoder = helper::get_pxar_fuse_accessor(
+            &server_archive_name,
             client.clone(),
-            crypt_config,
-            file_info.chunk_crypt_mode(),
-            most_used,
-        );
-        let reader = BufferedDynamicReader::new(index, chunk_reader);
-        let archive_size = reader.archive_size();
-        let reader: pbs_pxar_fuse::Reader = Arc::new(BufferedDynamicReadAt::new(reader));
-        let decoder = pbs_pxar_fuse::Accessor::new(reader, archive_size).await?;
+            &manifest,
+            crypt_config.clone(),
+        )
+        .await?;
 
         let session =
             pbs_pxar_fuse::Session::mount(decoder, options, false, Path::new(target.unwrap()))
@@ -310,7 +325,8 @@ async fn mount_do(param: Value, pipe: Option<OwnedFd>) -> Result<Value, Error> {
                 // exit on interrupted
             }
         }
-    } else if server_archive_name.ends_with(".fidx") {
+    } else if server_archive_name.archive_type() == ArchiveType::FixedIndex {
+        let file_info = manifest.lookup_file_info(&server_archive_name)?;
         let index = client
             .download_fixed_index(&manifest, &server_archive_name)
             .await?;
@@ -323,8 +339,11 @@ async fn mount_do(param: Value, pipe: Option<OwnedFd>) -> Result<Value, Error> {
         );
         let reader = CachedChunkReader::new(chunk_reader, index, 8).seekable();
 
-        let name = &format!("{}:{}/{}", repo, path, archive_name);
-        let name_escaped = proxmox_sys::systemd::escape_unit(name, false);
+        let name = &format!(
+            "{repo}:{path}/{}",
+            server_archive_name.without_type_extension(),
+        );
+        let name_escaped = proxmox_systemd::escape_unit(name, false);
 
         let mut session =
             pbs_fuse_loop::FuseLoopSession::map_loop(size, reader, &name_escaped, options).await?;
@@ -389,7 +408,7 @@ fn unmap(
             pbs_fuse_loop::cleanup_unused_run_files(None);
             let mut any = false;
             for (backing, loopdev) in pbs_fuse_loop::find_all_mappings()? {
-                let name = proxmox_sys::systemd::unescape_unit(&backing)?;
+                let name = proxmox_systemd::unescape_unit(&backing)?;
                 log::info!(
                     "{}:\t{}",
                     loopdev.unwrap_or_else(|| "(unmapped)".to_string()),
@@ -412,7 +431,7 @@ fn unmap(
     if name.starts_with(pbs_fuse_loop::DEVICE_PREFIX) {
         pbs_fuse_loop::unmap_loopdev(name)?;
     } else {
-        let name = proxmox_sys::systemd::escape_unit(&name, false);
+        let name = proxmox_systemd::escape_unit(&name, false);
         pbs_fuse_loop::unmap_name(name)?;
     }
 

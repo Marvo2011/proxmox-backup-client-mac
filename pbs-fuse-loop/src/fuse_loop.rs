@@ -1,13 +1,15 @@
 //! Map a raw data reader as a loop device via FUSE
 
-use anyhow::{bail, format_err, Error};
+use anyhow::{Error, bail, format_err};
 #[cfg(target_os = "linux")]
 use std::collections::HashMap;
 use std::ffi::OsStr;
-use std::fs::{read_to_string, remove_file, File, OpenOptions};
-use std::io::prelude::*;
+use std::fs::{File, OpenOptions, read_to_string, remove_file};
 use std::io::SeekFrom;
+use std::io::prelude::*;
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
+use std::sync::LazyLock;
 
 use nix::sys::signal::{self, Signal};
 use nix::unistd::Pid;
@@ -87,9 +89,7 @@ fn device_file(backing_file: &Path) -> PathBuf {
 }
 
 #[cfg(target_os = "linux")]
-lazy_static::lazy_static! {
-    static ref LOOPDEV_REGEX: Regex = Regex::new(r"^loop\d+$").unwrap();
-}
+static LOOPDEV_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^loop\d+$").unwrap());
 
 /// Represents an ongoing FUSE-session that has been mapped onto a loop device.
 /// Create with map_loop, then call 'main' and poll until startup_chan reports
@@ -189,7 +189,7 @@ impl<R: AsyncRead + AsyncSeek + Unpin> FuseLoopSession<R> {
     fn write_pidfile(path: &Path) -> Result<(), Error> {
         let pid = unsafe { libc::getpid() };
         let mut file = File::create(path)?;
-        write!(file, "{}", pid)?;
+        write!(file, "{pid}")?;
         Ok(())
     }
 
@@ -446,8 +446,7 @@ fn get_backing_file(loopdev: &str) -> Result<String, Error> {
     })?;
 
     let block_path = PathBuf::from(format!(
-        "/sys/devices/virtual/block/loop{}/loop/backing_file",
-        num
+        "/sys/devices/virtual/block/loop{num}/loop/backing_file"
     ));
     let backing_file = read_to_string(block_path).map_err(|err| {
         if err.kind() == std::io::ErrorKind::NotFound {

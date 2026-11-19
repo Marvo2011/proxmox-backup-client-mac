@@ -18,18 +18,22 @@
 //!     ...
 //! ```
 
+#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::Path;
 
-use anyhow::{bail, format_err, Error};
+use anyhow::{Error, bail, format_err};
 use serde::de::DeserializeOwned;
 use serde::ser::Serialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use proxmox_lang::try_block;
-use proxmox_schema::format::{dump_properties, wrap_text, ParameterDisplayStyle};
+use proxmox_schema::format::{ParameterDisplayStyle, dump_properties, wrap_text};
 use proxmox_schema::*;
+
+pub mod typed;
 
 /// Used for additional properties when the schema allows them.
 const ADDITIONAL_PROPERTY_SCHEMA: Schema = StringSchema::new("Additional property").schema();
@@ -39,6 +43,7 @@ pub struct SectionConfigPlugin {
     type_name: String,
     properties: &'static (dyn ObjectSchemaType + Send + Sync + 'static),
     id_property: Option<String>,
+    type_key: Option<&'static str>,
 }
 
 impl SectionConfigPlugin {
@@ -51,7 +56,14 @@ impl SectionConfigPlugin {
             type_name,
             properties,
             id_property,
+            type_key: None,
         }
+    }
+
+    /// Override the type key for this plugin.
+    pub const fn with_type_key(mut self, type_key: &'static str) -> Self {
+        self.type_key = Some(type_key);
+        self
     }
 
     pub fn type_name(&self) -> &str {
@@ -66,17 +78,16 @@ impl SectionConfigPlugin {
         self.properties
     }
 
-    pub fn get_id_schema(&self) -> Option<&Schema> {
-        match &self.id_property {
-            Some(id_prop) => {
-                if let Some((_, schema)) = self.properties.lookup(id_prop) {
-                    Some(schema)
-                } else {
-                    None
-                }
-            }
-            None => None,
-        }
+    pub fn get_id_schema(&self) -> Option<&'static Schema> {
+        let id_prop = self.id_property.as_deref()?;
+        // We pass `None` since the ID schema of a section config must not be inside a
+        // `oneOf`. It wouldn't make sense, as it would be potentially inaccessible
+        // depending on *another* key's value.
+        Some(
+            self.properties
+                .lookup_schema(id_prop, &proxmox_schema::NoTypeData)?
+                .1,
+        )
     }
 }
 
@@ -93,12 +104,20 @@ pub struct SectionConfig {
         fn(type_name: &str, section_id: &str, key: &str, value: &Value) -> Result<String, Error>,
 
     allow_unknown_sections: bool,
+    type_key: Option<&'static str>,
 }
 
 enum ParseState<'a> {
     BeforeHeader,
-    InsideSection(&'a SectionConfigPlugin, String, Value),
+    InsideSection(InsideSection<'a>),
     InsideUnknownSection(String, String, Value),
+}
+
+struct InsideSection<'a> {
+    plugin: &'a SectionConfigPlugin,
+    section_id: String,
+    header_data: Value,
+    properties: Vec<(usize, String, String)>,
 }
 
 /// Interface to manipulate configuration data
@@ -243,6 +262,7 @@ impl SectionConfig {
             format_section_header: Self::default_format_section_header,
             format_section_content: Self::default_format_section_content,
             allow_unknown_sections: false,
+            type_key: None,
         }
     }
 
@@ -256,6 +276,7 @@ impl SectionConfig {
             format_section_header: Self::systemd_format_section_header,
             format_section_content: Self::systemd_format_section_content,
             allow_unknown_sections: false,
+            type_key: None,
         }
     }
 
@@ -284,11 +305,18 @@ impl SectionConfig {
             format_section_header,
             format_section_content,
             allow_unknown_sections: false,
+            type_key: None,
         }
     }
 
     pub const fn allow_unknown_sections(mut self, allow_unknown_sections: bool) -> Self {
         self.allow_unknown_sections = allow_unknown_sections;
+        self
+    }
+
+    /// The default type key for all and unknown section types.
+    pub const fn with_type_key(mut self, type_key: &'static str) -> Self {
+        self.type_key = Some(type_key);
         self
     }
 
@@ -322,7 +350,7 @@ impl SectionConfig {
         let mut done = HashSet::new();
 
         for section_id in &config.order {
-            if config.sections.get(section_id).is_none() {
+            if !config.sections.contains_key(section_id) {
                 continue;
             };
             list.push(section_id);
@@ -361,10 +389,11 @@ impl SectionConfig {
                     raw += &(self.format_section_header)(type_name, section_id, section_config)?;
 
                     for (key, value) in section_config.as_object().unwrap() {
-                        if let Some(id_property) = &plugin.id_property {
-                            if id_property == key {
-                                continue; // skip writing out id properties, they are in the section header
-                            }
+                        if plugin.id_property.as_deref() == Some(key)
+                            || plugin.type_key == Some(key)
+                            || (plugin.type_key.is_none() && self.type_key == Some(key))
+                        {
+                            continue; // id and type are part of the section header
                         }
                         raw += &(self.format_section_content)(type_name, section_id, key, value)?;
                     }
@@ -405,27 +434,6 @@ impl SectionConfig {
     ) -> Result<SectionConfigData, Error> {
         let mut state = ParseState::BeforeHeader;
 
-        let test_required_properties = |value: &Value,
-                                        schema: &(dyn ObjectSchemaType + Send + Sync),
-                                        id_property: &Option<String>|
-         -> Result<(), Error> {
-            for (name, optional, _prop_schema) in schema.properties() {
-                if let Some(id_property) = id_property {
-                    if name == id_property {
-                        // the id_property is the section header, skip for requirement check
-                        continue;
-                    }
-                }
-                if !*optional && value[name] == Value::Null {
-                    return Err(format_err!(
-                        "property '{}' is missing and it is not optional.",
-                        name
-                    ));
-                }
-            }
-            Ok(())
-        };
-
         let mut line_no = 0;
 
         try_block!({
@@ -445,7 +453,15 @@ impl SectionConfig {
                                 (self.parse_section_header)(line)
                             {
                                 //println!("OKLINE: type: {} ID: {}", section_type, section_id);
+
                                 if let Some(plugin) = self.plugins.get(&section_type) {
+                                    let section_data =
+                                        if let Some(type_key) = plugin.type_key.or(self.type_key) {
+                                            json!({type_key: section_type})
+                                        } else {
+                                            json!({})
+                                        };
+
                                     let id_schema =
                                         plugin.get_id_schema().unwrap_or(self.id_schema);
                                     if let Err(err) = id_schema.parse_simple_value(&section_id) {
@@ -454,13 +470,22 @@ impl SectionConfig {
                                             err.to_string()
                                         );
                                     }
-                                    state =
-                                        ParseState::InsideSection(plugin, section_id, json!({}));
+                                    state = ParseState::InsideSection(InsideSection {
+                                        plugin,
+                                        section_id,
+                                        header_data: section_data,
+                                        properties: Vec::new(),
+                                    });
                                 } else if self.allow_unknown_sections {
+                                    let section_data = if let Some(type_key) = self.type_key {
+                                        json!({type_key: section_type})
+                                    } else {
+                                        json!({})
+                                    };
                                     state = ParseState::InsideUnknownSection(
                                         section_type,
                                         section_id,
-                                        json!({}),
+                                        section_data,
                                     );
                                 } else {
                                     bail!("unknown section type '{}'", section_type);
@@ -469,57 +494,14 @@ impl SectionConfig {
                                 bail!("syntax error (expected header)");
                             }
                         }
-                        ParseState::InsideSection(plugin, ref mut section_id, ref mut config) => {
+                        ParseState::InsideSection(ref mut inside) => {
                             if line.trim().is_empty() {
-                                // finish section
-                                test_required_properties(
-                                    config,
-                                    plugin.properties,
-                                    &plugin.id_property,
-                                )?;
-                                if let Some(id_property) = &plugin.id_property {
-                                    config[id_property] = Value::from(section_id.clone());
-                                }
-                                result.set_data(section_id, &plugin.type_name, config.take())?;
-                                result.record_order(section_id);
-
+                                Self::finish_section(&mut result, inside, &mut line_no)?;
                                 state = ParseState::BeforeHeader;
                                 continue;
                             }
                             if let Some((key, value)) = (self.parse_section_content)(line) {
-                                //println!("CONTENT: key: {} value: {}", key, value);
-
-                                let schema = plugin.properties.lookup(&key);
-                                let (is_array, prop_schema) = match schema {
-                                    Some((_optional, Schema::Array(ArraySchema { items, .. }))) => {
-                                        (true, items)
-                                    }
-                                    Some((_optional, ref prop_schema)) => (false, prop_schema),
-                                    None => match plugin.properties.additional_properties() {
-                                        true => (false, &&ADDITIONAL_PROPERTY_SCHEMA),
-                                        false => bail!("unknown property '{}'", key),
-                                    },
-                                };
-
-                                let value = match prop_schema.parse_simple_value(&value) {
-                                    Ok(value) => value,
-                                    Err(err) => {
-                                        bail!("property '{}': {}", key, err.to_string());
-                                    }
-                                };
-
-                                #[allow(clippy::collapsible_if)] // clearer
-                                if is_array {
-                                    if config[&key] == Value::Null {
-                                        config[key] = json!([value]);
-                                    } else {
-                                        config[key].as_array_mut().unwrap().push(value);
-                                    }
-                                } else if config[&key] == Value::Null {
-                                    config[key] = value;
-                                } else {
-                                    bail!("duplicate property '{}'", key);
-                                }
+                                inside.properties.push((line_no, key, value));
                             } else {
                                 bail!("syntax error (expected section properties)");
                             }
@@ -555,14 +537,8 @@ impl SectionConfig {
 
                 match state {
                     ParseState::BeforeHeader => {}
-                    ParseState::InsideSection(plugin, ref mut section_id, ref mut config) => {
-                        // finish section
-                        test_required_properties(config, plugin.properties, &plugin.id_property)?;
-                        if let Some(id_property) = &plugin.id_property {
-                            config[id_property] = Value::from(section_id.clone());
-                        }
-                        result.set_data(section_id, &plugin.type_name, config)?;
-                        result.record_order(section_id);
+                    ParseState::InsideSection(ref mut inside) => {
+                        Self::finish_section(&mut result, inside, &mut line_no)?;
                     }
                     ParseState::InsideUnknownSection(
                         ref section_type,
@@ -584,12 +560,99 @@ impl SectionConfig {
         .map_err(|e: Error| format_err!("parsing {:?} failed: {}", filename.as_ref(), e))
     }
 
+    fn test_required_properties(
+        value: &Value,
+        schema: &dyn ObjectSchemaType,
+        id_property: Option<&str>,
+    ) -> Result<(), Error> {
+        for property in schema.all_properties().with_types_from(value) {
+            let name = property.name();
+            if let Some(id_property) = id_property
+                && name == id_property
+            {
+                // the id_property is the section header, skip for requirement check
+                continue;
+            }
+            if !property.optional() && value[name] == Value::Null {
+                return Err(format_err!(
+                    "property '{}' is missing and it is not optional.",
+                    name
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn parse_section_property(
+        config: &mut Value,
+        schema: &dyn ObjectSchemaType,
+        key: &str,
+        value: &str,
+        type_data: &dyn WithTypeField,
+    ) -> Result<(), Error> {
+        let (is_array, prop_schema) = match schema.lookup_schema(key, type_data) {
+            Some((_, Schema::Array(ArraySchema { items, .. }))) => (true, *items),
+            Some((_, prop_schema)) => (false, prop_schema),
+            None if schema.additional_properties() => (false, &ADDITIONAL_PROPERTY_SCHEMA),
+            None => bail!("unknown property '{}'", key),
+        };
+        let value = prop_schema
+            .parse_simple_value(value)
+            .map_err(|err| format_err!("property '{}': {}", key, err))?;
+
+        if is_array {
+            if config[key] == Value::Null {
+                config[key] = json!([value]);
+            } else {
+                config[key].as_array_mut().unwrap().push(value);
+            }
+        } else if config[key] == Value::Null {
+            config[key] = value;
+        } else {
+            bail!("duplicate property '{}'", key);
+        }
+        Ok(())
+    }
+
+    fn finish_section(
+        result: &mut SectionConfigData,
+        inside: &InsideSection<'_>,
+        line_no: &mut usize,
+    ) -> Result<(), Error> {
+        let plugin = inside.plugin;
+        let section_id = &inside.section_id;
+        let mut config = inside.header_data.clone();
+
+        // Type properties can follow their variant's properties, as written files sort them. Parse
+        // in file order to keep array values ordered and errors at the first bad line.
+        let type_data = |key: &str, func: &mut dyn FnMut(Option<&str>)| {
+            func(inside.header_data[key].as_str().or_else(|| {
+                let (_, _, value) = inside.properties.iter().find(|(_, name, _)| name == key)?;
+                Some(value.as_str())
+            }))
+        };
+        for (property_line, key, value) in &inside.properties {
+            Self::parse_section_property(&mut config, plugin.properties, key, value, &type_data)
+                .inspect_err(|_| *line_no = *property_line)?;
+        }
+
+        plugin.properties.canonicalize_aliases(&mut config)?;
+        Self::test_required_properties(&config, plugin.properties, plugin.id_property.as_deref())?;
+        plugin.properties.verify_type_fields(&config)?;
+        if let Some(id_property) = &plugin.id_property {
+            config[id_property] = Value::from(section_id.clone());
+        }
+        result.set_data(section_id, &plugin.type_name, config)?;
+        result.record_order(section_id);
+        Ok(())
+    }
+
     fn default_format_section_header(
         type_name: &str,
         section_id: &str,
         _data: &Value,
     ) -> Result<String, Error> {
-        Ok(format!("{}: {}\n", type_name, section_id))
+        Ok(format!("{type_name}: {section_id}\n"))
     }
 
     fn default_format_section_content(
@@ -631,7 +694,7 @@ impl SectionConfig {
             );
         }
 
-        Ok(format!("\t{} {}\n", key, text))
+        Ok(format!("\t{key} {text}\n"))
     }
 
     fn default_parse_section_content(line: &str) -> Option<(String, String)> {
@@ -700,10 +763,10 @@ impl SectionConfig {
         _data: &Value,
     ) -> Result<String, Error> {
         if type_name != section_id {
-            bail!("gut unexpexted section type");
+            bail!("gut unexpected section type");
         }
 
-        Ok(format!("[{}]\n", section_id))
+        Ok(format!("[{section_id}]\n"))
     }
 
     fn systemd_format_section_content(
@@ -745,7 +808,7 @@ impl SectionConfig {
             );
         }
 
-        Ok(format!("{}={}\n", key, text))
+        Ok(format!("{key}={text}\n"))
     }
 
     fn systemd_parse_section_content(line: &str) -> Option<(String, String)> {
@@ -844,7 +907,7 @@ lvmthin: local-lvm2
 ";
 
     let res = config.parse(filename, raw);
-    println!("RES: {:?}", res);
+    println!("RES: {res:?}");
     let raw = config.write(filename, &res.unwrap());
     println!("CONFIG:\n{}", raw.unwrap());
 }
@@ -915,7 +978,7 @@ group: mygroup
 ";
 
     let res = config.parse(filename, raw);
-    println!("RES: {:?}", res);
+    println!("RES: {res:?}");
     let raw = config.write(filename, &res.unwrap());
     println!("CONFIG:\n{}", raw.unwrap());
 }
@@ -964,11 +1027,11 @@ lvmthin: local-lvm2
 ";
 
     let res = config.parse(filename, raw);
-    println!("RES: {:?}", res);
+    println!("RES: {res:?}");
     let created = config
         .write(filename, &res.unwrap())
         .expect("failed to write config");
-    println!("CONFIG:\n{}", raw);
+    println!("CONFIG:\n{raw}");
 
     assert_eq!(raw, created);
 }
@@ -998,19 +1061,11 @@ fn test_section_config_with_additional_properties() {
         ),
     ];
 
-    const USER_PROPERTIES: ObjectSchema = ObjectSchema {
-        description: "user properties",
-        properties: &PROPERTIES,
-        additional_properties: false,
-        default_key: None,
-    };
+    const USER_PROPERTIES: ObjectSchema = ObjectSchema::new("user properties", &PROPERTIES);
 
-    const USER_PROPERTIES_WITH_ADDTIONAL: ObjectSchema = ObjectSchema {
-        description: "user properties with additional",
-        properties: &PROPERTIES,
-        additional_properties: true,
-        default_key: None,
-    };
+    const USER_PROPERTIES_WITH_ADDITIONAL: ObjectSchema =
+        ObjectSchema::new("user properties with additional", &PROPERTIES)
+            .additional_properties(true);
 
     let plugin = SectionConfigPlugin::new(
         "user".to_string(),
@@ -1022,7 +1077,7 @@ fn test_section_config_with_additional_properties() {
     let plugin = SectionConfigPlugin::new(
         "user".to_string(),
         Some("userid".to_string()),
-        &USER_PROPERTIES_WITH_ADDTIONAL,
+        &USER_PROPERTIES_WITH_ADDITIONAL,
     );
     config_with_additional.register_plugin(plugin);
 
@@ -1034,7 +1089,7 @@ user: root@pam
 ";
 
     let res = config_with_additional.parse(filename, raw);
-    println!("RES: {:?}", res);
+    println!("RES: {res:?}");
     let written = config_with_additional.write(filename, &res.unwrap());
     println!("CONFIG:\n{}", written.unwrap());
 
@@ -1068,12 +1123,7 @@ fn test_section_config_with_unknown_section_types() {
         ),
     ];
 
-    const USER_PROPERTIES: ObjectSchema = ObjectSchema {
-        description: "user properties",
-        properties: &PROPERTIES,
-        additional_properties: false,
-        default_key: None,
-    };
+    const USER_PROPERTIES: ObjectSchema = ObjectSchema::new("user properties", &PROPERTIES);
 
     let plugin = SectionConfigPlugin::new(
         "user".to_string(),
@@ -1106,20 +1156,62 @@ token: asdf@pbs!asdftoken
     };
 
     let res = config.parse(filename, raw).unwrap();
-    println!("RES: {:?}", res);
+    println!("RES: {res:?}");
     let written = config.write(filename, &res);
     println!("CONFIG:\n{}", written.as_ref().unwrap());
 
     check(res);
 
     let res = config.parse(filename, &written.unwrap()).unwrap();
-    println!("RES second time: {:?}", res);
+    println!("RES second time: {res:?}");
 
     check(res);
 
     let config = config.allow_unknown_sections(false);
 
     assert!(config.parse(filename, raw).is_err());
+}
+
+#[test]
+fn test_section_config_property_aliases() {
+    let filename = "mirror.cfg";
+
+    const ID_SCHEMA: Schema = StringSchema::new("Mirror ID.").min_length(3).schema();
+    const PROPERTIES: ObjectSchema = ObjectSchema::new(
+        "mirror properties",
+        &[("verify-mode", false, &StringSchema::new("Mode.").schema())],
+    )
+    .property_aliases(&[("verify", "verify-mode")]);
+
+    let plugin = SectionConfigPlugin::new("mirror".to_string(), None, &PROPERTIES);
+    let mut config = SectionConfig::new(&ID_SCHEMA);
+    config.register_plugin(plugin);
+
+    // Deprecated alias is canonicalized in the parsed Value, so downstream serde-driven
+    // `convert_to_typed_array` calls see only the canonical key.
+    let raw = "mirror: legacy\n\tverify full\n";
+    let res = config.parse(filename, raw).unwrap();
+    let (_, section) = res.sections.get("legacy").unwrap();
+    assert_eq!(*section.get("verify-mode").unwrap(), json!("full"));
+    assert!(
+        section.get("verify").is_none(),
+        "alias key must be rewritten"
+    );
+
+    // Required-property check after canonicalization recognizes the alias as satisfying
+    // the canonical property's `optional: false`.
+    let raw = "mirror: alias-only\n\tverify size\n";
+    config
+        .parse(filename, raw)
+        .expect("alias satisfies required");
+
+    // Mixing alias and canonical in one section is rejected.
+    let raw = "mirror: conflict\n\tverify full\n\tverify-mode none\n";
+    let err = config.parse(filename, raw).expect_err("mix rejected");
+    assert!(
+        format!("{err}").contains("cannot set both"),
+        "unexpected error: {err}"
+    );
 }
 
 #[test]
@@ -1189,21 +1281,21 @@ sync: s-6c32330a-6204
     };
 
     let res = config.parse(filename, raw).unwrap();
-    println!("RES: {:?}", res);
+    println!("RES: {res:?}");
     let written = config.write(filename, &res).unwrap();
-    println!("CONFIG:\n{}", written);
+    println!("CONFIG:\n{written}");
 
     check(res);
 
     let res = config.parse(filename, &written).unwrap();
-    println!("RES (second time): {:?}", res);
+    println!("RES (second time): {res:?}");
 
     check(res);
 
     let res_unknown = config_unknown.parse(filename, raw).unwrap();
-    println!("RES (unknown): {:?}", res_unknown);
+    println!("RES (unknown): {res_unknown:?}");
     let written_unknown = config_unknown.write(filename, &res_unknown).unwrap();
-    println!("CONFIG (unknown):\n{}", written_unknown);
+    println!("CONFIG (unknown):\n{written_unknown}");
 
     check(res_unknown);
 
@@ -1219,7 +1311,7 @@ sync: fail
     assert!(config.parse(filename, raw).is_err());
 }
 
-/// Generate ReST Documentaion for ``SectionConfig``
+/// Generate ReST Documentation for ``SectionConfig``
 pub fn dump_section_config(config: &SectionConfig) -> String {
     let mut res = String::new();
 
@@ -1240,11 +1332,7 @@ pub fn dump_section_config(config: &SectionConfig) -> String {
             use std::fmt::Write as _;
 
             let description = wrap_text("", "", properties.description(), 80);
-            let _ = write!(
-                res,
-                "\n**Section type** \'``{}``\':  {}\n\n",
-                name, description
-            );
+            let _ = write!(res, "\n**Section type** \'``{name}``\':  {description}\n\n");
         }
 
         res.push_str(&dump_properties(

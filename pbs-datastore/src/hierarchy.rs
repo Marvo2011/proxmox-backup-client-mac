@@ -1,15 +1,14 @@
-use std::os::unix::io::RawFd;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use anyhow::{bail, format_err, Error};
+use anyhow::{Error, bail, format_err};
 
-use pbs_api_types::{BackupNamespace, BackupType, BACKUP_DATE_REGEX, BACKUP_ID_REGEX};
+use pbs_api_types::{BACKUP_DATE_REGEX, BACKUP_ID_REGEX, BackupNamespace, BackupType};
 use proxmox_sys::fs::get_file_type;
 
-use crate::backup_info::{BackupDir, BackupGroup};
 use crate::DataStore;
+use crate::backup_info::{BackupDir, BackupGroup};
 
 /// A iterator for all BackupDir's (Snapshots) in a BackupGroup
 pub struct ListSnapshots {
@@ -56,12 +55,7 @@ impl Iterator for ListSnapshots {
             };
             if let Ok(name) = entry.file_name().to_str() {
                 if BACKUP_DATE_REGEX.is_match(name) {
-                    let backup_time = match proxmox_time::parse_rfc3339(name) {
-                        Ok(time) => time,
-                        Err(err) => return Some(Err(err)),
-                    };
-
-                    return Some(BackupDir::with_group(self.group.clone(), backup_time));
+                    return Some(BackupDir::with_rfc3339(self.group.clone(), name.to_owned()));
                 }
             }
         }
@@ -78,17 +72,8 @@ pub struct ListGroupsType {
 
 impl ListGroupsType {
     pub fn new(store: Arc<DataStore>, ns: BackupNamespace, ty: BackupType) -> Result<Self, Error> {
-        Self::new_at(libc::AT_FDCWD, store, ns, ty)
-    }
-
-    fn new_at(
-        fd: RawFd,
-        store: Arc<DataStore>,
-        ns: BackupNamespace,
-        ty: BackupType,
-    ) -> Result<Self, Error> {
         Ok(Self {
-            dir: proxmox_sys::fs::read_subdir(fd, &store.type_path(&ns, ty))?,
+            dir: proxmox_sys::fs::read_subdir(libc::AT_FDCWD, &store.type_path(&ns, ty))?,
             store,
             ns,
             ty,
@@ -202,15 +187,16 @@ impl Iterator for ListGroups {
                     if let Ok(group_type) = BackupType::from_str(name) {
                         // found a backup group type, descend into it to scan all IDs in it
                         // by switching to the id-state branch
-                        match ListGroupsType::new_at(
-                            entry.parent_fd(),
-                            Arc::clone(&self.store),
-                            self.ns.clone(),
-                            group_type,
-                        ) {
-                            Ok(ty) => self.id_state = Some(ty),
-                            Err(err) => return Some(Err(err)),
-                        }
+                        let dir = match proxmox_sys::fs::read_subdir(entry.parent_fd(), name) {
+                            Ok(dir) => dir,
+                            Err(err) => return Some(Err(err.into())),
+                        };
+                        self.id_state = Some(ListGroupsType {
+                            dir,
+                            store: Arc::clone(&self.store),
+                            ns: self.ns.clone(),
+                            ty: group_type,
+                        });
                     }
                 }
             }
@@ -417,10 +403,9 @@ impl Iterator for ListNamespacesRecursive {
                 if state.is_empty() {
                     return None; // there's a state but it's empty -> we're all done
                 }
-                let iter = match state.last_mut() {
-                    Some(iter) => iter,
-                    None => return None, // unexpected, should we just unwrap?
-                };
+                // should we just unwrap on None?
+                let iter = state.last_mut()?;
+
                 match iter.next() {
                     Some(Ok(ns)) => {
                         if state.len() < self.max_depth as usize {

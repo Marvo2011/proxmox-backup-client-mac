@@ -43,6 +43,12 @@ pub struct Fs {
     free_inodes: Mutex<Vec<u64>>,
 }
 
+impl Default for Fs {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Fs {
     pub fn new() -> Self {
         Self {
@@ -61,7 +67,7 @@ impl Fs {
         }
     }
 
-    pub fn lookup(&self, inode: u64) -> io::Result<InodeLookup> {
+    pub fn lookup(&self, inode: u64) -> io::Result<InodeLookup<'_>> {
         let inode = usize::try_from(inode).map_err(|_| {
             // we could have never created such an inode for the kernel...
             io_format_err!("kernel accessed unexpected too-large inode: {}", inode)
@@ -79,7 +85,7 @@ impl Fs {
         }
     }
 
-    pub fn lookup_at(&self, inode: u64, name: &OsStr) -> io::Result<InodeLookup> {
+    pub fn lookup_at(&self, inode: u64, name: &OsStr) -> io::Result<InodeLookup<'_>> {
         let node = self.lookup(inode)?;
 
         if name == OsStr::new(".") {
@@ -115,7 +121,6 @@ impl Fs {
         let inode = entry.inode;
 
         entry.on_drop(self);
-        drop(entry);
 
         // no lookups, no hard links, delete:
         eprintln!("Deleting inode {}", inode);
@@ -147,7 +152,7 @@ impl Fs {
         name: OsString,
         mode: libc::mode_t,
         fs_content: FsContent,
-    ) -> io::Result<InodeLookup> {
+    ) -> io::Result<InodeLookup<'_>> {
         use std::collections::btree_map::Entry::*;
         let parent_dir = self.lookup(parent)?;
 
@@ -202,7 +207,7 @@ impl Fs {
         parent: u64,
         name: OsString,
         mode: libc::mode_t,
-    ) -> io::Result<InodeLookup> {
+    ) -> io::Result<InodeLookup<'_>> {
         self.do_create(
             parent,
             name,
@@ -216,7 +221,7 @@ impl Fs {
         parent: u64,
         name: OsString,
         mode: libc::mode_t,
-    ) -> io::Result<InodeLookup> {
+    ) -> io::Result<InodeLookup<'_>> {
         self.do_create(
             parent,
             name,
@@ -323,7 +328,7 @@ impl<'a> std::ops::Deref for InodeLookup<'a> {
     type Target = FsEntry;
 
     fn deref(&self) -> &Self::Target {
-        self.entry.clone().unwrap()
+        self.entry.unwrap()
     }
 }
 
@@ -337,6 +342,7 @@ pub struct FsEntry {
 }
 
 impl FsEntry {
+    /*
     fn try_add_link(&self) -> io::Result<()> {
         loop {
             let links = self.links.load(Ordering::Acquire);
@@ -353,6 +359,7 @@ impl FsEntry {
             }
         }
     }
+    */
 
     fn on_drop(&self, fs: &Fs) {
         if let FsContent::Dir(dir) = &self.content {
