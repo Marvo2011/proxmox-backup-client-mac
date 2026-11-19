@@ -11,7 +11,13 @@ Server Solutions GmbH.
 
 ## Installation
 
-Download the archive of the latest
+With [Homebrew](https://brew.sh):
+
+```sh
+brew install marvo2011/tap/proxmox-backup-client
+```
+
+Or download the archive of the latest
 [release](https://github.com/Marvo2011/proxmox-backup-client-mac/releases),
 unpack it and put `proxmox-backup-client` and `pxar` somewhere in your `PATH`.
 

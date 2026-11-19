@@ -22,6 +22,10 @@ concurrency:
 env:
   FUSE_T_VERSION: "1.2.9"
   CARGO_TERM_COLOR: always
+  # Homebrew tap (<owner>/homebrew-tap) that gets the formula of each release. Needs the
+  # HOMEBREW_TAP_TOKEN secret with write access to it, the step is skipped without.
+  HOMEBREW_TAP: ${{ github.repository_owner }}/homebrew-tap
+  HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
 
 jobs:
   release:
@@ -136,3 +140,67 @@ jobs:
               --title "proxmox-backup-client ${VERSION} for macOS (Apple Silicon)" \
               --notes-file notes.md
           fi
+
+      - name: Update Homebrew tap
+        if: env.HOMEBREW_TAP_TOKEN != ''
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ steps.version.outputs.tag }}
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+        run: |
+          url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/$(basename "$ARCHIVE")"
+          sha256=$(shasum -a 256 "$ARCHIVE" | cut -d' ' -f1)
+
+          git clone --depth 1 \
+            "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/${HOMEBREW_TAP}.git" tap
+          mkdir -p tap/Formula
+
+          # placeholders are replaced below, the heredoc is quoted so that the
+          # Ruby code is taken literally
+          cat > tap/Formula/proxmox-backup-client.rb <<'EOF'
+          class ProxmoxBackupClient < Formula
+            desc "Proxmox Backup Server client and pxar tool (unofficial macOS port)"
+            homepage "https://github.com/@REPOSITORY@"
+            url "@URL@"
+            version "@VERSION@"
+            sha256 "@SHA256@"
+            license "AGPL-3.0-only"
+
+            depends_on arch: :arm64
+            depends_on :macos
+
+            def install
+              bin.install "proxmox-backup-client", "pxar"
+            end
+
+            def caveats
+              <<~EOS
+                The mount, map and unmap commands need FUSE-T:
+                  brew install --cask macos-fuse-t/cask/fuse-t
+              EOS
+            end
+
+            test do
+              # the binary reports the version with "+" (3.2.4+20261119)
+              assert_match "client version: #{version.to_s.tr("-", "+")}",
+                           shell_output("#{bin}/proxmox-backup-client version")
+            end
+          end
+          EOF
+          sed -i '' \
+            -e "s|@REPOSITORY@|${GITHUB_REPOSITORY}|" \
+            -e "s|@URL@|${url}|" \
+            -e "s|@VERSION@|${VERSION}|" \
+            -e "s|@SHA256@|${sha256}|" \
+            tap/Formula/proxmox-backup-client.rb
+
+          cd tap
+          git add Formula/proxmox-backup-client.rb
+          if git diff --cached --quiet; then
+            echo "formula is up to date"
+            exit 0
+          fi
+          git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit -m "proxmox-backup-client ${VERSION}"
+          git push
