@@ -1148,7 +1148,7 @@ dependencies = [
 
 [[package]]
 name = "pbs-buildcfg"
-version = "3.2.4"
+version = "3.2.4+20261119"
 
 [[package]]
 name = "pbs-client"

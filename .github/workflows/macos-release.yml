@@ -1,11 +1,11 @@
 name: macOS release
 
 # Builds the client and the pxar tool for macOS on Apple Silicon and publishes
-# them as a GitHub release tagged with the client version (e.g. v3.2.4).
+# them as a GitHub release tagged with the client version (e.g. v3.2.4-20261119).
 #
-# The version only changes with upstream version bumps, so pushes without a
-# bump update the existing release: its binaries are replaced and the tag is
-# moved to the new commit.
+# The version is the upstream version plus the date of the port's release. Pushes
+# without a version bump update the existing release: its binaries are replaced
+# and the tag is moved to the new commit.
 
 on:
   push:
@@ -76,15 +76,22 @@ jobs:
             fi
           done
 
+      # The workspace version is the upstream version plus the build date of the port as
+      # semver build metadata (3.2.4+20261119). Tags and file names use "-" instead of "+".
       - name: Determine version
         id: version
         run: |
-          version=$(target/release/proxmox-backup-client version --output-format json \
-            | jq -r '.client.version + "." + .client.release')
-          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          version=$(cargo metadata --locked --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "pbs-buildcfg") | .version')
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+\+[0-9]{8}$ ]]; then
             echo "::error::unexpected client version '$version'"
             exit 1
           fi
+          if ! target/release/proxmox-backup-client version | grep -qxF "client version: $version"; then
+            echo "::error::binary does not report version '$version'"
+            exit 1
+          fi
+          version=${version/+/-}
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "tag=v$version" >> "$GITHUB_OUTPUT"
 

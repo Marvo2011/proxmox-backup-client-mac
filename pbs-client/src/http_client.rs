@@ -1000,7 +1000,7 @@ impl H2Client {
 
         let mut send_request = self.h2.clone().ready().await?;
 
-        let (response, stream) = send_request.send_request(request, false).unwrap();
+        let (response, stream) = send_request.send_request(request, false)?;
 
         PipeToSendStream::new(bytes::Bytes::from(data), stream).await?;
 
@@ -1027,11 +1027,11 @@ impl H2Client {
             .map_err(Error::from)
             .and_then(move |mut send_request| async move {
                 if let Some(data) = data {
-                    let (response, stream) = send_request.send_request(request, false).unwrap();
+                    let (response, stream) = send_request.send_request(request, false)?;
                     PipeToSendStream::new(data, stream).await?;
                     Ok(response)
                 } else {
-                    let (response, _stream) = send_request.send_request(request, true).unwrap();
+                    let (response, _stream) = send_request.send_request(request, true)?;
                     Ok(response)
                 }
             })

@@ -753,7 +753,19 @@ impl BackupWriter {
                     })
                 }
             })
-            .then(move |result| async move { upload_result.await?.and(result) }.boxed())
+            .then(move |result| {
+                async move {
+                    match upload_result.await {
+                        // the queue error is usually the root cause, the stream
+                        // only sees "failed to send to upload queue" then
+                        Ok(queue_result) => queue_result.and(result),
+                        Err(_) => {
+                            result.and(Err(format_err!("upload queue terminated unexpectedly")))
+                        }
+                    }
+                }
+                .boxed()
+            })
             .and_then(move |_| {
                 let duration = start_time.elapsed();
                 let chunk_count = total_chunks2.load(Ordering::SeqCst);

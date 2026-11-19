@@ -58,6 +58,10 @@ fn detect_fs_type(fd: RawFd) -> Result<i64, Error> {
     Ok(fs_stat.f_type)
 }
 
+/// `SF_DATALESS` from `<sys/stat.h>`: the file's content is not present locally.
+#[cfg(target_os = "macos")]
+const SF_DATALESS: u32 = 0x40000000;
+
 /// macOS has no file system magic numbers, so map the file system type name to the Linux magic
 /// number with the same semantics for archiving.
 #[cfg(target_os = "macos")]
@@ -550,6 +554,14 @@ impl Archiver {
 
         let file_mode = stat.st_mode & libc::S_IFMT;
         let is_file_or_dir = file_mode == libc::S_IFREG || file_mode == libc::S_IFDIR;
+
+        // Online-only files of File Provider cloud storage (iCloud Drive, Nextcloud, ...) would
+        // be downloaded on read, which can take long, fill the disk or fail. Skip them.
+        #[cfg(target_os = "macos")]
+        if file_mode == libc::S_IFREG && stat.st_flags & SF_DATALESS != 0 {
+            log::warn!("skipping online-only file: {:?}", self.path);
+            return Ok(());
+        }
 
         // Other file types are opened with O_PATH on Linux. Elsewhere they are not opened at all,
         // as this could block (FIFOs) or have side effects (devices), their metadata is taken

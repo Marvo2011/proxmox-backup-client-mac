@@ -20,6 +20,10 @@ cargo clippy
 
 The build needs FUSE-T installed (https://www.fuse-t.org), because `proxmox-fuse`'s `glue.c` uses its libfuse3 headers. `.cargo/config.toml` links libfuse3 weakly (`-weak-lfuse3`, rpath `/usr/local/lib`), so the binaries run without FUSE-T and only `mount`/`map` require it (`proxmox_fuse::sys::available()`). Releases link OpenSSL statically (`OPENSSL_STATIC=1`, see `.github/workflows/macos-release.yml`), and CI checks that only system libraries are linked.
 
+## Versioning
+
+The workspace version in `Cargo.toml` is the upstream version plus the release date of the port as build metadata, e.g. `3.2.4+20261119`. Bump the date for a new release. The release workflow tags it as `v3.2.4-20261119`; pushes without a bump replace the binaries of the existing release.
+
 ## Layout
 
 - `vendor/`: Proxmox crates (proxmox-sys, proxmox-time, pxar, proxmox-fuse, …) patched in via `.cargo/config.toml`, most with macOS changes. `vendor/README.md` lists the upstream commits and every local change. Keep it updated when changing vendored code.

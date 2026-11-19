@@ -206,7 +206,11 @@ async fn backup_directory<P: AsRef<Path>>(
     // spawn chunker inside a separate task so that it can run parallel
     tokio::spawn(async move {
         while let Some(v) = chunk_stream.next().await {
-            let _ = tx.send(v).await;
+            // stop archiving once the upload is gone, the pxar stream is dropped
+            // here which aborts the archiver
+            if tx.send(v).await.is_err() {
+                break;
+            }
         }
     });
 
@@ -467,10 +471,10 @@ async fn api_version(param: Value) -> Result<(), Error> {
         }
     }
     if output_format == "text" {
+        // includes the build date of the macOS port, e.g. 3.2.4+20261119
         println!(
-            "client version: {}.{}",
-            pbs_buildcfg::PROXMOX_PKG_VERSION,
-            pbs_buildcfg::PROXMOX_PKG_RELEASE,
+            "client version: {}",
+            pbs_buildcfg::PROXMOX_BACKUP_CRATE_VERSION
         );
         if let Some(server) = version_info["server"].as_object() {
             let server_version = server["version"].as_str().unwrap();
