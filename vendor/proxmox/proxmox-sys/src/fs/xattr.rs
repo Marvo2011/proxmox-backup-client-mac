@@ -143,6 +143,8 @@ pub fn flistxattr(fd: RawFd) -> Result<ListXAttr, nix::errno::Errno> {
                 // Buffer was not big enough to fit the list, retry with double the size
                 size = size.checked_mul(2).ok_or(Errno::ENOMEM)?;
             }
+            // macOS occasionally interrupts this without a signal, retry with the same size
+            Errno::EINTR => {}
             _ => return Err(err),
         }
         // Retry to read the list with new buffer
@@ -177,6 +179,8 @@ pub fn fgetxattr(fd: RawFd, name: &CStr) -> Result<Vec<u8>, nix::errno::Errno> {
                 // Buffer was not big enough to fit the value, retry with double the size
                 size = size.checked_mul(2).ok_or(Errno::ENOMEM)?;
             }
+            // macOS occasionally interrupts this without a signal, retry with the same size
+            Errno::EINTR => {}
             _ => return Err(err),
         }
         buffer.resize(size, 0);

@@ -69,8 +69,12 @@ fn detect_fs_type(fd: RawFd) -> Result<i64, Error> {
     use proxmox_sys::linux::magic::*;
 
     let mut fs_stat = std::mem::MaybeUninit::uninit();
-    let res = unsafe { libc::fstatfs(fd, fs_stat.as_mut_ptr()) };
-    Errno::result(res)?;
+    // macOS occasionally interrupts this without a signal
+    while let Err(err) = Errno::result(unsafe { libc::fstatfs(fd, fs_stat.as_mut_ptr()) }) {
+        if err != Errno::EINTR {
+            return Err(err.into());
+        }
+    }
     let fs_stat = unsafe { fs_stat.assume_init() };
 
     let name = unsafe { CStr::from_ptr(fs_stat.f_fstypename.as_ptr()) };
@@ -347,6 +351,8 @@ impl Archiver {
                     noatime = OFlag::empty();
                     continue;
                 }
+                // macOS occasionally interrupts this without a signal
+                Err(Errno::EINTR) => continue,
                 Err(other) => Err(Error::from(other)),
             };
         }

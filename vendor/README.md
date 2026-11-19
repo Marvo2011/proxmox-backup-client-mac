@@ -20,7 +20,8 @@ Platform specific code uses `#[cfg(target_os = ...)]` and keeps the Linux code
 paths unchanged.
 
 - `proxmox-sys`
-  - xattr calls: macOS variants take extra `position`/`options` arguments
+  - xattr calls: macOS variants take extra `position`/`options` arguments,
+    `flistxattr`/`fgetxattr` retry on `EINTR` (macOS returns it without a signal)
   - `fs_info`: `statfs` instead of `statfs64`
   - `atomic_open_or_create_file`: `renameatx_np(RENAME_EXCL)` instead of
     `renameat2(RENAME_NOREPLACE)`, `O_TMPFILE` check Linux only
