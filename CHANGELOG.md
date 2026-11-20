@@ -10,6 +10,8 @@ released version, so every version needs one.
   Full Disk Access) are skipped with the warning `failed to open file: …:
   operation not permitted` instead of aborting the backup with
   `EPERM: Operation not permitted`.
+- Warnings about files that cannot be opened name the path below the archive
+  root (e.g. `"Library/Containers/x/a"`) instead of only the file name.
 
 ## 4.2.10+20261119
 

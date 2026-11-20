@@ -518,6 +518,18 @@ impl Archiver {
         Ok(None)
     }
 
+    /// Path of `file_name` below the archive root for messages. Entries are opened while
+    /// `self.path` is already their own path, files like `.pxarexclude` while it is the one of
+    /// their directory.
+    fn path_of(&self, file_name: &CStr) -> PathBuf {
+        let name = OsStr::from_bytes(file_name.to_bytes());
+        if self.path.file_name() == Some(name) {
+            self.path.clone()
+        } else {
+            self.path.join(name)
+        }
+    }
+
     /// openat() wrapper which allows but logs `EACCES` and turns `ENOENT` into `None`.
     ///
     /// The `existed` flag is set when iterating through a directory to note that we know the file
@@ -551,7 +563,10 @@ impl Archiver {
                     Ok(None)
                 }
                 Err(Errno::EACCES) => {
-                    warn!("failed to open file: {:?}: access denied", file_name);
+                    warn!(
+                        "failed to open file: {:?}: access denied",
+                        self.path_of(file_name)
+                    );
                     Ok(None)
                 }
                 Err(Errno::ESTALE) => {
@@ -569,7 +584,7 @@ impl Archiver {
                 Err(Errno::EPERM) => {
                     warn!(
                         "failed to open file: {:?}: operation not permitted (privacy protected, needs Full Disk Access)",
-                        file_name
+                        self.path_of(file_name)
                     );
                     Ok(None)
                 }
