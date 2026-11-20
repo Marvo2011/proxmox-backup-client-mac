@@ -223,6 +223,7 @@ fn paperkey_text<W: Write>(
     Ok(())
 }
 
+#[cfg(not(target_os = "macos"))]
 fn generate_qr_code(output_type: &str, lines: &[String]) -> Result<Vec<u8>, Error> {
     let mut child = Command::new("qrencode")
         .args(["-t", output_type, "-m0", "-s1", "-lm", "--output", "-"])
@@ -248,4 +249,30 @@ fn generate_qr_code(output_type: &str, lines: &[String]) -> Result<Vec<u8>, Erro
     let output = proxmox_sys::command::command_output(output, None)?;
 
     Ok(output)
+}
+
+/// Same output as `qrencode -t <svg|utf8i> -m0 -s1 -lm`, macOS has no qrencode binary.
+#[cfg(target_os = "macos")]
+fn generate_qr_code(output_type: &str, lines: &[String]) -> Result<Vec<u8>, Error> {
+    use qrcode::render::{svg, unicode};
+    use qrcode::{EcLevel, QrCode};
+
+    let code = QrCode::with_error_correction_level(lines.join("\n").as_bytes(), EcLevel::M)
+        .map_err(|err| format_err!("failed to generate QR code - {err}"))?;
+    let output = match output_type {
+        "svg" => code
+            .render::<svg::Color>()
+            .quiet_zone(false)
+            .module_dimensions(1, 1)
+            .build(),
+        // inverted, as qrencode's utf8i: light modules are printed as blocks
+        "utf8i" => code
+            .render::<unicode::Dense1x2>()
+            .quiet_zone(false)
+            .dark_color(unicode::Dense1x2::Light)
+            .light_color(unicode::Dense1x2::Dark)
+            .build(),
+        other => bail!("unsupported QR code output type '{other}'"),
+    };
+    Ok(output.into_bytes())
 }

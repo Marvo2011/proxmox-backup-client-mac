@@ -57,3 +57,7 @@ pbs-tools.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+
+# macOS has no qrencode, the QR code of paper keys is generated in process
+[target.'cfg(target_os = "macos")'.dependencies]
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
