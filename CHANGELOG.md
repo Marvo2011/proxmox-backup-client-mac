@@ -4,6 +4,13 @@ The version is the upstream proxmox-backup version plus the release date of the
 port. The release workflow takes the release notes from the section of the
 released version, so every version needs one.
 
+## 4.2.10+20261120
+
+- Folders that macOS protects (`~/Library/Accounts`, Mail, Safari, … without
+  Full Disk Access) are skipped with the warning `failed to open file: …:
+  operation not permitted` instead of aborting the backup with
+  `EPERM: Operation not permitted`.
+
 ## 4.2.10+20261119
 
 - Based on upstream proxmox-backup 4.2.10 (before 3.2.4). New in the client

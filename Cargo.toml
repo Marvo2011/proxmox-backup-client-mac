@@ -5,7 +5,7 @@
 # [workspace.dependencies] is kept as in upstream.
 
 [workspace.package]
-version = "4.2.10+20261119"
+version = "4.2.10+20261120"
 authors = [
     "Dietmar Maurer <dietmar@proxmox.com>",
     "Dominik Csapak <d.csapak@proxmox.com>",

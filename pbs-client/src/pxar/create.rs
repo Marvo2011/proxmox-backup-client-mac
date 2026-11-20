@@ -563,6 +563,16 @@ impl Archiver {
                     noatime = OFlag::empty();
                     continue;
                 }
+                // macOS denies access to privacy protected locations (e.g. ~/Library/Accounts,
+                // Mail, Safari) with EPERM, unless the process has Full Disk Access
+                #[cfg(target_os = "macos")]
+                Err(Errno::EPERM) => {
+                    warn!(
+                        "failed to open file: {:?}: operation not permitted (privacy protected, needs Full Disk Access)",
+                        file_name
+                    );
+                    Ok(None)
+                }
                 // macOS occasionally interrupts this without a signal
                 Err(Errno::EINTR) => continue,
                 Err(other) => Err(Error::from(other)),
@@ -751,6 +761,12 @@ impl Archiver {
                 Err(Errno::EACCES) => {
                     // may happen for fuse mountpoints without allow_other or allow_root
                     warn!("warning: failed to stat file: {full_path:?}: access denied");
+                    continue;
+                }
+                // privacy protected location on macOS, see open_file
+                #[cfg(target_os = "macos")]
+                Err(Errno::EPERM) => {
+                    warn!("warning: failed to stat file: {full_path:?}: operation not permitted");
                     continue;
                 }
                 Err(Errno::ESTALE) => {
